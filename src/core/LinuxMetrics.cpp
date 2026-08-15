@@ -1,0 +1,250 @@
+#include "LinuxMetrics.h"
+
+#include <QRegularExpression>
+
+#include <algorithm>
+
+namespace noxshell {
+
+namespace {
+enum class Section {
+    None,
+    Cpu,
+    Memory,
+    Load,
+    Cores,
+    Disk,
+};
+
+QList<QByteArray> fields(const QByteArray &line)
+{
+    return line.simplified().split(' ');
+}
+
+quint64 kilobytesToBytes(quint64 value)
+{
+    constexpr quint64 bytesPerKilobyte = 1024;
+    return value * bytesPerKilobyte;
+}
+
+void setError(QString *error, const QString &message)
+{
+    if (error) *error = message;
+}
+} // namespace
+
+quint64 LinuxCpuTimes::total() const
+{
+    return user + nice + system + idle + ioWait + irq + softIrq + steal;
+}
+
+quint64 LinuxCpuTimes::idleTotal() const
+{
+    return idle + ioWait;
+}
+
+bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &snapshot, QString *error)
+{
+    snapshot = {};
+    Section section = Section::None;
+    bool hasCpu = false;
+    bool hasMemoryTotal = false;
+    bool hasMemoryAvailable = false;
+    bool hasLoad = false;
+    bool hasCores = false;
+    quint64 memoryFree = 0;
+    quint64 buffers = 0;
+    quint64 cached = 0;
+    quint64 reclaimable = 0;
+    quint64 sharedMemory = 0;
+
+    const auto lines = payload.split('\n');
+    for (auto line : lines) {
+        line = line.trimmed();
+        if (line.endsWith('\r')) line.chop(1);
+        if (line == "__CPU__") {
+            section = Section::Cpu;
+            continue;
+        }
+        if (line == "__MEM__") {
+            section = Section::Memory;
+            continue;
+        }
+        if (line == "__LOAD__") {
+            section = Section::Load;
+            continue;
+        }
+        if (line == "__CORES__") {
+            section = Section::Cores;
+            continue;
+        }
+        if (line == "__DISK__") {
+            section = Section::Disk;
+            continue;
+        }
+        if (line.isEmpty()) continue;
+
+        const auto parts = fields(line);
+        switch (section) {
+        case Section::Cpu: {
+            if (parts.size() < 5 || parts.first() != "cpu") break;
+            bool ok = true;
+            auto value = [&parts, &ok](qsizetype index) {
+                if (index >= parts.size()) return quint64{0};
+                bool fieldOk = false;
+                const auto parsed = parts.at(index).toULongLong(&fieldOk);
+                ok = ok && fieldOk;
+                return parsed;
+            };
+            snapshot.cpu.user = value(1);
+            snapshot.cpu.nice = value(2);
+            snapshot.cpu.system = value(3);
+            snapshot.cpu.idle = value(4);
+            snapshot.cpu.ioWait = value(5);
+            snapshot.cpu.irq = value(6);
+            snapshot.cpu.softIrq = value(7);
+            snapshot.cpu.steal = value(8);
+            hasCpu = ok;
+            break;
+        }
+        case Section::Memory: {
+            if (parts.size() < 2) break;
+            bool ok = false;
+            const auto value = kilobytesToBytes(parts.at(1).toULongLong(&ok));
+            if (!ok) break;
+            const auto key = parts.first();
+            if (key == "MemTotal:") {
+                snapshot.memoryTotalBytes = value;
+                hasMemoryTotal = true;
+            } else if (key == "MemAvailable:") {
+                snapshot.memoryAvailableBytes = value;
+                hasMemoryAvailable = true;
+            } else if (key == "MemFree:") {
+                memoryFree = value;
+            } else if (key == "Buffers:") {
+                buffers = value;
+            } else if (key == "Cached:") {
+                cached = value;
+            } else if (key == "SReclaimable:") {
+                reclaimable = value;
+            } else if (key == "Shmem:") {
+                sharedMemory = value;
+            }
+            break;
+        }
+        case Section::Load: {
+            if (parts.size() < 3) break;
+            bool ok1 = false;
+            bool ok5 = false;
+            bool ok15 = false;
+            snapshot.load1 = parts.at(0).toDouble(&ok1);
+            snapshot.load5 = parts.at(1).toDouble(&ok5);
+            snapshot.load15 = parts.at(2).toDouble(&ok15);
+            hasLoad = ok1 && ok5 && ok15;
+            break;
+        }
+        case Section::Cores: {
+            bool ok = false;
+            const int count = parts.first().toInt(&ok);
+            if (ok && count > 0) {
+                snapshot.cpuCoreCount = count;
+                hasCores = true;
+            }
+            break;
+        }
+        case Section::Disk: {
+            if (line.startsWith("Filesystem") || parts.size() < 6) break;
+            bool totalOk = false;
+            bool usedOk = false;
+            bool availableOk = false;
+            const auto total = kilobytesToBytes(parts.at(1).toULongLong(&totalOk));
+            const auto used = kilobytesToBytes(parts.at(2).toULongLong(&usedOk));
+            const auto available = kilobytesToBytes(parts.at(3).toULongLong(&availableOk));
+            auto percentText = parts.at(4);
+            if (percentText.endsWith('%')) percentText.chop(1);
+            bool percentOk = false;
+            const int percent = percentText.toInt(&percentOk);
+            if (!totalOk || !usedOk || !availableOk || !percentOk) break;
+            LinuxDiskUsage disk;
+            disk.fileSystem = QString::fromUtf8(parts.first());
+            disk.mountPoint = QString::fromUtf8(parts.mid(5).join(' '));
+            disk.totalBytes = total;
+            disk.usedBytes = used;
+            disk.availableBytes = available;
+            disk.usagePercent = qBound(0, percent, 100);
+            snapshot.disks.append(std::move(disk));
+            break;
+        }
+        case Section::None:
+            break;
+        }
+    }
+
+    if (!hasMemoryAvailable && hasMemoryTotal) {
+        const auto fallback = memoryFree + buffers + cached + reclaimable;
+        snapshot.memoryAvailableBytes = fallback > sharedMemory ? fallback - sharedMemory : fallback;
+        hasMemoryAvailable = fallback > 0;
+    }
+    if (!hasCpu) {
+        setError(error, QStringLiteral("无法解析 /proc/stat"));
+        return false;
+    }
+    if (!hasMemoryTotal || !hasMemoryAvailable || snapshot.memoryAvailableBytes > snapshot.memoryTotalBytes) {
+        setError(error, QStringLiteral("无法解析 /proc/meminfo"));
+        return false;
+    }
+    if (!hasLoad) {
+        setError(error, QStringLiteral("无法解析 /proc/loadavg"));
+        return false;
+    }
+    if (!hasCores) {
+        setError(error, QStringLiteral("无法获取 CPU 核心数"));
+        return false;
+    }
+    return true;
+}
+
+MetricSample LinuxMetricsParser::calculate(const LinuxMetricsSnapshot &current, const LinuxMetricsSnapshot *previous)
+{
+    MetricSample sample;
+    sample.capturedAt = QDateTime::currentDateTime();
+    sample.memoryTotalBytes = current.memoryTotalBytes;
+    sample.memoryUsedBytes = current.memoryTotalBytes - current.memoryAvailableBytes;
+    if (sample.memoryTotalBytes > 0) {
+        sample.memoryPercent = 100.0 * static_cast<double>(sample.memoryUsedBytes) / static_cast<double>(sample.memoryTotalBytes);
+    }
+    sample.load1 = current.load1;
+    sample.load5 = current.load5;
+    sample.load15 = current.load15;
+    sample.cpuCoreCount = qMax(1, current.cpuCoreCount);
+
+    const auto rootDisk = std::find_if(current.disks.cbegin(), current.disks.cend(), [](const LinuxDiskUsage &disk) {
+        return disk.mountPoint == QStringLiteral("/");
+    });
+    if (rootDisk != current.disks.cend()) {
+        sample.primaryDisk = *rootDisk;
+    } else if (!current.disks.isEmpty()) {
+        sample.primaryDisk = current.disks.first();
+    }
+
+    if (previous) {
+        const auto totalNow = current.cpu.total();
+        const auto totalBefore = previous->cpu.total();
+        const auto idleNow = current.cpu.idleTotal();
+        const auto idleBefore = previous->cpu.idleTotal();
+        if (totalNow > totalBefore && idleNow >= idleBefore) {
+            const auto totalDelta = totalNow - totalBefore;
+            const auto idleDelta = qMin(totalDelta, idleNow - idleBefore);
+            const auto kernelNow = current.cpu.system + current.cpu.irq + current.cpu.softIrq;
+            const auto kernelBefore = previous->cpu.system + previous->cpu.irq + previous->cpu.softIrq;
+            sample.cpuPercent = 100.0 * static_cast<double>(totalDelta - idleDelta) / static_cast<double>(totalDelta);
+            if (kernelNow >= kernelBefore) {
+                sample.kernelPercent = 100.0 * static_cast<double>(qMin(totalDelta, kernelNow - kernelBefore)) / static_cast<double>(totalDelta);
+            }
+            sample.cpuReady = true;
+        }
+    }
+    return sample;
+}
+
+} // namespace noxshell

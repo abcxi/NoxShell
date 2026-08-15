@@ -1,0 +1,212 @@
+name: Build and release NoxShell
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noxshell-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-version:
+    name: Validate version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: version
+        name: Read project version
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^project\(NoxShell VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match project version v$version" >&2
+            exit 1
+          fi
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: validate-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.*"
+          archives: "qtbase qtsvg"
+          cache: true
+
+      - name: Install native dependencies
+        run: brew install libssh2 pkg-config
+
+      - name: Build, test and package DMG
+        shell: bash
+        env:
+          NOXSHELL_MACOS_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          export QT_ROOT="$QT_ROOT_DIR"
+          export PKG_CONFIG_PATH="$(brew --prefix libssh2)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          ./script/package-release.sh
+          test -f "output/玄壳-v${{ needs.validate-version.outputs.version }}-macOS-${{ matrix.arch }}.dmg"
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v7
+        with:
+          name: NoxShell-v${{ needs.validate-version.outputs.version }}-macOS-${{ matrix.arch }}
+          path: output/*.dmg
+          compression-level: 0
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    needs: validate-version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.*"
+          arch: win64_msvc2022_64
+          archives: "qtbase qtsvg"
+          cache: true
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build-release -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_TESTING=ON `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build and test
+        shell: pwsh
+        run: |
+          cmake --build build-release --parallel
+          ctest --test-dir build-release -C Release --output-on-failure
+
+      - name: Build NSIS installer and portable ZIP
+        shell: pwsh
+        run: |
+          cpack --config build-release/CPackConfig.cmake -C Release -B output
+          Get-ChildItem output
+          if (-not (Test-Path "output/NoxShell-v${{ needs.validate-version.outputs.version }}-Windows-x64.exe")) {
+            throw "NSIS installer was not generated"
+          }
+          if (-not (Test-Path "output/NoxShell-v${{ needs.validate-version.outputs.version }}-Windows-x64.zip")) {
+            throw "Portable ZIP was not generated"
+          }
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: NoxShell-v${{ needs.validate-version.outputs.version }}-Windows-x64
+          path: |
+            output/*.exe
+            output/*.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64
+    needs: validate-version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.*"
+          archives: "qtbase qtsvg"
+          cache: true
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssh2-1-dev pkg-config ninja-build patchelf
+
+      - name: Build, test and package tarball
+        shell: bash
+        run: |
+          export QT_ROOT="$QT_ROOT_DIR"
+          ./script/package-release.sh
+          test -f "output/NoxShell-v${{ needs.validate-version.outputs.version }}-Linux-x86_64.tar.gz"
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v7
+        with:
+          name: NoxShell-v${{ needs.validate-version.outputs.version }}-Linux-x86_64
+          path: output/*.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - validate-version
+      - macos
+      - windows
+      - linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          checksum_file="$(mktemp)"
+          find dist -maxdepth 1 -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  dist/#  #' > "$checksum_file"
+          mv "$checksum_file" dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "玄壳 $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
