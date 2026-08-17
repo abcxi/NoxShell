@@ -27,7 +27,7 @@ using RemoteFileEntries = QVector<RemoteFileEntry>;
 enum class RemoteFileOperation {
     Upload,
     Download,
-    CreateDirectory,
+    MakeDirectory,
     Rename,
     Remove,
 };

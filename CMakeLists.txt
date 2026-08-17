@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.44 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.45 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -179,23 +179,15 @@ install(TARGETS NoxShell
     RUNTIME DESTINATION bin
 )
 
-if(APPLE)
-    qt_generate_deploy_app_script(
-        TARGET NoxShell
-        OUTPUT_SCRIPT NOXSHELL_DEPLOY_SCRIPT
-        NO_PLUGINS
-        NO_TRANSLATIONS
-        NO_UNSUPPORTED_PLATFORM_ERROR
-    )
-else()
+if(NOT APPLE)
     qt_generate_deploy_app_script(
         TARGET NoxShell
         OUTPUT_SCRIPT NOXSHELL_DEPLOY_SCRIPT
         NO_TRANSLATIONS
         NO_UNSUPPORTED_PLATFORM_ERROR
     )
+    install(SCRIPT "${NOXSHELL_DEPLOY_SCRIPT}")
 endif()
-install(SCRIPT "${NOXSHELL_DEPLOY_SCRIPT}")
 
 set(CPACK_PACKAGE_NAME "NoxShell")
 set(CPACK_PACKAGE_VENDOR "NoxShell")

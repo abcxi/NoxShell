@@ -941,13 +941,13 @@ void Libssh2Worker::cancelTransfer(quint64 requestId)
 void Libssh2Worker::createDirectory(quint64 requestId, const QString &path)
 {
     LIBSSH2_SFTP *sftp = nullptr;
-    if (!beginSftpOperation(requestId, RemoteFileOperation::CreateDirectory, path, sftp)) return;
+    if (!beginSftpOperation(requestId, RemoteFileOperation::MakeDirectory, path, sftp)) return;
     const auto bytes = path.toUtf8();
     const int result = libssh2_sftp_mkdir_ex(sftp, bytes.constData(), bytes.size(), 0755);
     const auto sftpError = libssh2_sftp_last_error(sftp);
     endSftpOperation(sftp);
-    if (result == 0) emit fileOperationFinished(requestId, RemoteFileOperation::CreateDirectory, path);
-    else emit fileOperationFailed(requestId, RemoteFileOperation::CreateDirectory, path, QStringLiteral("创建目录失败（SFTP %1）").arg(sftpError));
+    if (result == 0) emit fileOperationFinished(requestId, RemoteFileOperation::MakeDirectory, path);
+    else emit fileOperationFailed(requestId, RemoteFileOperation::MakeDirectory, path, QStringLiteral("创建目录失败（SFTP %1）").arg(sftpError));
 }
 
 void Libssh2Worker::renamePath(quint64 requestId, const QString &sourcePath, const QString &destinationPath)

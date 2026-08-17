@@ -1,21 +1,20 @@
 # 玄壳（NoxShell）
 
-面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.44`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
+面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.45`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
 
 ## 下载
 
 [前往 GitHub Releases 下载最新版本](https://github.com/abcxi/NoxShell/releases/latest)
 
-当前版本：`v0.2.44`
+当前版本：`v0.2.45`
 
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.44/%E7%8E%84%E5%A3%B3-v0.2.44-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.44/%E7%8E%84%E5%A3%B3-v0.2.44-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.44/NoxShell-v0.2.44-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.44/NoxShell-v0.2.44-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| Linux | [下载 x86_64 压缩包](https://github.com/abcxi/NoxShell/releases/download/v0.2.44/NoxShell-v0.2.44-Linux-x86_64.tar.gz) | 64 位 x86 Linux |
-| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.44/SHA256SUMS.txt) | 用于验证下载文件完整性 |
+| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/%E7%8E%84%E5%A3%B3-v0.2.45-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/%E7%8E%84%E5%A3%B3-v0.2.45-macOS-x86_64.dmg) | Intel 芯片 Mac |
+| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/NoxShell-v0.2.45-Windows-x64.exe) | 64 位 Windows，推荐使用 |
+| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/NoxShell-v0.2.45-Windows-x64.zip) | 64 位 Windows，解压即用 |
+| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/SHA256SUMS.txt) | 用于验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签并且 GitHub Actions 构建成功后出现。私有仓库的下载链接需要先登录具有仓库访问权限的 GitHub 账号。
 
@@ -96,16 +95,15 @@ open build/NoxShell.app
 
 macOS 默认生成单文件、LZMA 压缩的 `.dmg`，挂载后把“玄壳”拖入 Applications 即可安装；最低部署版本默认为 macOS 14.0。若还需要备用 ZIP，可执行 `NOXSHELL_CREATE_ZIP=1 ./script/package-release.sh`。产物写入 `output/`。
 
-Windows 使用 CPack + NSIS 生成带开始菜单、桌面快捷方式和卸载入口的 `.exe` 安装程序，同时保留免安装 `.zip`。Windows 的 libssh2 由 `vcpkg.json` 管理并静态链接，Qt DLL 与平台插件由 Qt 部署脚本自动收集。Linux 当前生成 `.tar.gz`。
+Windows 使用 CPack + NSIS 生成带开始菜单、桌面快捷方式和卸载入口的 `.exe` 安装程序，同时保留免安装 `.zip`。Windows 的 libssh2 由 `vcpkg.json` 管理并静态链接，Qt DLL 与平台插件由 Qt 部署脚本自动收集。
 
 仓库内的 `.github/workflows/release.yml` 支持手动运行，也会在推送 `v*` 标签时自动构建并测试以下产物：
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`
 - Windows x64 NSIS `.exe` 与便携 `.zip`
-- Linux x64 `.tar.gz`
 
-标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.44`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
+标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.45`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
 
 本地生成的 macOS 包采用临时签名，未使用 Developer ID 签名或 Apple 公证，仅适合内测；公开分发仍需正式签名与公证。使用当前 Homebrew Qt 构建时应在目标最低版本的 macOS 机器上做一次实际启动测试，正式兼容构建建议使用 Qt Online Installer 提供的官方 Qt。
 

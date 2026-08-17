@@ -651,7 +651,7 @@ void SshSession::createDirectory(const QString &path)
 {
     const auto requestId = nextFileRequestId();
     if (!m_connected) {
-        emit fileOperationFailed(RemoteFileOperation::CreateDirectory, path, QStringLiteral("SSH 会话未连接"));
+        emit fileOperationFailed(RemoteFileOperation::MakeDirectory, path, QStringLiteral("SSH 会话未连接"));
     } else if (!m_demo) {
         emit createDirectoryRequested(requestId, path);
     } else {
@@ -659,7 +659,7 @@ void SshSession::createDirectory(const QString &path)
         auto entries = demoEntriesFor(parent);
         const bool exists = std::any_of(entries.cbegin(), entries.cend(), [&path](const RemoteFileEntry &entry) { return entry.path == path; });
         if (exists) {
-            emit fileOperationFailed(RemoteFileOperation::CreateDirectory, path, QStringLiteral("目标名称已存在"));
+            emit fileOperationFailed(RemoteFileOperation::MakeDirectory, path, QStringLiteral("目标名称已存在"));
             return;
         }
         RemoteFileEntry entry;
@@ -673,7 +673,7 @@ void SshSession::createDirectory(const QString &path)
         entries.prepend(entry);
         m_demoFileOverrides.insert(parent, entries);
         m_demoFileOverrides.insert(path, {});
-        completeDemoOperation(requestId, RemoteFileOperation::CreateDirectory, path);
+        completeDemoOperation(requestId, RemoteFileOperation::MakeDirectory, path);
     }
 }
 

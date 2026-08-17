@@ -1207,7 +1207,7 @@ private slots:
         const QString renamed = base + QStringLiteral("/archives");
         session.createDirectory(created);
         QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 1000);
-        QCOMPARE(qvariant_cast<noxshell::RemoteFileOperation>(operationSpy.last().at(0)), noxshell::RemoteFileOperation::CreateDirectory);
+        QCOMPARE(qvariant_cast<noxshell::RemoteFileOperation>(operationSpy.last().at(0)), noxshell::RemoteFileOperation::MakeDirectory);
 
         session.renamePath(created, renamed);
         QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 2, 1000);

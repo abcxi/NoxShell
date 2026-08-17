@@ -291,7 +291,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
         [this](RemoteFileOperation operation, const QString &path) {
             const auto names = QStringList{QStringLiteral("上传"), QStringLiteral("下载"), QStringLiteral("新建目录"), QStringLiteral("重命名"), QStringLiteral("删除")};
             m_statusLabel->setText(QStringLiteral("  %1完成  ·  %2").arg(names.value(static_cast<int>(operation)), QFileInfo(path).fileName()));
-            if (operation == RemoteFileOperation::CreateDirectory || operation == RemoteFileOperation::Rename
+            if (operation == RemoteFileOperation::MakeDirectory || operation == RemoteFileOperation::Rename
                 || operation == RemoteFileOperation::Remove) {
                 m_mutationInFlight = false;
                 if (auto *directoryNode = directoryItemForPath(m_currentPath)) {
@@ -304,7 +304,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
         });
     connect(m_session, &SshSession::fileOperationFailed, this,
         [this](RemoteFileOperation operation, const QString &, const QString &message) {
-            if (operation == RemoteFileOperation::CreateDirectory || operation == RemoteFileOperation::Rename
+            if (operation == RemoteFileOperation::MakeDirectory || operation == RemoteFileOperation::Rename
                 || operation == RemoteFileOperation::Remove) {
                 m_mutationInFlight = false;
             }

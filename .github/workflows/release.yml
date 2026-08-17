@@ -135,40 +135,6 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  linux:
-    name: Linux x64
-    needs: validate-version
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.8.*"
-          archives: "qtbase qtsvg"
-          cache: true
-
-      - name: Install native dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssh2-1-dev pkg-config ninja-build patchelf
-
-      - name: Build, test and package tarball
-        shell: bash
-        run: |
-          export QT_ROOT="$QT_ROOT_DIR"
-          ./script/package-release.sh
-          test -f "output/NoxShell-v${{ needs.validate-version.outputs.version }}-Linux-x86_64.tar.gz"
-
-      - name: Upload Linux package
-        uses: actions/upload-artifact@v7
-        with:
-          name: NoxShell-v${{ needs.validate-version.outputs.version }}-Linux-x86_64
-          path: output/*.tar.gz
-          compression-level: 0
-          if-no-files-found: error
-
   publish-release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -176,7 +142,6 @@ jobs:
       - validate-version
       - macos
       - windows
-      - linux
     runs-on: ubuntu-22.04
     permissions:
       contents: write

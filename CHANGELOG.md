@@ -1,5 +1,11 @@
 # 变更记录
 
+## 0.2.45 — 2026-08-17
+
+- 修复 Qt 6.8 不支持 `qt_generate_deploy_app_script(NO_PLUGINS)` 导致两种 macOS GitHub Actions 构建在 CMake 配置阶段失败的问题；macOS DMG 统一由发布脚本部署所需插件和运行库。
+- 将文件操作枚举从 `CreateDirectory` 改为 `MakeDirectory`，避免 Windows SDK 将其宏展开为 `CreateDirectoryW` 并造成编译失败。
+- 自动发布聚焦 macOS Apple Silicon、macOS Intel 与 Windows x64，移除会阻塞 Release 的 Linux 安装包任务和下载入口。
+
 ## 0.2.44 — 2026-08-15
 
 - macOS 发布产物改为单文件、LZMA 压缩的 DMG，内含“玄壳.app”和 Applications 拖拽入口；ZIP 改为可选备用产物。
