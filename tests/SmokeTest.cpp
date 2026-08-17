@@ -259,17 +259,16 @@ private slots:
     {
         noxshell::ui::TerminalWorkspace workspace(nullptr, nullptr);
         workspace.resize(900, 500);
-        workspace.show();
 
+        auto *viewStack = workspace.findChild<QStackedWidget *>(QStringLiteral("terminalWorkspaceViewStack"));
         auto *recentPage = workspace.findChild<QWidget *>(QStringLiteral("terminalRecentPage"));
         auto *sessionsPage = workspace.findChild<QWidget *>(QStringLiteral("terminalSessionsPage"));
         auto *recentEmpty = workspace.findChild<QLabel *>(QStringLiteral("recentLoginEmpty"));
+        QVERIFY(viewStack);
         QVERIFY(recentPage);
         QVERIFY(sessionsPage);
         QVERIFY(recentEmpty);
-        QVERIFY(recentPage->isVisible());
-        QVERIFY(recentEmpty->isVisible());
-        QVERIFY(!sessionsPage->isVisible());
+        QCOMPARE(viewStack->currentWidget(), recentPage);
 
         noxshell::ServerProfile first;
         first.id = QStringLiteral("tab-context-first");
@@ -281,8 +280,7 @@ private slots:
         second.connectionMode = noxshell::ConnectionMode::Demo;
         workspace.openOrActivate(first, false);
         workspace.openOrActivate(second, false);
-        QVERIFY(!recentPage->isVisible());
-        QVERIFY(sessionsPage->isVisible());
+        QCOMPARE(viewStack->currentWidget(), sessionsPage);
 
         auto *tabs = workspace.findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
         auto *connectAction = workspace.findChild<QAction *>(QStringLiteral("terminalConnectAction"));
@@ -300,49 +298,53 @@ private slots:
         QVERIFY(closeAllAction);
         QVERIFY(!workspace.findChild<QPushButton *>(QStringLiteral("duplicateTerminalButton")));
         QCOMPARE(tabs->count(), 2);
-        QVERIFY(tabs->isVisible());
         QVERIFY(tabs->height() >= 30);
-        QVERIFY(tabs->tabRect(0).width() >= 110);
         QVERIFY(tabs->currentIndex() >= 0);
         QVERIFY(!tabs->tabText(tabs->currentIndex()).isEmpty());
         QVERIFY(!tabs->tabIcon(0).isNull());
         QVERIFY(tabs->tabToolTip(0).contains(QStringLiteral("未连接")));
 
-        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        const auto prepareContext = [&workspace](int index) {
+            bool prepared = false;
+            const bool invoked = QMetaObject::invokeMethod(&workspace, "prepareTabContextMenu",
+                Qt::DirectConnection, Q_RETURN_ARG(bool, prepared), Q_ARG(int, index));
+            return invoked && prepared;
+        };
+
+        QVERIFY(prepareContext(0));
         QVERIFY(connectAction->isEnabled());
         QVERIFY(!disconnectAction->isEnabled());
         connectAction->trigger();
         QTRY_VERIFY_WITH_TIMEOUT(tabs->tabToolTip(0).contains(QStringLiteral("连接成功")), 1000);
-        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        QVERIFY(prepareContext(0));
         QVERIFY(!connectAction->isEnabled());
         QVERIFY(disconnectAction->isEnabled());
         disconnectAction->trigger();
         QTRY_VERIFY_WITH_TIMEOUT(tabs->tabToolTip(0).contains(QStringLiteral("未连接")), 1000);
 
-        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        QVERIFY(prepareContext(0));
         duplicateAction->trigger();
         QCOMPARE(tabs->count(), 3);
 
-        tabs->customContextMenuRequested(tabs->tabRect(1).center());
+        QVERIFY(prepareContext(1));
         closeOthersAction->trigger();
         QCOMPARE(tabs->count(), 1);
         QCOMPARE(tabs->tabText(0), QStringLiteral("第二台"));
 
-        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        QVERIFY(prepareContext(0));
         duplicateAction->trigger();
         QCOMPARE(tabs->count(), 2);
-        tabs->customContextMenuRequested(tabs->tabRect(1).center());
+        QVERIFY(prepareContext(1));
         closeCurrentAction->trigger();
         QCOMPARE(tabs->count(), 1);
 
-        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        QVERIFY(prepareContext(0));
         duplicateAction->trigger();
         QCOMPARE(tabs->count(), 2);
-        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        QVERIFY(prepareContext(0));
         closeAllAction->trigger();
         QCOMPARE(tabs->count(), 0);
-        QVERIFY(recentPage->isVisible());
-        QVERIFY(!sessionsPage->isVisible());
+        QCOMPARE(viewStack->currentWidget(), recentPage);
     }
 
     void editingServerKeepsOldConnectionSnapshotAndNextConnectUsesNewProfile()

@@ -142,20 +142,20 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     m_tabs->setTabsClosable(true);
     m_tabs->setElideMode(Qt::ElideRight);
     m_tabs->setContextMenuPolicy(Qt::CustomContextMenu);
-    auto *tabMenu = new QMenu(this);
-    auto *connectAction = tabMenu->addAction(QStringLiteral("连接"));
-    auto *disconnectAction = tabMenu->addAction(QStringLiteral("断开连接"));
-    connectAction->setObjectName(QStringLiteral("terminalConnectAction"));
-    disconnectAction->setObjectName(QStringLiteral("terminalDisconnectAction"));
-    tabMenu->addSeparator();
-    auto *duplicateAction = tabMenu->addAction(QStringLiteral("复制会话"));
+    m_tabMenu = new QMenu(this);
+    m_connectAction = m_tabMenu->addAction(QStringLiteral("连接"));
+    m_disconnectAction = m_tabMenu->addAction(QStringLiteral("断开连接"));
+    m_connectAction->setObjectName(QStringLiteral("terminalConnectAction"));
+    m_disconnectAction->setObjectName(QStringLiteral("terminalDisconnectAction"));
+    m_tabMenu->addSeparator();
+    auto *duplicateAction = m_tabMenu->addAction(QStringLiteral("复制会话"));
     duplicateAction->setObjectName(QStringLiteral("terminalDuplicateAction"));
-    tabMenu->addSeparator();
-    auto *closeCurrentAction = tabMenu->addAction(QStringLiteral("关闭当前"));
-    auto *closeOthersAction = tabMenu->addAction(QStringLiteral("关闭其他"));
-    auto *closeAllAction = tabMenu->addAction(QStringLiteral("关闭全部"));
+    m_tabMenu->addSeparator();
+    auto *closeCurrentAction = m_tabMenu->addAction(QStringLiteral("关闭当前"));
+    m_closeOthersAction = m_tabMenu->addAction(QStringLiteral("关闭其他"));
+    auto *closeAllAction = m_tabMenu->addAction(QStringLiteral("关闭全部"));
     closeCurrentAction->setObjectName(QStringLiteral("terminalCloseCurrentAction"));
-    closeOthersAction->setObjectName(QStringLiteral("terminalCloseOthersAction"));
+    m_closeOthersAction->setObjectName(QStringLiteral("terminalCloseOthersAction"));
     closeAllAction->setObjectName(QStringLiteral("terminalCloseAllAction"));
     auto *clearButton = new QPushButton(QStringLiteral("清屏"));
     clearButton->setObjectName(QStringLiteral("clearTerminalButton"));
@@ -177,33 +177,26 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     });
     connect(m_tabs, &QTabBar::tabCloseRequested, this, &TerminalWorkspace::closeSession);
     connect(m_tabs, &QTabBar::customContextMenuRequested, this,
-        [this, tabMenu, connectAction, disconnectAction, closeOthersAction](const QPoint &position) {
+        [this](const QPoint &position) {
         const int index = m_tabs->tabAt(position);
-        if (index < 0) return;
-        m_tabContextIndex = index;
-        m_tabs->setCurrentIndex(index);
-        const auto phase = static_cast<TabConnectionPhase>(
-            m_stack->widget(index)->property("terminalConnectionPhase").toInt());
-        connectAction->setEnabled(phase == TabConnectionPhase::Disconnected);
-        disconnectAction->setEnabled(phase != TabConnectionPhase::Disconnected);
-        closeOthersAction->setEnabled(m_tabs->count() > 1);
+        if (!prepareTabContextMenu(index)) return;
         // The minimal/offscreen platform plugins used by headless CI do not
         // support popup activation or keyboard grabs. The action state above
         // remains fully testable without asking those plugins to show a menu.
         const QString platformName = QGuiApplication::platformName();
         if (platformName != QStringLiteral("minimal")
             && platformName != QStringLiteral("offscreen")) {
-            tabMenu->popup(m_tabs->mapToGlobal(position));
+            m_tabMenu->popup(m_tabs->mapToGlobal(position));
         }
     });
-    connect(connectAction, &QAction::triggered, this, [this] {
+    connect(m_connectAction, &QAction::triggered, this, [this] {
         if (m_tabContextIndex < 0 || m_tabContextIndex >= m_stack->count()) return;
         auto *page = m_stack->widget(m_tabContextIndex);
         const auto profile = page->property("serverProfile").value<ServerProfile>();
         if (profile.id.isEmpty()) return;
         if (auto *panel = page->findChild<TerminalPanel *>()) panel->connectToServer(profile);
     });
-    connect(disconnectAction, &QAction::triggered, this, [this] {
+    connect(m_disconnectAction, &QAction::triggered, this, [this] {
         if (m_tabContextIndex < 0 || m_tabContextIndex >= m_stack->count()) return;
         if (auto *session = m_stack->widget(m_tabContextIndex)->findChild<SshSession *>()) {
             session->disconnectFromHost();
@@ -211,7 +204,7 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     });
     connect(duplicateAction, &QAction::triggered, this, [this] { duplicateSessionAt(m_tabContextIndex); });
     connect(closeCurrentAction, &QAction::triggered, this, [this] { closeSession(m_tabContextIndex); });
-    connect(closeOthersAction, &QAction::triggered, this, [this] { closeOtherSessions(m_tabContextIndex); });
+    connect(m_closeOthersAction, &QAction::triggered, this, [this] { closeOtherSessions(m_tabContextIndex); });
     connect(closeAllAction, &QAction::triggered, this, &TerminalWorkspace::closeAllSessions);
     connect(clearButton, &QPushButton::clicked, this, [this] {
         const int index = m_tabs->currentIndex();
@@ -230,6 +223,19 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
 
     refreshRecentLogins();
     updateWorkspaceState();
+}
+
+bool TerminalWorkspace::prepareTabContextMenu(int index)
+{
+    if (index < 0 || index >= m_tabs->count() || index >= m_stack->count()) return false;
+    m_tabContextIndex = index;
+    m_tabs->setCurrentIndex(index);
+    const auto phase = static_cast<TabConnectionPhase>(
+        m_stack->widget(index)->property("terminalConnectionPhase").toInt());
+    m_connectAction->setEnabled(phase == TabConnectionPhase::Disconnected);
+    m_disconnectAction->setEnabled(phase != TabConnectionPhase::Disconnected);
+    m_closeOthersAction->setEnabled(m_tabs->count() > 1);
+    return true;
 }
 
 int TerminalWorkspace::sessionCount() const

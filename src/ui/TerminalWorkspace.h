@@ -8,6 +8,8 @@ class QStackedWidget;
 class QTabBar;
 class QTreeWidget;
 class QLabel;
+class QAction;
+class QMenu;
 
 namespace noxshell {
 class CredentialStore;
@@ -40,6 +42,7 @@ signals:
     void commandSubmitted(const QString &serverId, const QString &command);
 
 private:
+    Q_INVOKABLE bool prepareTabContextMenu(int index);
     void addSession(const ServerProfile &profile, bool activate, bool persist, bool connectNow);
     void duplicateSessionAt(int index);
     void closeSession(int index);
@@ -60,6 +63,10 @@ private:
     QWidget *m_sessionsPage{};
     QTreeWidget *m_recentLogins{};
     QLabel *m_recentEmptyLabel{};
+    QMenu *m_tabMenu{};
+    QAction *m_connectAction{};
+    QAction *m_disconnectAction{};
+    QAction *m_closeOthersAction{};
     int m_tabContextIndex{-1};
 };
 
