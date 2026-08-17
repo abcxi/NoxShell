@@ -351,7 +351,6 @@ private slots:
     {
         noxshell::ui::TerminalWorkspace workspace(nullptr, nullptr);
         workspace.resize(900, 500);
-        workspace.show();
 
         noxshell::ServerProfile original;
         original.id = QStringLiteral("edited-live-host");

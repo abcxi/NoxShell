@@ -110,7 +110,18 @@ jobs:
         shell: pwsh
         run: |
           cmake --build build-release --config Release --parallel
-          ctest --test-dir build-release -C Release --output-on-failure
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $testLog = Join-Path $PWD "build-release/NoxShellSmokeTest.log"
+          & ".\build-release\Release\NoxShellSmokeTest.exe" -v1 -o "${testLog},txt"
+          $testExit = $LASTEXITCODE
+          if (Test-Path $testLog) {
+            Get-Content -Path $testLog
+          } else {
+            Write-Error "NoxShellSmokeTest did not create its test log"
+          }
+          if ($testExit -ne 0) {
+            throw "NoxShellSmokeTest failed with exit code $testExit"
+          }
 
       - name: Build NSIS installer and portable ZIP
         shell: pwsh
