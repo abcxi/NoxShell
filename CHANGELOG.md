@@ -1,5 +1,10 @@
 # 变更记录
 
+## 0.2.46 — 2026-08-17
+
+- 修复 macOS GitHub Actions 在 `minimal`/`offscreen` 无界面平台插件下显示终端标签右键菜单时发生段错误的问题；菜单动作状态与行为仍由完整测试覆盖。
+- Windows GitHub Actions 改用 Visual Studio 2022 x64/MSVC 生成器，与 MSVC 版 Qt 和 `x64-windows-static-md` 依赖保持同一工具链，消除 MinGW 链接 MSVC 静态库时的安全 Cookie 符号错误。
+
 ## 0.2.45 — 2026-08-17
 
 - 修复 Qt 6.8 不支持 `qt_generate_deploy_app_script(NO_PLUGINS)` 导致两种 macOS GitHub Actions 构建在 CMake 配置阶段失败的问题；macOS DMG 统一由发布脚本部署所需插件和运行库。

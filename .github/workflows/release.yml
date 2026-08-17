@@ -101,8 +101,7 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S . -B build-release -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
+          cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 `
             -DBUILD_TESTING=ON `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
@@ -110,7 +109,7 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: |
-          cmake --build build-release --parallel
+          cmake --build build-release --config Release --parallel
           ctest --test-dir build-release -C Release --output-on-failure
 
       - name: Build NSIS installer and portable ZIP

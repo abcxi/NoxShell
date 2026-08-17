@@ -7,6 +7,7 @@
 
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QGuiApplication>
 #include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
@@ -186,7 +187,14 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
         connectAction->setEnabled(phase == TabConnectionPhase::Disconnected);
         disconnectAction->setEnabled(phase != TabConnectionPhase::Disconnected);
         closeOthersAction->setEnabled(m_tabs->count() > 1);
-        tabMenu->popup(m_tabs->mapToGlobal(position));
+        // The minimal/offscreen platform plugins used by headless CI do not
+        // support popup activation or keyboard grabs. The action state above
+        // remains fully testable without asking those plugins to show a menu.
+        const QString platformName = QGuiApplication::platformName();
+        if (platformName != QStringLiteral("minimal")
+            && platformName != QStringLiteral("offscreen")) {
+            tabMenu->popup(m_tabs->mapToGlobal(position));
+        }
     });
     connect(connectAction, &QAction::triggered, this, [this] {
         if (m_tabContextIndex < 0 || m_tabContextIndex >= m_stack->count()) return;

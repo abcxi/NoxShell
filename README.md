@@ -1,20 +1,20 @@
 # 玄壳（NoxShell）
 
-面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.45`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
+面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.46`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
 
 ## 下载
 
 [前往 GitHub Releases 下载最新版本](https://github.com/abcxi/NoxShell/releases/latest)
 
-当前版本：`v0.2.45`
+当前版本：`v0.2.46`
 
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/%E7%8E%84%E5%A3%B3-v0.2.45-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/%E7%8E%84%E5%A3%B3-v0.2.45-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/NoxShell-v0.2.45-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/NoxShell-v0.2.45-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.45/SHA256SUMS.txt) | 用于验证下载文件完整性 |
+| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.46/%E7%8E%84%E5%A3%B3-v0.2.46-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.46/%E7%8E%84%E5%A3%B3-v0.2.46-macOS-x86_64.dmg) | Intel 芯片 Mac |
+| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.46/NoxShell-v0.2.46-Windows-x64.exe) | 64 位 Windows，推荐使用 |
+| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.46/NoxShell-v0.2.46-Windows-x64.zip) | 64 位 Windows，解压即用 |
+| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.46/SHA256SUMS.txt) | 用于验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签并且 GitHub Actions 构建成功后出现。私有仓库的下载链接需要先登录具有仓库访问权限的 GitHub 账号。
 
@@ -103,7 +103,7 @@ Windows 使用 CPack + NSIS 生成带开始菜单、桌面快捷方式和卸载�
 - macOS Intel `.dmg`
 - Windows x64 NSIS `.exe` 与便携 `.zip`
 
-标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.45`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
+标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.46`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
 
 本地生成的 macOS 包采用临时签名，未使用 Developer ID 签名或 Apple 公证，仅适合内测；公开分发仍需正式签名与公证。使用当前 Homebrew Qt 构建时应在目标最低版本的 macOS 机器上做一次实际启动测试，正式兼容构建建议使用 Qt Online Installer 提供的官方 Qt。
 

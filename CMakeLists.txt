@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.45 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.46 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)

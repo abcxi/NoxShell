@@ -15,18 +15,17 @@
 `.github/workflows/release.yml` 提供两种触发方式：
 
 - 在 GitHub Actions 页面手动运行：只构建并保存各平台 Artifacts。
-- 推送与项目版本一致的标签（例如 `v0.2.45`）：构建 Windows 与 macOS 安装包，并自动创建或更新 GitHub Release。
+- 推送与项目版本一致的标签（例如 `v0.2.46`）：构建 Windows 与 macOS 安装包，并自动创建或更新 GitHub Release。
 
 自动发布包含 macOS arm64/x86_64 DMG、Windows x64 NSIS EXE/便携 ZIP 和统一的 SHA-256 校验文件。Windows 使用 `vcpkg` 的 `x64-windows-static-md` triplet 静态链接 libssh2/zlib，避免安装后缺少非 Qt DLL；Qt 运行库和插件由 CMake 的 Qt 部署脚本写入安装包。
 
 Windows 本地打包要求：CMake 3.25+、Qt 6.5+、vcpkg、NSIS 3.03+。配置时指定 vcpkg toolchain，然后运行：
 
 ```powershell
-cmake -S . -B build-release -G Ninja `
-  -DCMAKE_BUILD_TYPE=Release `
+cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 `
   -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-cmake --build build-release --parallel
+cmake --build build-release --config Release --parallel
 ctest --test-dir build-release -C Release --output-on-failure
 cpack --config build-release/CPackConfig.cmake -C Release -B output
 ```
