@@ -27,6 +27,7 @@ public:
     [[nodiscard]] int historyLineCount() const { return m_model.historyLineCount(); }
     [[nodiscard]] int columns() const { return m_model.columns(); }
     [[nodiscard]] int rows() const { return m_model.rows(); }
+    [[nodiscard]] QSizeF cellSize() const { return {m_cellWidth, m_cellHeight}; }
 
 signals:
     void inputGenerated(const QByteArray &data);

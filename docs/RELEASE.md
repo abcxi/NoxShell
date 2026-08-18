@@ -15,7 +15,7 @@
 `.github/workflows/release.yml` 提供两种触发方式：
 
 - 在 GitHub Actions 页面手动运行：只构建并保存各平台 Artifacts。
-- 推送与项目版本一致的标签（例如 `v0.2.49`）：构建 Windows 与 macOS 安装包，并自动创建或更新 GitHub Release。
+- 推送与项目版本一致的标签（例如 `v0.2.50`）：构建 Windows 与 macOS 安装包，并自动创建或更新 GitHub Release。
 
 自动发布包含 macOS arm64/x86_64 DMG、Windows x64 NSIS EXE/便携 ZIP 和统一的 SHA-256 校验文件。Windows 使用 `vcpkg` 的 `x64-windows-static-md` triplet 静态链接 libssh2/zlib，避免安装后缺少非 Qt DLL；Qt 运行库和插件由 CMake 的 Qt 部署脚本写入安装包。
 

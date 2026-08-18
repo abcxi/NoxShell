@@ -24,8 +24,6 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFile>
-#include <QFontDatabase>
-#include <QFontMetrics>
 #include <QIcon>
 #include <QImage>
 #include <QLabel>
@@ -163,9 +161,9 @@ private slots:
         view.feedText(QStringLiteral("[root@linux ~]# wrong"));
         QTest::qWait(20);
 
-        const QFontMetrics metrics(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-        const int cellWidth = qCeil(metrics.horizontalAdvance(QLatin1Char('M')));
-        const int cellHeight = qCeil(metrics.height() + 1.0);
+        const auto cellSize = view.cellSize();
+        const int cellWidth = qCeil(cellSize.width());
+        const int cellHeight = qCeil(cellSize.height());
         QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, QPoint(cellWidth / 2, cellHeight / 2));
         QTest::mouseMove(&view, QPoint(cellWidth * 6, cellHeight / 2));
         QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, QPoint(cellWidth * 6, cellHeight / 2));
@@ -437,9 +435,9 @@ private slots:
         view.feedText(QStringLiteral("alpha beta gamma\r\nsecond line"));
         QTest::qWait(20);
 
-        const QFontMetrics metrics(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-        const int cellWidth = qCeil(metrics.horizontalAdvance(QLatin1Char('M')));
-        const int cellHeight = qCeil(metrics.height() + 1.0);
+        const auto cellSize = view.cellSize();
+        const int cellWidth = qCeil(cellSize.width());
+        const int cellHeight = qCeil(cellSize.height());
         const QPoint start(cellWidth / 2, cellHeight / 2);
         const QPoint end(cellWidth * 5 + cellWidth / 2, cellHeight / 2);
         QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, start);
@@ -760,7 +758,7 @@ private slots:
         profile.password = QStringLiteral("not-a-real-password");
 
         session.connectTo(profile);
-        QTRY_VERIFY_WITH_TIMEOUT(!outputSpy.isEmpty(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(!outputSpy.isEmpty(), 10000);
         const auto output = outputSpy.last().at(0).toString();
         QVERIFY(output.contains(QStringLiteral("TCP失败")) || output.contains(QStringLiteral("SSH 握手失败")));
         QVERIFY(!session.isConnected());

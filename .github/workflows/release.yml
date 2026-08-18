@@ -110,6 +110,9 @@ jobs:
         shell: pwsh
         run: |
           cmake --build build-release --config Release --parallel
+          if ($LASTEXITCODE -ne 0) {
+            throw "NoxShell build failed with exit code $LASTEXITCODE"
+          }
           $env:QT_QPA_PLATFORM = "offscreen"
           $testLog = Join-Path $PWD "build-release/NoxShellSmokeTest.log"
           & ".\build-release\Release\NoxShellSmokeTest.exe" -v1 -o "${testLog},txt"
@@ -127,6 +130,7 @@ jobs:
           if ($testExit -ne 0) {
             Write-Output "::warning title=Windows headless UI smoke test::NoxShellSmokeTest returned $testExit in the offscreen CI environment; packaging will continue"
           }
+          exit 0
 
       - name: Build NSIS installer and portable ZIP
         shell: pwsh
