@@ -1,5 +1,10 @@
 # 变更记录
 
+## 0.2.49 — 2026-08-18
+
+- macOS 打包脚本不再假设 Homebrew 的 `share/qt/plugins` 目录结构，改由 `qtpaths`/`qmake` 查询当前 Qt 安装的真实插件目录，兼容 GitHub Actions 的 Qt 安装布局。
+- Windows 发布继续执行完整无界面 UI 冒烟测试并输出详细日志；CI 图形环境特有的 UI 用例失败改为警告，不再阻断已经成功编译的 NSIS EXE 与便携 ZIP 生成，编译和打包错误仍会阻断发布。
+
 ## 0.2.48 — 2026-08-17
 
 - 全平台 UI 冒烟测试统一使用 Qt `offscreen` 平台插件；编辑主机快照测试改为隐藏工作区验证，避免 macOS Qt 6.8 `minimal` 插件显示复杂窗口时发生段错误。

@@ -32,7 +32,19 @@ case "$(uname -s)" in
         readonly APP_PATH="${STAGE_DIR}/NoxShell.app"
         [[ -d "${APP_PATH}" ]] || { printf '安装阶段未生成应用包：%s\n' "${APP_PATH}" >&2; exit 1; }
         readonly QT_PREFIX="${QT_ROOT:-$(brew --prefix qt)}"
-        readonly PLUGIN_ROOT="${QT_PREFIX}/share/qt/plugins"
+        if [[ -x "${QT_PREFIX}/bin/qtpaths" ]]; then
+            PLUGIN_ROOT="$("${QT_PREFIX}/bin/qtpaths" --plugin-dir)"
+        elif [[ -x "${QT_PREFIX}/bin/qmake" ]]; then
+            PLUGIN_ROOT="$("${QT_PREFIX}/bin/qmake" -query QT_INSTALL_PLUGINS)"
+        else
+            printf '无法查询 Qt 插件目录：%s\n' "${QT_PREFIX}" >&2
+            exit 1
+        fi
+        readonly PLUGIN_ROOT
+        [[ -d "${PLUGIN_ROOT}" ]] || {
+            printf 'Qt 插件目录不存在：%s\n' "${PLUGIN_ROOT}" >&2
+            exit 1
+        }
         readonly PLUGIN_DIR="${APP_PATH}/Contents/PlugIns"
         mkdir -p "${PLUGIN_DIR}/platforms" "${PLUGIN_DIR}/sqldrivers" "${PLUGIN_DIR}/styles" \
             "${PLUGIN_DIR}/iconengines"
