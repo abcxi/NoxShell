@@ -159,9 +159,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     [[ -d "${APP_PATH}" ]] || fail "未找到应用包: ${APP_PATH}"
     printf '启动: %s\n' "${APP_PATH}"
     if ((${#APP_ARGS[@]} > 0)); then
-        open "${APP_PATH}" --args "${APP_ARGS[@]}"
+        # `open` 默认会激活已经运行的旧进程，导致刚编译的界面看起来没有更新。
+        # `-n` 强制从本次构建产物启动一个新实例。
+        open -n "${APP_PATH}" --args "${APP_ARGS[@]}"
     else
-        open "${APP_PATH}"
+        open -n "${APP_PATH}"
     fi
 else
     APP_PATH="${BUILD_DIR}/NoxShell"

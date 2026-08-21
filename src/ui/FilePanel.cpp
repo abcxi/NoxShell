@@ -1,6 +1,7 @@
 #include "FilePanel.h"
 
 #include "../core/SshSession.h"
+#include "FilePermissionDialog.h"
 #include "RemoteFileEditor.h"
 #include "TransferQueuePanel.h"
 
@@ -19,7 +20,6 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
-#include <QPushButton>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QSplitter>
@@ -41,6 +41,8 @@ constexpr int kPathRole = Qt::UserRole;
 constexpr int kDirectoryRole = Qt::UserRole + 1;
 constexpr int kDirectoryLoadedRole = Qt::UserRole + 2;
 constexpr int kPlaceholderRole = Qt::UserRole + 3;
+constexpr int kPermissionsRole = Qt::UserRole + 4;
+constexpr int kSymbolicLinkRole = Qt::UserRole + 5;
 
 QString permissionText(quint32 mode)
 {
@@ -92,57 +94,54 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     auto *header = new QWidget;
     header->setObjectName(QStringLiteral("fileToolbar"));
     auto *headerLayout = new QHBoxLayout(header);
-    headerLayout->setContentsMargins(11, 0, 9, 0);
+    headerLayout->setContentsMargins(11, 6, 9, 6);
     headerLayout->setSpacing(6);
     auto *title = new QLabel(QStringLiteral("文件管理"));
     title->setStyleSheet(QStringLiteral("font-weight:650;"));
     m_serverLabel = new QLabel(QStringLiteral("SFTP"));
     m_serverLabel->setObjectName(QStringLiteral("fileServerLabel"));
     m_serverLabel->setStyleSheet(QStringLiteral("color:#738297;font-size:12px;"));
-    m_moreButton = new QToolButton;
     m_transferQueueButton = new QToolButton;
-    m_moreButton->setObjectName(QStringLiteral("fileMoreButton"));
     m_transferQueueButton->setObjectName(QStringLiteral("transferQueueButton"));
-    auto *moreMenu = new QMenu(m_moreButton);
-    m_newFileAction = moreMenu->addAction(QStringLiteral("新建文件"));
+    m_contextMenu = new QMenu(this);
+    m_contextMenu->setObjectName(QStringLiteral("fileContextMenu"));
+    m_newFileAction = m_contextMenu->addAction(QStringLiteral("新建文件"));
     m_newFileAction->setObjectName(QStringLiteral("fileNewFileAction"));
-    m_newDirectoryAction = moreMenu->addAction(QStringLiteral("新建目录"));
+    m_newDirectoryAction = m_contextMenu->addAction(QStringLiteral("新建目录"));
     m_newDirectoryAction->setObjectName(QStringLiteral("fileNewDirectoryAction"));
-    moreMenu->addSeparator();
-    m_downloadAction = moreMenu->addAction(QStringLiteral("下载所选文件"));
+    m_contextMenu->addSeparator();
+    m_downloadAction = m_contextMenu->addAction(QStringLiteral("下载所选文件"));
     m_downloadAction->setObjectName(QStringLiteral("fileContextDownloadAction"));
-    moreMenu->addSeparator();
-    m_renameAction = moreMenu->addAction(QStringLiteral("重命名"));
-    m_removeAction = moreMenu->addAction(QStringLiteral("删除"));
+    m_contextMenu->addSeparator();
+    m_renameAction = m_contextMenu->addAction(QStringLiteral("重命名"));
+    m_permissionsAction = m_contextMenu->addAction(QStringLiteral("权限管理"));
+    m_removeAction = m_contextMenu->addAction(QStringLiteral("删除"));
     m_renameAction->setObjectName(QStringLiteral("fileRenameAction"));
+    m_permissionsAction->setObjectName(QStringLiteral("filePermissionsAction"));
     m_removeAction->setObjectName(QStringLiteral("fileRemoveAction"));
-    m_moreButton->setText(QStringLiteral("⋯"));
-    m_moreButton->setMenu(moreMenu);
-    m_moreButton->setPopupMode(QToolButton::InstantPopup);
-    m_moreButton->setAutoRaise(true);
-    m_moreButton->setFixedSize(28, 28);
     m_transferQueueButton->setIcon(QIcon(QStringLiteral(":/assets/transfer-queue.svg")));
-    m_transferQueueButton->setIconSize(QSize(18, 18));
+    m_transferQueueButton->setIconSize(QSize(16, 16));
     m_transferQueueButton->setToolTip(QStringLiteral("传输队列 · 空闲"));
     m_transferQueueButton->setAccessibleName(QStringLiteral("打开传输队列"));
     m_transferQueueButton->setAutoRaise(true);
-    m_transferQueueButton->setFixedSize(28, 28);
+    m_transferQueueButton->setFixedSize(26, 26);
     m_transferQueueButton->setStyleSheet(QStringLiteral(
-        "QToolButton{border:1px solid transparent;border-radius:4px;padding:3px;}"
+        "QToolButton{border:1px solid transparent;border-radius:4px;padding:0;background:transparent;}"
         "QToolButton:hover,QToolButton::menu-button:hover{background:#F0F5FA;border-color:#D5DFEA;}"
+        "QToolButton:pressed{background:#E7EFF7;border-color:#BFCEDF;}"
         "QToolButton[active=\"true\"]{background:#E8F3FF;border-color:#8BBFFF;}"
         "QToolButton::menu-indicator{image:none;}"));
 
-    auto *queueMenu = new QMenu(m_transferQueueButton);
-    queueMenu->setObjectName(QStringLiteral("transferQueueMenu"));
-    queueMenu->setStyleSheet(QStringLiteral("QMenu{padding:0;border:1px solid #CCD7E3;border-radius:5px;background:#FBFCFD;}"));
-    auto *queueWidgetAction = new QWidgetAction(queueMenu);
+    m_transferQueueMenu = new QMenu(m_transferQueueButton);
+    m_transferQueueMenu->setObjectName(QStringLiteral("transferQueueMenu"));
+    m_transferQueueMenu->setStyleSheet(QStringLiteral("QMenu{padding:0;border:1px solid #CCD7E3;border-radius:5px;background:#FBFCFD;}"));
+    auto *queueWidgetAction = new QWidgetAction(m_transferQueueMenu);
     m_transferQueuePanel = new TransferQueuePanel(m_session);
     m_transferQueuePanel->setProperty("popup", true);
-    m_transferQueuePanel->setFixedWidth(500);
+    m_transferQueuePanel->setFixedWidth(520);
     queueWidgetAction->setDefaultWidget(m_transferQueuePanel);
-    queueMenu->addAction(queueWidgetAction);
-    m_transferQueueButton->setMenu(queueMenu);
+    m_transferQueueMenu->addAction(queueWidgetAction);
+    m_transferQueueButton->setMenu(m_transferQueueMenu);
     m_transferQueueButton->setPopupMode(QToolButton::InstantPopup);
 
     m_statusLabel = new QLabel(QStringLiteral("  等待 SSH 连接"));
@@ -152,20 +151,35 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     m_statusLabel->setStyleSheet(QStringLiteral("color:#738297;font-size:11px;"));
 
-    m_backButton = new QPushButton(QStringLiteral("‹"));
-    m_upButton = new QPushButton(QStringLiteral("↑"));
-    m_refreshButton = new QPushButton(QStringLiteral("↻"));
+    m_backButton = new QToolButton;
+    m_upButton = new QToolButton;
+    m_refreshButton = new QToolButton;
     m_backButton->setObjectName(QStringLiteral("fileBackButton"));
     m_upButton->setObjectName(QStringLiteral("fileUpButton"));
     m_refreshButton->setObjectName(QStringLiteral("fileRefreshButton"));
+    m_backButton->setIcon(QIcon(QStringLiteral(":/assets/file-back.svg")));
+    m_upButton->setIcon(QIcon(QStringLiteral(":/assets/file-up.svg")));
+    m_refreshButton->setIcon(QIcon(QStringLiteral(":/assets/file-refresh.svg")));
+    m_backButton->setToolTip(QStringLiteral("返回"));
+    m_upButton->setToolTip(QStringLiteral("上级目录"));
+    m_refreshButton->setToolTip(QStringLiteral("刷新目录"));
+    const auto compactToolButtonStyle = QStringLiteral(
+        "QToolButton{border:1px solid transparent;border-radius:4px;padding:0;background:transparent;}"
+        "QToolButton:hover{background:#F0F5FA;border-color:#D5DFEA;}"
+        "QToolButton:pressed{background:#E7EFF7;border-color:#BFCEDF;}"
+        "QToolButton:disabled{opacity:0.45;}");
     for (auto *button : {m_backButton, m_upButton, m_refreshButton}) {
-        button->setFixedSize(28, 28);
-        button->setStyleSheet(QStringLiteral("padding:0;"));
+        button->setAutoRaise(true);
+        button->setFixedSize(26, 26);
+        button->setIconSize(QSize(16, 16));
+        button->setStyleSheet(compactToolButtonStyle);
     }
     m_pathEdit = new QLineEdit(QStringLiteral("/"));
     m_pathEdit->setObjectName(QStringLiteral("remotePathEdit"));
     m_pathEdit->setMinimumWidth(120);
-    m_pathEdit->setFixedHeight(28);
+    m_pathEdit->setFixedHeight(26);
+    m_pathEdit->setStyleSheet(QStringLiteral(
+        "QLineEdit#remotePathEdit{min-height:24px;max-height:24px;padding:0 9px;}"));
 
     headerLayout->addWidget(title);
     headerLayout->addWidget(m_serverLabel);
@@ -175,7 +189,6 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     headerLayout->addWidget(m_pathEdit, 1);
     headerLayout->addWidget(m_refreshButton);
     headerLayout->addWidget(m_transferQueueButton);
-    headerLayout->addWidget(m_moreButton);
 
     m_tree = new QTreeWidget;
     m_tree->setObjectName(QStringLiteral("remoteFileTree"));
@@ -229,11 +242,18 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
             m_transferQueueButton->style()->unpolish(m_transferQueueButton);
             m_transferQueueButton->style()->polish(m_transferQueueButton);
         });
+    connect(m_transferQueuePanel, &TransferQueuePanel::taskAdded, this, [this] {
+        QTimer::singleShot(0, this, [this] {
+            if (!isVisible() || !m_transferQueueMenu || m_transferQueueMenu->isVisible()) return;
+            m_transferQueueMenu->popup(
+                m_transferQueueButton->mapToGlobal(QPoint(0, m_transferQueueButton->height())));
+        });
+    });
 
-    connect(m_refreshButton, &QPushButton::clicked, this, [this] { navigateTo(m_currentPath, false); });
+    connect(m_refreshButton, &QToolButton::clicked, this, [this] { navigateTo(m_currentPath, false); });
     connect(m_pathEdit, &QLineEdit::returnPressed, this, [this] { navigateTo(m_pathEdit->text()); });
-    connect(m_upButton, &QPushButton::clicked, this, &FilePanel::navigateUp);
-    connect(m_backButton, &QPushButton::clicked, this, &FilePanel::navigateBack);
+    connect(m_upButton, &QToolButton::clicked, this, &FilePanel::navigateUp);
+    connect(m_backButton, &QToolButton::clicked, this, &FilePanel::navigateBack);
     connect(m_tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item) {
         if (item->data(0, kDirectoryRole).toBool()) navigateTo(item->data(0, kPathRole).toString());
         else openFile(item);
@@ -248,7 +268,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
             m_tree->clearSelection();
         }
         updateActionState();
-        if (m_connected) m_moreButton->menu()->exec(m_tree->viewport()->mapToGlobal(position));
+        if (m_connected) m_contextMenu->exec(m_tree->viewport()->mapToGlobal(position));
     });
     connect(m_directoryTree, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
         requestDirectoryNode(item);
@@ -263,6 +283,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     connect(m_newFileAction, &QAction::triggered, this, &FilePanel::createFile);
     connect(m_newDirectoryAction, &QAction::triggered, this, &FilePanel::createDirectory);
     connect(m_renameAction, &QAction::triggered, this, &FilePanel::renameSelected);
+    connect(m_permissionsAction, &QAction::triggered, this, &FilePanel::changeSelectedPermissions);
     connect(m_removeAction, &QAction::triggered, this, &FilePanel::removeSelected);
     connect(m_session, &SshSession::directoryListed, this, &FilePanel::showEntries);
     connect(m_session, &SshSession::directoryListingFailed, this, &FilePanel::showError);
@@ -289,10 +310,17 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
         });
     connect(m_session, &SshSession::fileOperationFinished, this,
         [this](RemoteFileOperation operation, const QString &path) {
-            const auto names = QStringList{QStringLiteral("上传"), QStringLiteral("下载"), QStringLiteral("新建目录"), QStringLiteral("重命名"), QStringLiteral("删除")};
+            if (operation == RemoteFileOperation::Remove && !m_removeQueue.isEmpty()) {
+                m_removeQueue.removeFirst();
+                ++m_removeSucceeded;
+                QTimer::singleShot(0, this, &FilePanel::startNextRemoval);
+                return;
+            }
+            const auto names = QStringList{QStringLiteral("上传"), QStringLiteral("下载"), QStringLiteral("新建目录"),
+                QStringLiteral("重命名"), QStringLiteral("删除"), QStringLiteral("权限修改")};
             m_statusLabel->setText(QStringLiteral("  %1完成  ·  %2").arg(names.value(static_cast<int>(operation)), QFileInfo(path).fileName()));
             if (operation == RemoteFileOperation::MakeDirectory || operation == RemoteFileOperation::Rename
-                || operation == RemoteFileOperation::Remove) {
+                || operation == RemoteFileOperation::Remove || operation == RemoteFileOperation::ChangePermissions) {
                 m_mutationInFlight = false;
                 if (auto *directoryNode = directoryItemForPath(m_currentPath)) {
                     directoryNode->setData(0, kDirectoryLoadedRole, false);
@@ -303,9 +331,15 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
             updateActionState();
         });
     connect(m_session, &SshSession::fileOperationFailed, this,
-        [this](RemoteFileOperation operation, const QString &, const QString &message) {
+        [this](RemoteFileOperation operation, const QString &path, const QString &message) {
+            if (operation == RemoteFileOperation::Remove && !m_removeQueue.isEmpty()) {
+                m_removeFailures.append(QStringLiteral("%1：%2").arg(QFileInfo(path).fileName(), message));
+                m_removeQueue.removeFirst();
+                QTimer::singleShot(0, this, &FilePanel::startNextRemoval);
+                return;
+            }
             if (operation == RemoteFileOperation::MakeDirectory || operation == RemoteFileOperation::Rename
-                || operation == RemoteFileOperation::Remove) {
+                || operation == RemoteFileOperation::Remove || operation == RemoteFileOperation::ChangePermissions) {
                 m_mutationInFlight = false;
             }
             m_statusLabel->setText(QStringLiteral("  操作失败 · %1").arg(message));
@@ -358,6 +392,12 @@ void FilePanel::setServer(const ServerProfile &profile)
     m_directoryTargetPath.clear();
     m_pendingDirectoryNodes.clear();
     m_mutationInFlight = false;
+    m_removeQueue.clear();
+    m_removeTotal = 0;
+    m_removeSucceeded = 0;
+    m_removeFailures.clear();
+    m_statusLabel->setToolTip({});
+    m_postRefreshStatus.clear();
     m_history = {m_currentPath};
     m_historyIndex = 0;
     m_tree->clear();
@@ -470,10 +510,17 @@ void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entrie
                                                                : entry.symbolicLink ? QStyle::SP_FileLinkIcon : QStyle::SP_FileIcon));
         item->setData(0, kPathRole, entry.path);
         item->setData(0, kDirectoryRole, entry.directory);
+        item->setData(0, kPermissionsRole, entry.permissions);
+        item->setData(0, kSymbolicLinkRole, entry.symbolicLink);
         item->setToolTip(0, entry.path);
         item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
     }
-    m_statusLabel->setText(QStringLiteral("  %1 个项目  ·  %2").arg(entries.size()).arg(path));
+    if (m_postRefreshStatus.isEmpty()) {
+        m_statusLabel->setText(QStringLiteral("  %1 个项目  ·  %2").arg(entries.size()).arg(path));
+    } else {
+        m_statusLabel->setText(m_postRefreshStatus);
+        m_postRefreshStatus.clear();
+    }
     revealDirectoryPath(path);
     updateActionState();
 }
@@ -621,9 +668,10 @@ void FilePanel::updateActionState()
     m_newFileAction->setEnabled(canMutate);
     m_newDirectoryAction->setEnabled(canMutate);
     m_downloadAction->setEnabled(m_connected && fileCount > 0);
-    m_moreButton->setEnabled(m_connected && m_tree->isEnabled());
     m_renameAction->setEnabled(hasSelection && singleSelection);
-    m_removeAction->setEnabled(hasSelection && singleSelection);
+    m_removeAction->setEnabled(hasSelection);
+    m_permissionsAction->setEnabled(hasSelection && singleSelection
+        && !items.first()->data(0, kSymbolicLinkRole).toBool());
 }
 
 void FilePanel::uploadFile()
@@ -854,22 +902,91 @@ void FilePanel::finishInlineRename(bool submit)
 void FilePanel::removeSelected()
 {
     if (m_mutationInFlight || m_inlineRenameActive) return;
-    if (selectedEntries().size() != 1) return;
-    auto *item = selectedEntry();
-    if (!item) return;
-    const auto path = item->data(0, kPathRole).toString();
-    const bool directory = item->data(0, kDirectoryRole).toBool();
+    const auto items = selectedEntries();
+    if (items.isEmpty()) return;
     const auto answer = QMessageBox::warning(this, QStringLiteral("删除远端项目"),
-        directory
-            ? QStringLiteral("确定删除空目录“%1”吗？非空目录会被服务器拒绝。此操作不可撤销。").arg(QFileInfo(path).fileName())
-            : QStringLiteral("确定删除文件“%1”吗？此操作不可撤销。").arg(QFileInfo(path).fileName()),
+        items.size() == 1
+            ? (items.first()->data(0, kDirectoryRole).toBool()
+                    ? QStringLiteral("确定删除空目录“%1”吗？非空目录会被服务器拒绝。此操作不可撤销。")
+                          .arg(QFileInfo(items.first()->data(0, kPathRole).toString()).fileName())
+                    : QStringLiteral("确定删除文件“%1”吗？此操作不可撤销。")
+                          .arg(QFileInfo(items.first()->data(0, kPathRole).toString()).fileName()))
+            : QStringLiteral("确定删除选中的 %1 个项目吗？非空目录会被服务器拒绝，其他项目仍会继续删除。此操作不可撤销。")
+                  .arg(items.size()),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes) return;
+
+    m_removeQueue.clear();
+    for (auto *item : items) {
+        const auto path = item->data(0, kPathRole).toString();
+        if (!path.isEmpty()) m_removeQueue.append({path, item->data(0, kDirectoryRole).toBool()});
+    }
+    if (m_removeQueue.isEmpty()) return;
+    m_removeTotal = m_removeQueue.size();
+    m_removeSucceeded = 0;
+    m_removeFailures.clear();
+    m_statusLabel->setToolTip({});
     m_mutationInFlight = true;
     m_tree->clearSelection();
-    m_statusLabel->setText(QStringLiteral("  正在删除 · %1").arg(QFileInfo(path).fileName()));
     updateActionState();
-    m_session->removePath(path, directory);
+    startNextRemoval();
+}
+
+void FilePanel::startNextRemoval()
+{
+    if (m_removeQueue.isEmpty()) {
+        finishRemovalBatch();
+        return;
+    }
+    const auto &next = m_removeQueue.first();
+    const int current = m_removeTotal - m_removeQueue.size() + 1;
+    m_statusLabel->setText(QStringLiteral("  正在删除 %1/%2 · %3")
+            .arg(current)
+            .arg(m_removeTotal)
+            .arg(QFileInfo(next.first).fileName()));
+    m_session->removePath(next.first, next.second);
+}
+
+void FilePanel::finishRemovalBatch()
+{
+    m_mutationInFlight = false;
+    if (auto *directoryNode = directoryItemForPath(m_currentPath)) {
+        directoryNode->setData(0, kDirectoryLoadedRole, false);
+        requestDirectoryNode(directoryNode);
+    }
+    if (m_removeFailures.isEmpty()) {
+        m_postRefreshStatus = QStringLiteral("  已删除 %1 个项目").arg(m_removeSucceeded);
+    } else {
+        m_postRefreshStatus = QStringLiteral("  删除完成：成功 %1，失败 %2 · %3")
+                .arg(m_removeSucceeded)
+                .arg(m_removeFailures.size())
+                .arg(m_removeFailures.join(QStringLiteral("；")));
+        m_statusLabel->setToolTip(m_removeFailures.join(QLatin1Char('\n')));
+    }
+    navigateTo(m_currentPath, false);
+    updateActionState();
+}
+
+void FilePanel::changeSelectedPermissions()
+{
+    if (m_mutationInFlight || m_inlineRenameActive || selectedEntries().size() != 1) return;
+    auto *item = selectedEntry();
+    if (!item || item->data(0, kSymbolicLinkRole).toBool()) return;
+
+    RemoteFileEntry entry;
+    entry.name = item->text(0);
+    entry.path = item->data(0, kPathRole).toString();
+    entry.directory = item->data(0, kDirectoryRole).toBool();
+    entry.symbolicLink = item->data(0, kSymbolicLinkRole).toBool();
+    entry.permissions = item->data(0, kPermissionsRole).toUInt();
+    if (entry.path.isEmpty()) return;
+
+    FilePermissionDialog dialog(entry, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    m_mutationInFlight = true;
+    m_statusLabel->setText(QStringLiteral("  正在修改权限 · %1").arg(entry.name));
+    updateActionState();
+    m_session->changePermissions(entry.path, dialog.permissions(), dialog.recursive(), dialog.scope());
 }
 
 void FilePanel::navigateBack()

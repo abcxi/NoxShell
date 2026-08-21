@@ -29,6 +29,15 @@ struct LoginHistoryEntry {
     QDateTime connectedAt;
 };
 
+struct CommandHistoryEntry {
+    qint64 id{};
+    QString serverId;
+    QString command;
+    QString note;
+    bool favorite{false};
+    QDateTime executedAt;
+};
+
 class ServerRepository final : public QObject {
     Q_OBJECT
 
@@ -38,7 +47,11 @@ public:
 
     bool initialize();
     [[nodiscard]] QVector<ServerProfile> loadServers();
+    [[nodiscard]] QStringList loadServerGroups();
     bool saveServer(ServerProfile &profile);
+    bool saveServerGroup(const QString &name);
+    bool renameServerGroup(const QString &oldName, const QString &newName);
+    bool deleteServerGroup(const QString &name);
     bool deleteServer(const QString &id);
     bool saveKnownHost(const QString &host, quint16 port, const QString &algorithm, const QString &fingerprint);
     [[nodiscard]] QString knownHostFingerprint(const QString &host, quint16 port);
@@ -46,6 +59,15 @@ public:
     bool saveTerminalState(const QStringList &serverIds, int currentIndex);
     bool recordSuccessfulLogin(const QString &serverId, const QDateTime &connectedAt = QDateTime::currentDateTime());
     [[nodiscard]] QVector<LoginHistoryEntry> loadRecentLogins(int limit = 20);
+    bool recordCommand(const QString &serverId, const QString &command,
+        const QDateTime &executedAt = QDateTime::currentDateTime());
+    [[nodiscard]] QVector<CommandHistoryEntry> loadCommandHistory(
+        const QString &serverId, bool favoritesOnly = false, int limit = 200);
+    bool setCommandFavorite(qint64 id, bool favorite);
+    bool setCommandNote(qint64 id, const QString &note);
+    bool deleteCommandHistory(qint64 id);
+    bool clearCommandHistory(const QString &serverId);
+    bool clearCommandFavorites(const QString &serverId);
     bool saveMetricSample(const QString &serverId, const MetricSample &sample);
     [[nodiscard]] QVector<MetricHistoryPoint> loadMetricHistory(const QString &serverId, const QDateTime &since);
     [[nodiscard]] MonitoringThresholds loadMonitoringThresholds(const QString &serverId);

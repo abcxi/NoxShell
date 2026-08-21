@@ -6,11 +6,14 @@
 #include "../src/core/SshSession.h"
 #include "../src/core/ServerRepository.h"
 #include "../src/ui/AppTheme.h"
+#include "../src/ui/CommandHistoryPanel.h"
 #include "../src/ui/FilePanel.h"
+#include "../src/ui/FilePermissionDialog.h"
 #include "../src/ui/HostSidebar.h"
 #include "../src/ui/MainWindow.h"
 #include "../src/ui/RemoteFileEditor.h"
 #include "../src/ui/ServerDialog.h"
+#include "../src/ui/TerminalSettingsDialog.h"
 #include "../src/ui/TerminalWorkspace.h"
 #include "../src/ui/TrendChart.h"
 #include "../src/ui/TransferQueuePanel.h"
@@ -19,11 +22,15 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QContextMenuEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QDoubleSpinBox>
 #include <QFile>
+#include <QFontComboBox>
+#include <QHBoxLayout>
 #include <QIcon>
 #include <QImage>
 #include <QLabel>
@@ -32,7 +39,11 @@
 #include <QListWidget>
 #include <QMimeData>
 #include <QMenu>
+#include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QProgressBar>
+#include <QProgressDialog>
+#include <QRadioButton>
 #include <QScrollBar>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -42,9 +53,11 @@
 #include <QPushButton>
 #include <QTabBar>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
 #include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
 #include <QUrl>
 #include <QtTest>
 
@@ -138,6 +151,60 @@ private slots:
         QVERIFY(!sizeSpy.isEmpty());
     }
 
+    void terminalViewSendsTabOncePerPhysicalKeyPress()
+    {
+        noxshell::ui::TerminalView view;
+        QSignalSpy inputSpy(&view, &noxshell::ui::TerminalView::inputGenerated);
+        view.resize(640, 240);
+        view.show();
+        view.setFocus();
+
+        QKeyEvent firstPress(QEvent::KeyPress, Qt::Key_Tab, Qt::NoModifier, QStringLiteral("\t"));
+        QKeyEvent duplicatePress(QEvent::KeyPress, Qt::Key_Tab, Qt::NoModifier, QStringLiteral("\t"));
+        QKeyEvent repeatPress(QEvent::KeyPress, Qt::Key_Tab, Qt::NoModifier, QStringLiteral("\t"), true, 2);
+        QKeyEvent release(QEvent::KeyRelease, Qt::Key_Tab, Qt::NoModifier, QStringLiteral("\t"));
+        QApplication::sendEvent(&view, &firstPress);
+        QApplication::sendEvent(&view, &duplicatePress);
+        QApplication::sendEvent(&view, &repeatPress);
+        QApplication::sendEvent(&view, &release);
+
+        QCOMPARE(inputSpy.count(), 1);
+        QCOMPARE(inputSpy.first().at(0).toByteArray(), QByteArray("\t"));
+
+        QTest::keyClick(&view, Qt::Key_Tab);
+        QCOMPARE(inputSpy.count(), 2);
+        QCOMPARE(inputSpy.last().at(0).toByteArray(), QByteArray("\t"));
+    }
+
+    void terminalAppearanceUpdatesFontAndLineSpacing()
+    {
+        const auto originalDefault = noxshell::ui::TerminalView::defaultAppearance();
+        noxshell::ui::TerminalView view;
+        view.resize(640, 300);
+        view.show();
+        QTest::qWait(20);
+
+        const auto originalCellHeight = view.cellSize().height();
+        auto changed = originalDefault;
+        changed.pointSize = qMin(32, qMax(8, originalDefault.pointSize + 2));
+        changed.lineSpacing = 1.5;
+        view.setAppearance(changed);
+
+        QCOMPARE(view.appearance().pointSize, changed.pointSize);
+        QCOMPARE(view.appearance().lineSpacing, changed.lineSpacing);
+        QVERIFY(view.cellSize().height() > originalCellHeight);
+        noxshell::ui::TerminalView::setDefaultAppearance(originalDefault);
+    }
+
+    void terminalSettingsDialogExposesFontSizeAndSpacingControls()
+    {
+        noxshell::ui::TerminalSettingsDialog dialog(noxshell::ui::TerminalView::defaultAppearance());
+        QVERIFY(dialog.findChild<QFontComboBox *>(QStringLiteral("terminalFontFamilyCombo")));
+        QVERIFY(dialog.findChild<QSpinBox *>(QStringLiteral("terminalFontSizeSpin")));
+        QVERIFY(dialog.findChild<QDoubleSpinBox *>(QStringLiteral("terminalLineSpacingSpin")));
+        QVERIFY(dialog.findChild<QLabel *>(QStringLiteral("terminalAppearancePreview")));
+    }
+
     void terminalViewReportsSubmittedCommandAfterEditing()
     {
         noxshell::ui::TerminalView view;
@@ -164,9 +231,12 @@ private slots:
         const auto cellSize = view.cellSize();
         const int cellWidth = qCeil(cellSize.width());
         const int cellHeight = qCeil(cellSize.height());
-        QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, QPoint(cellWidth / 2, cellHeight / 2));
-        QTest::mouseMove(&view, QPoint(cellWidth * 6, cellHeight / 2));
-        QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, QPoint(cellWidth * 6, cellHeight / 2));
+        const auto origin = view.contentOrigin().toPoint();
+        QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier,
+            origin + QPoint(cellWidth / 2, cellHeight / 2));
+        QTest::mouseMove(&view, origin + QPoint(cellWidth * 6, cellHeight / 2));
+        QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier,
+            origin + QPoint(cellWidth * 6, cellHeight / 2));
         QVERIFY(!view.selectedText().isEmpty());
 
         QSignalSpy inputSpy(&view, &noxshell::ui::TerminalView::inputGenerated);
@@ -201,12 +271,12 @@ private slots:
     {
         noxshell::ui::HostSidebar sidebar;
         sidebar.show();
-        auto *list = sidebar.findChild<QListWidget *>();
-        QVERIFY(list);
+        auto *tree = sidebar.findChild<QTreeWidget *>(QStringLiteral("hostList"));
+        QVERIFY(tree);
         QCOMPARE(sidebar.servers().size(), 0);
-        QCOMPARE(list->count(), 1);
-        QVERIFY(list->item(0)->text().contains(QStringLiteral("添加")));
-        QVERIFY(!(list->item(0)->flags() & Qt::ItemIsSelectable));
+        QCOMPARE(tree->topLevelItemCount(), 1);
+        QVERIFY(tree->topLevelItem(0)->text(0).contains(QStringLiteral("新建分组")));
+        QVERIFY(!(tree->topLevelItem(0)->flags() & Qt::ItemIsSelectable));
     }
 
     void hostSidebarSelectsWithoutConnectingAndActivatesOnDoubleClick()
@@ -215,42 +285,69 @@ private slots:
         profile.id = QStringLiteral("sidebar-host");
         profile.name = QStringLiteral("sidebar-host");
         profile.host = QStringLiteral("192.0.2.10");
-        noxshell::ui::HostSidebar sidebar({profile});
+        profile.group = QStringLiteral("生产环境");
+        noxshell::ui::HostSidebar sidebar({profile}, {QStringLiteral("生产环境"), QStringLiteral("测试环境")});
         QSignalSpy selectedSpy(&sidebar, &noxshell::ui::HostSidebar::serverSelected);
         QSignalSpy connectSpy(&sidebar, &noxshell::ui::HostSidebar::serverConnectRequested);
         QSignalSpy collapseSpy(&sidebar, &noxshell::ui::HostSidebar::collapseRequested);
+        QSignalSpy groupChangedSpy(&sidebar, &noxshell::ui::HostSidebar::serverGroupChanged);
+        QSignalSpy addInGroupSpy(&sidebar, &noxshell::ui::HostSidebar::addServerInGroupRequested);
         sidebar.show();
         sidebar.selectFirstServer();
         QCOMPARE(selectedSpy.count(), 1);
         QCOMPARE(connectSpy.count(), 0);
 
-        auto *list = sidebar.findChild<QListWidget *>(QStringLiteral("hostList"));
-        QVERIFY(list);
+        auto *tree = sidebar.findChild<QTreeWidget *>(QStringLiteral("hostList"));
+        QVERIFY(tree);
+        QCOMPARE(tree->topLevelItemCount(), 2);
+        QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
+        QCOMPARE(tree->topLevelItem(1)->childCount(), 0);
+        QVERIFY(tree->topLevelItem(0)->isExpanded());
+        QVERIFY(tree->dragEnabled());
+        QVERIFY(tree->acceptDrops());
         auto *search = sidebar.findChild<QLineEdit *>(QStringLiteral("hostSearch"));
         auto *addButton = sidebar.findChild<QPushButton *>(QStringLiteral("hostAddButton"));
         QVERIFY(search);
         QVERIFY(addButton);
         QCOMPARE(search->geometry().y(), addButton->geometry().y());
         QVERIFY(addButton->geometry().x() > search->geometry().x());
-        auto *rowWidget = list->itemWidget(list->item(0));
+        auto *hostItem = tree->topLevelItem(0)->child(0);
+        auto *rowWidget = tree->itemWidget(hostItem, 0);
         QVERIFY(rowWidget);
         QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemName"))->text(), QStringLiteral("sidebar-host"));
         QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemAddress"))->text(), QStringLiteral("192.0.2.10"));
         QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemName"))->geometry().y(),
             rowWidget->findChild<QLabel *>(QStringLiteral("hostItemAddress"))->geometry().y());
-        QVERIFY(list->item(0)->sizeHint().height() <= 42);
+        QVERIFY(hostItem->sizeHint(0).height() <= 42);
         QVERIFY(!rowWidget->findChild<QLabel *>(QStringLiteral("hostItemState")));
-        QVERIFY(!list->item(0)->toolTip().contains(QStringLiteral("离线")));
-        QVERIFY(!list->item(0)->toolTip().contains(QStringLiteral("在线")));
+        QVERIFY(!hostItem->toolTip(0).contains(QStringLiteral("离线")));
+        QVERIFY(!hostItem->toolTip(0).contains(QStringLiteral("在线")));
         QVERIFY(sidebar.setServerState(profile.id, noxshell::ServerState::Online));
         QVERIFY(!rowWidget->findChild<QLabel *>(QStringLiteral("hostItemState")));
-        list->itemDoubleClicked(list->item(0));
+        tree->itemDoubleClicked(hostItem, 0);
         QCOMPARE(connectSpy.count(), 1);
         QCOMPARE(collapseSpy.count(), 1);
         QCOMPARE(qvariant_cast<noxshell::ServerProfile>(connectSpy.first().at(0)).id, profile.id);
+        QVERIFY(sidebar.moveServerToGroup(profile.id, QStringLiteral("测试环境")));
+        QCOMPARE(groupChangedSpy.count(), 1);
+        QCOMPARE(sidebar.servers().first().group, QStringLiteral("测试环境"));
+        QCOMPARE(tree->topLevelItem(0)->childCount(), 0);
+        QCOMPARE(tree->topLevelItem(1)->childCount(), 1);
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostConnectAction")));
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostDuplicateAction")));
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostDeleteAction")));
+        QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostNewGroupAction")));
+        auto *newConnection = sidebar.findChild<QAction *>(QStringLiteral("hostNewConnectionAction"));
+        QVERIFY(newConnection);
+        QCOMPARE(newConnection->text(), QStringLiteral("新建连接"));
+        tree->customContextMenuRequested(tree->visualItemRect(tree->topLevelItem(1)).center());
+        QVERIFY(newConnection->isVisible());
+        newConnection->trigger();
+        QCOMPARE(addInGroupSpy.count(), 1);
+        QCOMPARE(addInGroupSpy.first().at(0).toString(), QStringLiteral("测试环境"));
+        QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostRenameGroupAction")));
+        QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostDeleteGroupAction")));
+        QVERIFY(sidebar.findChild<QMenu *>(QStringLiteral("hostMoveGroupMenu")));
     }
 
     void terminalTabContextMenuDuplicatesAndClosesSessions()
@@ -267,10 +364,13 @@ private slots:
         QVERIFY(sessionsPage);
         QVERIFY(recentEmpty);
         QCOMPARE(viewStack->currentWidget(), recentPage);
+        auto *tabToolbar = workspace.findChild<QWidget *>(QStringLiteral("terminalTabToolbar"));
+        QVERIFY(tabToolbar);
+        QVERIFY(tabToolbar->isHidden());
 
         noxshell::ServerProfile first;
         first.id = QStringLiteral("tab-context-first");
-        first.name = QStringLiteral("第一台");
+        first.name = QStringLiteral("第一台超长服务器名称甲");
         first.connectionMode = noxshell::ConnectionMode::Demo;
         noxshell::ServerProfile second;
         second.id = QStringLiteral("tab-context-second");
@@ -283,24 +383,78 @@ private slots:
         auto *tabs = workspace.findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
         auto *connectAction = workspace.findChild<QAction *>(QStringLiteral("terminalConnectAction"));
         auto *disconnectAction = workspace.findChild<QAction *>(QStringLiteral("terminalDisconnectAction"));
+        auto *clearAction = workspace.findChild<QAction *>(QStringLiteral("terminalClearAction"));
         auto *duplicateAction = workspace.findChild<QAction *>(QStringLiteral("terminalDuplicateAction"));
         auto *closeCurrentAction = workspace.findChild<QAction *>(QStringLiteral("terminalCloseCurrentAction"));
         auto *closeOthersAction = workspace.findChild<QAction *>(QStringLiteral("terminalCloseOthersAction"));
         auto *closeAllAction = workspace.findChild<QAction *>(QStringLiteral("terminalCloseAllAction"));
+        auto *newTabButton = workspace.findChild<QToolButton *>(QStringLiteral("terminalNewTabButton"));
         QVERIFY(tabs);
         QVERIFY(connectAction);
         QVERIFY(disconnectAction);
+        QVERIFY(clearAction);
         QVERIFY(duplicateAction);
         QVERIFY(closeCurrentAction);
         QVERIFY(closeOthersAction);
         QVERIFY(closeAllAction);
+        QVERIFY(newTabButton);
+        QSignalSpy sidebarVisibilitySpy(&workspace,
+            &noxshell::ui::TerminalWorkspace::hostSidebarVisibilityRequested);
+        QVERIFY(!workspace.findChild<QPushButton *>(QStringLiteral("clearTerminalButton")));
         QVERIFY(!workspace.findChild<QPushButton *>(QStringLiteral("duplicateTerminalButton")));
+        QVERIFY(!tabToolbar->isHidden());
+        auto *tabToolbarLayout = qobject_cast<QHBoxLayout *>(tabToolbar->layout());
+        QVERIFY(tabToolbarLayout);
+        QCOMPARE(tabToolbarLayout->indexOf(tabs), 0);
+        QCOMPARE(tabToolbarLayout->count(), 1);
+        QCOMPARE(tabToolbarLayout->stretch(0), 1);
+        QVERIFY(tabs->sizeHint().width() >= 100);
+        tabToolbarLayout->activate();
+        QVERIFY(tabs->width() >= 100);
+        tabs->resize(600, tabs->height());
+        QVERIFY(tabs->tabRect(0).width() >= 95);
+        QVERIFY(tabs->tabRect(0).left() < 20);
         QCOMPARE(tabs->count(), 2);
+        QCOMPARE(tabs->tabText(0).size(), 10);
+        QVERIFY(tabs->tabText(0).endsWith(QChar(0x2026)));
+        QVERIFY(tabs->tabToolTip(0).contains(first.name));
+        auto *firstCloseContainer = tabs->tabButton(0, QTabBar::RightSide);
+        QVERIFY(firstCloseContainer);
+        auto *firstCloseButton = firstCloseContainer->findChild<QToolButton *>(
+            QStringLiteral("terminalTabCloseButton"));
+        QVERIFY(firstCloseButton);
+        QVERIFY(!tabs->tabButton(0, QTabBar::LeftSide));
+        QCoreApplication::processEvents();
+        const QRect firstTabRect = tabs->tabRect(0);
+        const int closeRight = firstCloseButton->mapTo(tabs, firstCloseButton->rect().topRight()).x();
+        QVERIFY(firstTabRect.right() - closeRight >= 5);
+        const int lastTabRight = tabs->geometry().left() + tabs->tabRect(1).right();
+        QVERIFY(newTabButton->x() >= lastTabRight);
+        QVERIFY(newTabButton->x() <= lastTabRight + 8);
         QVERIFY(tabs->height() >= 30);
         QVERIFY(tabs->currentIndex() >= 0);
         QVERIFY(!tabs->tabText(tabs->currentIndex()).isEmpty());
         QVERIFY(!tabs->tabIcon(0).isNull());
         QVERIFY(tabs->tabToolTip(0).contains(QStringLiteral("未连接")));
+
+        auto *sessionStack = workspace.findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+        QVERIFY(sessionStack);
+        QCOMPARE(sessionStack->count(), 2);
+        auto *firstOutput = sessionStack->widget(0)->findChild<noxshell::ui::TerminalView *>();
+        auto *secondOutput = sessionStack->widget(1)->findChild<noxshell::ui::TerminalView *>();
+        QVERIFY(firstOutput);
+        QVERIFY(secondOutput);
+        firstOutput->feedText(QStringLiteral("first-session-buffer"));
+        secondOutput->feedText(QStringLiteral("second-session-buffer"));
+
+        newTabButton->click();
+        QCOMPARE(viewStack->currentWidget(), recentPage);
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(sidebarVisibilitySpy.count(), 1);
+        QCOMPARE(sidebarVisibilitySpy.takeFirst().at(0).toBool(), true);
+        tabs->tabBarClicked(1);
+        QCOMPARE(viewStack->currentWidget(), sessionsPage);
+        QCOMPARE(tabs->currentIndex(), 1);
 
         const auto prepareContext = [&workspace](int index) {
             bool prepared = false;
@@ -308,6 +462,11 @@ private slots:
                 Qt::DirectConnection, Q_RETURN_ARG(bool, prepared), Q_ARG(int, index));
             return invoked && prepared;
         };
+
+        QVERIFY(prepareContext(1));
+        clearAction->trigger();
+        QVERIFY(firstOutput->plainText().contains(QStringLiteral("first-session-buffer")));
+        QVERIFY(!secondOutput->plainText().contains(QStringLiteral("second-session-buffer")));
 
         QVERIFY(prepareContext(0));
         QVERIFY(connectAction->isEnabled());
@@ -332,8 +491,10 @@ private slots:
         QVERIFY(prepareContext(0));
         duplicateAction->trigger();
         QCOMPARE(tabs->count(), 2);
-        QVERIFY(prepareContext(1));
-        closeCurrentAction->trigger();
+        auto *secondCloseButton = tabs->tabButton(1, QTabBar::RightSide)
+                                      ->findChild<QToolButton *>(QStringLiteral("terminalTabCloseButton"));
+        QVERIFY(secondCloseButton);
+        secondCloseButton->click();
         QCOMPARE(tabs->count(), 1);
 
         QVERIFY(prepareContext(0));
@@ -438,8 +599,11 @@ private slots:
         const auto cellSize = view.cellSize();
         const int cellWidth = qCeil(cellSize.width());
         const int cellHeight = qCeil(cellSize.height());
-        const QPoint start(cellWidth / 2, cellHeight / 2);
-        const QPoint end(cellWidth * 5 + cellWidth / 2, cellHeight / 2);
+        const auto origin = view.contentOrigin().toPoint();
+        QVERIFY(origin.x() >= 14);
+        QVERIFY(origin.y() >= 10);
+        const QPoint start = origin + QPoint(cellWidth / 2, cellHeight / 2);
+        const QPoint end = origin + QPoint(cellWidth * 5 + cellWidth / 2, cellHeight / 2);
         QTest::mousePress(&view, Qt::LeftButton, Qt::NoModifier, start);
         QTest::mouseMove(&view, end);
         QTest::mouseRelease(&view, Qt::LeftButton, Qt::NoModifier, end);
@@ -650,7 +814,15 @@ private slots:
             QCOMPARE(servers.first().id, serverId);
             QCOMPARE(servers.first().name, QStringLiteral("persisted-host-edited"));
             QCOMPARE(servers.first().port, static_cast<quint16>(2222));
+            QCOMPARE(servers.first().group, QStringLiteral("test"));
             QCOMPARE(servers.first().credentialRef, QStringLiteral("server/test-reference"));
+            QVERIFY(repository.loadServerGroups().contains(QStringLiteral("test")));
+            QVERIFY(repository.saveServerGroup(QStringLiteral("空分组")));
+            QVERIFY(repository.loadServerGroups().contains(QStringLiteral("空分组")));
+            QVERIFY(repository.renameServerGroup(QStringLiteral("test"), QStringLiteral("生产环境")));
+            QCOMPARE(repository.loadServers().first().group, QStringLiteral("生产环境"));
+            QVERIFY(repository.deleteServerGroup(QStringLiteral("生产环境")));
+            QCOMPARE(repository.loadServers().first().group, QString{});
             QVERIFY(servers.first().password.isEmpty());
             QCOMPARE(repository.knownHostFingerprint(QStringLiteral("192.0.2.10"), 22), QStringLiteral("SHA256:test-fingerprint"));
             const auto terminalState = repository.loadTerminalState();
@@ -740,6 +912,43 @@ private slots:
             database.close();
         }
         QSqlDatabase::removeDatabase(verifyConnection);
+    }
+
+    void commandHistoryPersistsFavoritesNotesAndManagement()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("command-history.sqlite3")), false);
+        QVERIFY2(repository.initialize(), qPrintable(repository.lastError()));
+        noxshell::ServerProfile profile;
+        profile.name = QStringLiteral("history-host");
+        profile.host = QStringLiteral("192.0.2.20");
+        profile.user = QStringLiteral("root");
+        QVERIFY(repository.saveServer(profile));
+
+        const auto older = QDateTime::currentDateTime().addSecs(-60);
+        const auto newer = QDateTime::currentDateTime();
+        QVERIFY(repository.recordCommand(profile.id, QStringLiteral("  pwd  "), older));
+        QVERIFY(repository.recordCommand(profile.id, QStringLiteral("ls -la"), older));
+        QVERIFY(repository.recordCommand(profile.id, QStringLiteral("pwd"), newer));
+        auto entries = repository.loadCommandHistory(profile.id);
+        QCOMPARE(entries.size(), 2);
+        QCOMPARE(entries.first().command, QStringLiteral("pwd"));
+        const auto pwdId = entries.first().id;
+        QVERIFY(repository.setCommandFavorite(pwdId, true));
+        QVERIFY(repository.setCommandNote(pwdId, QStringLiteral("查看当前目录")));
+        entries = repository.loadCommandHistory(profile.id, true);
+        QCOMPARE(entries.size(), 1);
+        QCOMPARE(entries.first().note, QStringLiteral("查看当前目录"));
+        QVERIFY(entries.first().favorite);
+        QVERIFY(repository.clearCommandFavorites(profile.id));
+        QVERIFY(repository.loadCommandHistory(profile.id, true).isEmpty());
+        entries = repository.loadCommandHistory(profile.id);
+        QCOMPARE(entries.size(), 2);
+        QVERIFY(repository.deleteCommandHistory(entries.last().id));
+        QCOMPARE(repository.loadCommandHistory(profile.id).size(), 1);
+        QVERIFY(repository.clearCommandHistory(profile.id));
+        QVERIFY(repository.loadCommandHistory(profile.id).isEmpty());
     }
 
     void realSshFailureIsReportedWithoutBlockingUi()
@@ -886,7 +1095,9 @@ private slots:
         auto *directoryTree = panel.findChild<QTreeWidget *>(QStringLiteral("remoteDirectoryTree"));
         auto *browserSplitter = panel.findChild<QSplitter *>(QStringLiteral("fileBrowserSplitter"));
         auto *pathEdit = panel.findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
-        auto *backButton = panel.findChild<QPushButton *>(QStringLiteral("fileBackButton"));
+        auto *backButton = panel.findChild<QToolButton *>(QStringLiteral("fileBackButton"));
+        auto *upButton = panel.findChild<QToolButton *>(QStringLiteral("fileUpButton"));
+        auto *refreshButton = panel.findChild<QToolButton *>(QStringLiteral("fileRefreshButton"));
         auto *contextDownload = panel.findChild<QAction *>(QStringLiteral("fileContextDownloadAction"));
         auto *newFileAction = panel.findChild<QAction *>(QStringLiteral("fileNewFileAction"));
         auto *newDirectoryAction = panel.findChild<QAction *>(QStringLiteral("fileNewDirectoryAction"));
@@ -900,20 +1111,40 @@ private slots:
         QVERIFY(browserSplitter);
         QVERIFY(pathEdit);
         QVERIFY(backButton);
+        QVERIFY(upButton);
+        QVERIFY(refreshButton);
         QVERIFY(contextDownload);
         QVERIFY(newFileAction);
         QVERIFY(newDirectoryAction);
         QVERIFY(queueButton);
         QVERIFY(queueMenu);
         QVERIFY(transferPanel);
+        auto *transferList = transferPanel->findChild<QListWidget *>(QStringLiteral("transferQueueList"));
+        auto *transferEmpty = transferPanel->findChild<QLabel *>(QStringLiteral("transferQueueEmpty"));
+        QVERIFY(transferList);
+        QVERIFY(transferEmpty);
+        QVERIFY(transferPanel->minimumHeight() >= 220);
+        QVERIFY(transferList->isHidden());
+        QVERIFY(!transferEmpty->isHidden());
         QVERIFY(fileToolbar);
         QVERIFY(fileStatus);
         QVERIFY(!queueButton->icon().isNull());
+        for (auto *button : {backButton, upButton, refreshButton, queueButton}) {
+            QCOMPARE(button->size(), QSize(26, 26));
+            QCOMPARE(button->iconSize(), QSize(16, 16));
+            QVERIFY(!button->icon().isNull());
+        }
         QCOMPARE(fileStatus->parentWidget(), fileToolbar);
         QCOMPARE(pathEdit->parentWidget(), fileToolbar);
+        QCOMPARE(fileToolbar->height(), 40);
+        QCOMPARE(pathEdit->height(), 26);
+        QVERIFY(std::abs(pathEdit->geometry().center().y() - fileToolbar->rect().center().y()) <= 1);
+        QVERIFY(pathEdit->geometry().top() > fileToolbar->rect().top());
+        QVERIFY(pathEdit->geometry().bottom() < fileToolbar->rect().bottom());
         QVERIFY(!panel.findChild<QPushButton *>(QStringLiteral("fileUploadButton")));
         QVERIFY(!panel.findChild<QPushButton *>(QStringLiteral("fileDownloadButton")));
         QVERIFY(!panel.findChild<QPushButton *>(QStringLiteral("fileNewDirectoryButton")));
+        QVERIFY(!panel.findChild<QToolButton *>(QStringLiteral("fileMoreButton")));
         QCOMPARE(newDirectoryAction->text(), QStringLiteral("新建目录"));
         QVERIFY(panel.layout()->indexOf(transferPanel) < 0);
         QVERIFY(!transferPanel->isVisible());
@@ -1106,6 +1337,29 @@ private slots:
         QApplication::sendEvent(tree->viewport(), &drop);
         QVERIFY(drop.isAccepted());
         QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(transferList->count(), 1, 1000);
+        QVERIFY(!transferList->isHidden());
+        QVERIFY(transferEmpty->isHidden());
+        QVERIFY(transferList->item(0)->sizeHint().height() >= 78);
+        auto *transferRow = transferList->itemWidget(transferList->item(0));
+        QVERIFY(transferRow);
+        auto *transferName = transferRow->findChild<QLabel *>(QStringLiteral("transferName"));
+        auto *transferAmount = transferRow->findChild<QLabel *>(QStringLiteral("transferAmount"));
+        auto *transferPath = transferRow->findChild<QLabel *>(QStringLiteral("transferPath"));
+        auto *transferState = transferRow->findChild<QLabel *>(QStringLiteral("transferState"));
+        auto *transferProgress = transferRow->findChild<QProgressBar *>(QStringLiteral("transferProgress"));
+        QVERIFY(transferName);
+        QVERIFY(transferAmount);
+        QVERIFY(transferPath);
+        QVERIFY(transferState);
+        QVERIFY(transferProgress);
+        QCOMPARE(transferName->text(), QStringLiteral("dragged.txt"));
+        QVERIFY(transferAmount->text().contains(QStringLiteral("14 B / 14 B")));
+        QVERIFY(transferPath->text().contains(QStringLiteral("/var/www/app/dragged.txt")));
+        QCOMPARE(transferState->text(), QStringLiteral("已完成"));
+        QCOMPARE(transferProgress->value(), 100);
+        QTRY_VERIFY_WITH_TIMEOUT(queueMenu->isVisible(), 1000);
+        queueMenu->hide();
 
         QTimer::singleShot(0, [] {
             auto *dialog = QApplication::activeModalWidget();
@@ -1177,6 +1431,130 @@ private slots:
         }(), 1000);
     }
 
+    void filePermissionDialogMapsModesAndRecursiveScope()
+    {
+        noxshell::RemoteFileEntry file;
+        file.name = QStringLiteral("deploy.sh");
+        file.path = QStringLiteral("/var/www/app/deploy.sh");
+        file.permissions = 0100640;
+        noxshell::ui::FilePermissionDialog fileDialog(file);
+        QCOMPARE(fileDialog.permissions(), quint32{0640});
+        auto *ownerExecute = fileDialog.findChild<QCheckBox *>(QStringLiteral("permissionCheck_0_2"));
+        auto *otherRead = fileDialog.findChild<QCheckBox *>(QStringLiteral("permissionCheck_2_0"));
+        QVERIFY(ownerExecute);
+        QVERIFY(otherRead);
+        ownerExecute->setChecked(true);
+        otherRead->setChecked(true);
+        QCOMPARE(fileDialog.permissions(), quint32{0744});
+        QVERIFY(!fileDialog.recursive());
+
+        noxshell::RemoteFileEntry directory = file;
+        directory.name = QStringLiteral("app");
+        directory.path = QStringLiteral("/var/www/app");
+        directory.directory = true;
+        directory.permissions = 0040755;
+        noxshell::ui::FilePermissionDialog directoryDialog(directory);
+        auto *recursive = directoryDialog.findChild<QCheckBox *>(QStringLiteral("recursivePermissionCheck"));
+        auto *filesOnly = directoryDialog.findChild<QRadioButton *>(QStringLiteral("permissionScopeFiles"));
+        QVERIFY(recursive);
+        QVERIFY(filesOnly);
+        QVERIFY(!filesOnly->isEnabled());
+        recursive->setChecked(true);
+        QVERIFY(filesOnly->isEnabled());
+        filesOnly->setChecked(true);
+        QVERIFY(directoryDialog.recursive());
+        QCOMPARE(directoryDialog.scope(), noxshell::PermissionScope::FilesOnly);
+    }
+
+    void filePanelChangesPermissionsFromContextAction()
+    {
+        noxshell::SshSession session(nullptr, nullptr);
+        noxshell::ui::FilePanel panel(&session);
+        panel.resize(920, 640);
+        panel.show();
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("demo-permission-panel");
+        profile.name = QStringLiteral("demo-permission-panel");
+        profile.user = QStringLiteral("root");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        panel.setServer(profile);
+        session.connectTo(profile);
+
+        auto *tree = panel.findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        auto *action = panel.findChild<QAction *>(QStringLiteral("filePermissionsAction"));
+        QVERIFY(tree);
+        QVERIFY(action);
+        QTRY_COMPARE_WITH_TIMEOUT(tree->topLevelItemCount(), 8, 1000);
+        QTreeWidgetItem *target = nullptr;
+        for (int row = 0; row < tree->topLevelItemCount(); ++row) {
+            if (tree->topLevelItem(row)->text(0) == QStringLiteral("deploy.sh")) target = tree->topLevelItem(row);
+        }
+        QVERIFY(target);
+        tree->setCurrentItem(target);
+        QVERIFY(action->isEnabled());
+
+        QTimer::singleShot(0, [] {
+            auto *dialog = qobject_cast<noxshell::ui::FilePermissionDialog *>(QApplication::activeModalWidget());
+            QVERIFY(dialog);
+            auto *ownerExecute = dialog->findChild<QCheckBox *>(QStringLiteral("permissionCheck_0_2"));
+            QVERIFY(ownerExecute);
+            ownerExecute->setChecked(true);
+            dialog->accept();
+        });
+        action->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT([tree] {
+            for (int row = 0; row < tree->topLevelItemCount(); ++row) {
+                auto *item = tree->topLevelItem(row);
+                if (item->text(0) == QStringLiteral("deploy.sh")) return item->text(4) == QStringLiteral("-rwxr--r--");
+            }
+            return false;
+        }(), 1000);
+    }
+
+    void filePanelDeletesMultipleSelectedEntries()
+    {
+        noxshell::SshSession session(nullptr, nullptr);
+        QSignalSpy operationSpy(&session, &noxshell::SshSession::fileOperationFinished);
+        noxshell::ui::FilePanel panel(&session);
+        panel.resize(920, 640);
+        panel.show();
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("demo-batch-delete-panel");
+        profile.name = QStringLiteral("demo-batch-delete-panel");
+        profile.user = QStringLiteral("root");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        panel.setServer(profile);
+        session.connectTo(profile);
+
+        auto *tree = panel.findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        auto *removeAction = panel.findChild<QAction *>(QStringLiteral("fileRemoveAction"));
+        QVERIFY(tree);
+        QVERIFY(removeAction);
+        QTRY_COMPARE_WITH_TIMEOUT(tree->topLevelItemCount(), 8, 1000);
+        const QStringList names{QStringLiteral(".env.production"), QStringLiteral("deploy.sh"), QStringLiteral("README.md")};
+        for (int row = 0; row < tree->topLevelItemCount(); ++row) {
+            auto *item = tree->topLevelItem(row);
+            if (names.contains(item->text(0))) item->setSelected(true);
+        }
+        QCOMPARE(tree->selectedItems().size(), 3);
+        QVERIFY(removeAction->isEnabled());
+
+        QTimer::singleShot(0, [] {
+            auto *dialog = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            QVERIFY(dialog);
+            QVERIFY(dialog->text().contains(QStringLiteral("3 个项目")));
+            auto *yesButton = dialog->button(QMessageBox::Yes);
+            QVERIFY(yesButton);
+            yesButton->click();
+        });
+        removeAction->trigger();
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 3, 1500);
+        QTRY_COMPARE_WITH_TIMEOUT(tree->topLevelItemCount(), 5, 1500);
+        for (int row = 0; row < tree->topLevelItemCount(); ++row) {
+            QVERIFY(!names.contains(tree->topLevelItem(row)->text(0)));
+        }
+    }
+
     void demoSftpOperationsMutateAndTransferFiles()
     {
         QTemporaryDir directory;
@@ -1208,16 +1586,30 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 1, 1000);
         QCOMPARE(qvariant_cast<noxshell::RemoteFileOperation>(operationSpy.last().at(0)), noxshell::RemoteFileOperation::MakeDirectory);
 
-        session.renamePath(created, renamed);
+        session.changePermissions(created, 0700);
         QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 2, 1000);
-        session.removePath(renamed, true);
+        QCOMPARE(qvariant_cast<noxshell::RemoteFileOperation>(operationSpy.last().at(0)), noxshell::RemoteFileOperation::ChangePermissions);
+        const auto permissionListingCount = directorySpy.count();
+        session.listDirectory(base);
+        QTRY_COMPARE_WITH_TIMEOUT(directorySpy.count(), permissionListingCount + 1, 1000);
+        auto permissionEntries = qvariant_cast<noxshell::RemoteFileEntries>(directorySpy.last().at(1));
+        auto permissionEntry = std::find_if(permissionEntries.cbegin(), permissionEntries.cend(), [&created](const noxshell::RemoteFileEntry &entry) {
+            return entry.path == created;
+        });
+        QVERIFY(permissionEntry != permissionEntries.cend());
+        QCOMPARE(permissionEntry->permissions & 0777U, quint32{0700});
+
+        session.renamePath(created, renamed);
         QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 3, 1000);
+        session.removePath(renamed, true);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 4, 1000);
 
         const auto remoteFile = base + QStringLiteral("/release.txt");
         session.uploadFile(uploadSource, remoteFile);
-        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 4, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 5, 1000);
+        const auto uploadListingCount = directorySpy.count();
         session.listDirectory(base);
-        QTRY_VERIFY_WITH_TIMEOUT(!directorySpy.isEmpty(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(directorySpy.count(), uploadListingCount + 1, 1000);
         const auto entries = qvariant_cast<noxshell::RemoteFileEntries>(directorySpy.last().at(1));
         const auto uploaded = std::find_if(entries.cbegin(), entries.cend(), [&remoteFile](const noxshell::RemoteFileEntry &entry) {
             return entry.path == remoteFile;
@@ -1227,13 +1619,13 @@ private slots:
 
         const auto downloadTarget = directory.filePath(QStringLiteral("downloaded.txt"));
         session.downloadFile(remoteFile, downloadTarget);
-        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 5, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 6, 1000);
         QFile downloaded(downloadTarget);
         QVERIFY(downloaded.open(QIODevice::ReadOnly));
         QCOMPARE(downloaded.readAll(), QByteArray("release payload"));
 
         session.removePath(remoteFile, false);
-        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 6, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(operationSpy.count(), 7, 1000);
         QVERIFY(failureSpy.isEmpty());
 
         session.removePath(base + QStringLiteral("/config"), true);
@@ -1383,27 +1775,51 @@ private slots:
         QTest::qWait(50);
         QVERIFY(window.isVisible());
 
-        auto *hosts = window.findChild<QListWidget *>();
+        auto *hosts = window.findChild<QTreeWidget *>(QStringLiteral("hostList"));
         QVERIFY(hosts);
-        QCOMPARE(hosts->count(), 5);
-        QTRY_COMPARE_WITH_TIMEOUT(hosts->currentRow(), 0, 1000);
+        QCOMPARE(hosts->topLevelItemCount(), 2);
+        QCOMPARE(hosts->topLevelItem(0)->childCount() + hosts->topLevelItem(1)->childCount(), 5);
+        QTRY_VERIFY_WITH_TIMEOUT(hosts->currentItem() != nullptr, 1000);
+        QVERIFY(hosts->currentItem()->parent() != nullptr);
 
         auto *sidebar = window.findChild<noxshell::ui::HostSidebar *>(QStringLiteral("hostSidebar"));
         auto *sidebarToggle = window.findChild<QToolButton *>(QStringLiteral("sidebarToggleButton"));
         auto *monitorToggle = window.findChild<QToolButton *>(QStringLiteral("monitorToggleButton"));
+        auto *settingsButton = window.findChild<QToolButton *>(QStringLiteral("terminalSettingsButton"));
         auto *windowToolbar = window.findChild<QToolBar *>(QStringLiteral("windowControlsToolbar"));
         QVERIFY(sidebar);
         QVERIFY(sidebarToggle);
         QVERIFY(monitorToggle);
+        QVERIFY(settingsButton);
         QVERIFY(windowToolbar);
+        QCOMPARE(sidebarToggle->parentWidget(), monitorToggle->parentWidget());
+        QCOMPARE(sidebarToggle->parentWidget(), settingsButton->parentWidget());
+#ifdef Q_OS_WIN
+        QVERIFY(window.windowFlags().testFlag(Qt::FramelessWindowHint));
+        QVERIFY(window.findChild<QToolButton *>(QStringLiteral("windowMinimizeButton")));
+        QVERIFY(window.findChild<QToolButton *>(QStringLiteral("windowMaximizeButton")));
+        QVERIFY(window.findChild<QToolButton *>(QStringLiteral("windowCloseButton")));
+#endif
+        const auto hostItemForName = [hosts](const QString &name) -> QTreeWidgetItem * {
+            for (QTreeWidgetItemIterator iterator(hosts); *iterator; ++iterator) {
+                auto *item = *iterator;
+                auto *row = hosts->itemWidget(item, 0);
+                auto *label = row ? row->findChild<QLabel *>(QStringLiteral("hostItemName")) : nullptr;
+                if (label && label->text() == name) return item;
+            }
+            return nullptr;
+        };
+        const auto currentHostName = [hosts] {
+            auto *row = hosts->itemWidget(hosts->currentItem(), 0);
+            auto *label = row ? row->findChild<QLabel *>(QStringLiteral("hostItemName")) : nullptr;
+            return label ? label->text() : QString{};
+        };
         QCOMPARE(window.toolBarArea(windowToolbar), Qt::TopToolBarArea);
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("topBar")));
         QVERIFY(!window.findChild<QLineEdit *>(QStringLiteral("globalSearch")));
-        QVERIFY(sidebar->isVisible());
+        QVERIFY(!sidebar->isVisible());
         QVERIFY(!sidebarToggle->icon().isNull());
         QVERIFY(!monitorToggle->icon().isNull());
-        QTest::mouseClick(sidebarToggle, Qt::LeftButton);
-        QVERIFY(!sidebar->isVisible());
         QVERIFY(sidebarToggle->toolTip().contains(QStringLiteral("显示")));
         QTest::mouseClick(sidebarToggle, Qt::LeftButton);
         QVERIFY(sidebar->isVisible());
@@ -1468,8 +1884,29 @@ private slots:
 
         auto *range = window.findChild<QComboBox *>(QStringLiteral("historyRange"));
         auto *cpuTrend = window.findChild<noxshell::ui::TrendChart *>(QStringLiteral("cpuTrendChart"));
+        auto *metricSummary = window.findChild<QFrame *>(QStringLiteral("monitorMetricSummary"));
+        auto *monitorDetails = window.findChild<QWidget *>(QStringLiteral("monitorDetails"));
+        auto *monitorDetailToggle = window.findChild<QToolButton *>(QStringLiteral("monitorTrendToggle"));
         QVERIFY(range);
         QVERIFY(cpuTrend);
+        QVERIFY(metricSummary);
+        QVERIFY(monitorDetails);
+        QVERIFY(monitorDetailToggle);
+        QCOMPARE(metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow")).size(), 4);
+        for (auto *metricRow : metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow"))) {
+            QCOMPARE(metricRow->height(), 46);
+            auto *progress = metricRow->findChild<QProgressBar *>();
+            QVERIFY(progress);
+            QCOMPARE(progress->orientation(), Qt::Horizontal);
+            QCOMPARE(progress->height(), 3);
+        }
+        QVERIFY(!monitorDetails->isVisible());
+        QCOMPARE(monitorDetailToggle->text(), QStringLiteral("详细"));
+        QTest::mouseClick(monitorDetailToggle, Qt::LeftButton);
+        QVERIFY(monitorDetails->isVisible());
+        QCOMPARE(monitorDetailToggle->text(), QStringLiteral("收起"));
+        QTest::mouseClick(monitorDetailToggle, Qt::LeftButton);
+        QVERIFY(!monitorDetails->isVisible());
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 0);
         QCOMPARE(range->count(), 3);
 
@@ -1481,29 +1918,47 @@ private slots:
         auto *address = window.findChild<QLabel *>(QStringLiteral("serverAddress"));
         auto *onlineBadge = window.findChild<QLabel *>(QStringLiteral("onlineBadge"));
         auto *copyAddress = window.findChild<QToolButton *>(QStringLiteral("copyHostAddressButton"));
-        auto *clearTerminal = window.findChild<QPushButton *>(QStringLiteral("clearTerminalButton"));
+        auto *clearTerminal = window.findChild<QAction *>(QStringLiteral("terminalClearAction"));
         QVERIFY(address);
         QVERIFY(onlineBadge);
         QVERIFY(copyAddress);
         QVERIFY(clearTerminal);
+        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("clearTerminalButton")));
         QCOMPARE(address->text(), QStringLiteral("未选择主机"));
         QVERIFY(onlineBadge->text().contains(QStringLiteral("待连接")));
         QApplication::clipboard()->clear();
         QTest::mouseClick(copyAddress, Qt::LeftButton);
         QVERIFY(QApplication::clipboard()->text().isEmpty());
 
-        hosts->itemDoubleClicked(hosts->item(0));
+        QVERIFY(hostItemForName(QStringLiteral("prod-web-01")));
+        hosts->itemDoubleClicked(hostItemForName(QStringLiteral("prod-web-01")), 0);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 1000);
         QTRY_VERIFY_WITH_TIMEOUT(!sidebar->isVisible(), 1000);
-        QCOMPARE(tabs->tabText(0), QStringLiteral("prod-web-01"));
+        QCOMPARE(tabs->tabText(0), QStringLiteral("prod-web-…"));
         QVERIFY(!tabs->tabText(0).contains(QLatin1Char('@')));
         QVERIFY(!recentPage->isVisible());
         QVERIFY(sessionsPage->isVisible());
         auto *input = window.findChild<QLineEdit *>(QStringLiteral("terminalInput"));
         auto *output = window.findChild<noxshell::ui::TerminalView *>(QStringLiteral("terminalOutput"));
+        auto *outputContainer = window.findChild<QWidget *>(QStringLiteral("terminalOutputContainer"));
         auto *loadingOverlay = window.findChild<QWidget *>(QStringLiteral("terminalLoadingOverlay"));
+        auto *historyButton = window.findChild<QToolButton *>(QStringLiteral("commandHistoryButton"));
+        auto *fileToggleButton = window.findChild<QToolButton *>(QStringLiteral("fileWorkspaceToggleButton"));
+        auto *historyPanel = window.findChild<noxshell::ui::CommandHistoryPanel *>(
+            QStringLiteral("commandHistoryPanel"));
         QVERIFY(input);
         QVERIFY(output);
+        QVERIFY(historyButton);
+        QVERIFY(fileToggleButton);
+        QVERIFY(historyPanel);
+        QVERIFY(!historyButton->icon().isNull());
+        QVERIFY(!fileToggleButton->icon().isNull());
+        QVERIFY(!historyPanel->isVisible());
+        QVERIFY(outputContainer);
+        QVERIFY(outputContainer->layout());
+        QCOMPARE(outputContainer->layout()->contentsMargins(), QMargins(0, 0, 0, 0));
+        QCOMPARE(output->contentOrigin(), QPointF(14, 10));
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("terminalStatus")));
         QVERIFY(loadingOverlay);
         QVERIFY(loadingOverlay->isVisible());
         QVERIFY(onlineBadge->text().contains(QStringLiteral("连接中")));
@@ -1513,12 +1968,58 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 1);
 
+        auto *newTabButton = window.findChild<QToolButton *>(QStringLiteral("terminalNewTabButton"));
+        QVERIFY(newTabButton);
+        QTest::mouseClick(newTabButton, Qt::LeftButton);
+        QVERIFY(recentPage->isVisible());
+        QVERIFY(sidebar->isVisible());
+        QTreeWidgetItem *currentServerLogin = nullptr;
+        for (int index = 0; index < recentLogins->topLevelItemCount(); ++index) {
+            if (recentLogins->topLevelItem(index)->text(0) == QStringLiteral("prod-web-01")) {
+                currentServerLogin = recentLogins->topLevelItem(index);
+                break;
+            }
+        }
+        QVERIFY(currentServerLogin);
+        recentLogins->itemDoubleClicked(currentServerLogin, 0);
+        QTRY_VERIFY_WITH_TIMEOUT(sessionsPage->isVisible(), 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!sidebar->isVisible(), 1000);
+        QCOMPARE(tabs->count(), 1);
+
         input->setFocus();
         QTest::keyClicks(input, QStringLiteral("pwd"));
         QTest::keyClick(input, Qt::Key_Return);
         QTRY_VERIFY_WITH_TIMEOUT(output->hasFocus(), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(output->plainText().contains(QStringLiteral("/var/www/app")), 1000);
-        QTest::mouseClick(clearTerminal, Qt::LeftButton);
+        QTest::mouseClick(historyButton, Qt::LeftButton);
+        QVERIFY(historyPanel->isVisible());
+        auto *commandHistory = historyPanel->findChild<QTreeWidget *>(QStringLiteral("commandHistoryList"));
+        auto *commandHistoryTabs = historyPanel->findChild<QTabBar *>(QStringLiteral("commandHistoryTabs"));
+        auto *favoriteAction = historyPanel->findChild<QAction *>(QStringLiteral("commandHistoryFavoriteAction"));
+        QVERIFY(commandHistory);
+        QVERIFY(commandHistoryTabs);
+        QVERIFY(favoriteAction);
+        QTRY_COMPARE_WITH_TIMEOUT(commandHistory->topLevelItemCount(), 1, 1000);
+        QCOMPARE(commandHistory->topLevelItem(0)->text(1), QStringLiteral("pwd"));
+        bool historyPrepared = false;
+        QVERIFY(QMetaObject::invokeMethod(historyPanel, "prepareItemActions", Qt::DirectConnection,
+            Q_RETURN_ARG(bool, historyPrepared), Q_ARG(int, 0)));
+        QVERIFY(historyPrepared);
+        favoriteAction->trigger();
+        commandHistoryTabs->setCurrentIndex(1);
+        QTRY_COMPARE_WITH_TIMEOUT(commandHistory->topLevelItemCount(), 1, 1000);
+        QTest::mouseClick(historyButton, Qt::LeftButton);
+        QVERIFY(!historyPanel->isVisible());
+
+        QVERIFY(filePane->isVisible());
+        QTest::mouseClick(fileToggleButton, Qt::LeftButton);
+        QVERIFY(!filePane->isVisible());
+        QVERIFY(fileToggleButton->toolTip().contains(QStringLiteral("显示")));
+        QTest::mouseClick(fileToggleButton, Qt::LeftButton);
+        QVERIFY(filePane->isVisible());
+        QVERIFY(fileToggleButton->toolTip().contains(QStringLiteral("隐藏")));
+        tabs->customContextMenuRequested(tabs->tabRect(0).center());
+        clearTerminal->trigger();
         QTRY_VERIFY_WITH_TIMEOUT(output->plainText().contains(QStringLiteral("root@prod-web-01:/var/www/app#")), 1000);
         QVERIFY(!output->plainText().contains(QStringLiteral("Last login")));
 
@@ -1534,8 +2035,9 @@ private slots:
         // 主机列表只负责选择连接：单击另一台主机不得切换当前终端或监控对象。
         QTest::mouseClick(sidebarToggle, Qt::LeftButton);
         QVERIFY(sidebar->isVisible());
-        hosts->setCurrentRow(2);
-        QCOMPARE(address->text(), QStringLiteral("10.0.0.11:22"));
+        QVERIFY(hostItemForName(QStringLiteral("db-master-01")));
+        hosts->setCurrentItem(hostItemForName(QStringLiteral("db-master-01")));
+        QCOMPARE(address->text(), QStringLiteral("10.0.0.11"));
         QVERIFY(onlineBadge->text().contains(QStringLiteral("在线")));
         QCOMPARE(tabs->count(), 1);
         QCOMPARE(tabs->currentIndex(), 0);
@@ -1544,7 +2046,7 @@ private slots:
                      [](const QLineEdit *editor) { return editor->isEnabled(); }),
             1);
 
-        hosts->itemDoubleClicked(hosts->item(2));
+        hosts->itemDoubleClicked(hostItemForName(QStringLiteral("db-master-01")), 0);
         QTRY_VERIFY_WITH_TIMEOUT(!sidebar->isVisible(), 1000);
         QTRY_COMPARE_WITH_TIMEOUT([&window] {
             const auto inputs = window.findChildren<QLineEdit *>(QStringLiteral("terminalInput"));
@@ -1552,7 +2054,7 @@ private slots:
                 return editor->isEnabled();
             });
         }(), 2, 1000);
-        QCOMPARE(tabs->tabText(1), QStringLiteral("db-master-01"));
+        QCOMPARE(tabs->tabText(1), QStringLiteral("db-master…"));
         auto *terminalWorkspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
         QVERIFY(terminalWorkspace);
         const auto terminalSessions = terminalWorkspace->findChildren<noxshell::SshSession *>();
@@ -1574,8 +2076,8 @@ private slots:
             return fileStack->currentWidget()->findChild<QLabel *>(QStringLiteral("fileServerLabel"));
         };
         tabs->setCurrentIndex(0);
-        QTRY_COMPARE_WITH_TIMEOUT(hosts->currentRow(), 0, 1000);
-        QCOMPARE(address->text(), QStringLiteral("10.0.0.11:22"));
+        QTRY_COMPARE_WITH_TIMEOUT(currentHostName(), QStringLiteral("prod-web-01"), 1000);
+        QCOMPARE(address->text(), QStringLiteral("10.0.0.11"));
         QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
         QVERIFY(activeFileServer());
         QVERIFY(activeFileServer()->text().contains(QStringLiteral("prod-web-01")));
@@ -1586,13 +2088,13 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(firstPath->text(), QStringLiteral("/var/www/app"), 1000);
 
         tabs->setCurrentIndex(1);
-        QTRY_COMPARE_WITH_TIMEOUT(hosts->currentRow(), 2, 1000);
-        QCOMPARE(address->text(), QStringLiteral("10.0.0.21:22"));
+        QTRY_COMPARE_WITH_TIMEOUT(currentHostName(), QStringLiteral("db-master-01"), 1000);
+        QCOMPARE(address->text(), QStringLiteral("10.0.0.21"));
         QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
         QVERIFY(activeFileServer()->text().contains(QStringLiteral("db-master-01")));
 
         // 左侧主机列表不再兼任标签导航，单击只保留列表选中项。
-        hosts->setCurrentRow(0);
+        hosts->setCurrentItem(hostItemForName(QStringLiteral("prod-web-01")));
         QCOMPARE(tabs->currentIndex(), 1);
         QVERIFY(activeFileServer()->text().contains(QStringLiteral("db-master-01")));
 
@@ -1615,7 +2117,7 @@ private slots:
         // 左侧不展示会话状态，关闭标签只改变终端工作区。
         tabs->tabCloseRequested(1);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 1000);
-        auto *closedHostRow = hosts->itemWidget(hosts->item(2));
+        auto *closedHostRow = hosts->itemWidget(hostItemForName(QStringLiteral("db-master-01")), 0);
         QVERIFY(closedHostRow);
         QVERIFY(!closedHostRow->findChild<QLabel *>(QStringLiteral("hostItemState")));
 
@@ -1644,7 +2146,7 @@ private slots:
         auto *addTestButton = addDialog.findChild<QPushButton *>(QStringLiteral("dialogTestConnectionButton"));
         auto *addStatus = addDialog.findChild<QLabel *>(QStringLiteral("connectionTestStatus"));
         auto *passwordEditor = addDialog.findChild<QLineEdit *>(QStringLiteral("passwordEditor"));
-        auto *passwordReveal = addDialog.findChild<QToolButton *>(QStringLiteral("passwordRevealButton"));
+        auto *passwordReveal = addDialog.findChild<QAction *>(QStringLiteral("passwordRevealAction"));
         auto *passwordHint = addDialog.findChild<QLabel *>(QStringLiteral("passwordSourceHint"));
         QVERIFY(addTestButton);
         QVERIFY(addStatus);
@@ -1661,13 +2163,72 @@ private slots:
         QTRY_VERIFY(passwordHint->text().contains(QStringLiteral("已忽略")));
         passwordEditor->clear();
         passwordEditor->setText(QStringLiteral("临时密码"));
-        QTest::mouseClick(passwordReveal, Qt::LeftButton);
+        QVERIFY(!passwordReveal->icon().isNull());
+        passwordReveal->trigger();
         QCOMPARE(passwordEditor->echoMode(), QLineEdit::Normal);
         QVERIFY(passwordHint->text().contains(QStringLiteral("当前输入")));
         QVERIFY(!addTestButton->isEnabled());
         addDialog.setConnectionServices(&repository, &credentialStore);
+        addDialog.setAvailableGroups({QStringLiteral("生产环境"), QStringLiteral("测试环境")});
+        addDialog.setInitialGroup(QStringLiteral("测试环境"));
         QVERIFY(addTestButton->isEnabled());
         QCOMPARE(addDialog.findChild<QPushButton *>(QStringLiteral("primaryButton"))->text(), QStringLiteral("保存主机"));
+
+        auto *nameEditor = addDialog.findChild<QLineEdit *>(QStringLiteral("nameEditor"));
+        auto *hostEditorForAdd = addDialog.findChild<QLineEdit *>(QStringLiteral("hostEditor"));
+        auto *portEditorForAdd = addDialog.findChild<QSpinBox *>(QStringLiteral("portEditor"));
+        auto *userEditor = addDialog.findChild<QLineEdit *>(QStringLiteral("userEditor"));
+        auto *authenticationEditor = addDialog.findChild<QComboBox *>(QStringLiteral("authenticationEditor"));
+        auto *groupEditor = addDialog.findChild<QComboBox *>(QStringLiteral("groupEditor"));
+        QVERIFY(nameEditor);
+        QVERIFY(hostEditorForAdd);
+        QVERIFY(portEditorForAdd);
+        QVERIFY(userEditor);
+        QVERIFY(authenticationEditor);
+        QVERIFY(groupEditor);
+        QVERIFY(!groupEditor->isEditable());
+        QCOMPARE(groupEditor->currentText(), QStringLiteral("测试环境"));
+        QCOMPARE(groupEditor->currentData().toString(), QStringLiteral("测试环境"));
+        QVERIFY(groupEditor->findText(QStringLiteral("未分组")) >= 0);
+        QVERIFY(groupEditor->findText(QStringLiteral("生产环境")) >= 0);
+        QVERIFY(groupEditor->findText(QStringLiteral("测试环境")) >= 0);
+        addDialog.show();
+        QCoreApplication::processEvents();
+        auto *endpointRow = addDialog.findChild<QWidget *>(QStringLiteral("endpointEditorRow"));
+        QVERIFY(endpointRow);
+        QCOMPARE(hostEditorForAdd->mapTo(endpointRow, QPoint{}).y(),
+            portEditorForAdd->mapTo(endpointRow, QPoint{}).y());
+        QVERIFY(hostEditorForAdd->geometry().right() < portEditorForAdd->geometry().left());
+        QCOMPARE(endpointRow->geometry().left(), authenticationEditor->geometry().left());
+        QCOMPARE(endpointRow->width(), authenticationEditor->width());
+
+        // 失败完成后测试按钮必须立即恢复，并允许下一次点击继续创建测试会话。
+        nameEditor->setText(QStringLiteral("retry-test"));
+        hostEditorForAdd->setText(QStringLiteral("127.0.0.1"));
+        portEditorForAdd->setValue(1);
+        userEditor->setText(QStringLiteral("root"));
+        passwordEditor->setText(QStringLiteral("retry-password"));
+        QSignalSpy testClicks(addTestButton, &QPushButton::clicked);
+        for (int attempt = 1; attempt <= 2; ++attempt) {
+            QTest::mouseClick(addTestButton, Qt::LeftButton);
+            QCOMPARE(testClicks.count(), attempt);
+            QVERIFY(!addTestButton->isEnabled());
+            auto *progress = addDialog.findChild<QProgressDialog *>();
+            QVERIFY(progress);
+            auto *testSession = progress->findChild<noxshell::SshSession *>();
+            QVERIFY(testSession);
+            QTimer::singleShot(0, [] {
+                for (auto *widget : QApplication::topLevelWidgets()) {
+                    if (auto *message = qobject_cast<QMessageBox *>(widget)) message->accept();
+                }
+            });
+            QVERIFY(QMetaObject::invokeMethod(testSession, "connectionChanged", Qt::DirectConnection,
+                Q_ARG(bool, false), Q_ARG(QString, QStringLiteral("SSH 连接失败：回归测试"))));
+            QTRY_VERIFY_WITH_TIMEOUT(addTestButton->isEnabled(), 1000);
+            QCOMPARE(addTestButton->text(), QStringLiteral("连接测试"));
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        }
+        addDialog.hide();
 
         noxshell::ServerProfile profile;
         profile.id = QStringLiteral("edit-test");

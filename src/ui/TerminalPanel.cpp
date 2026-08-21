@@ -1,14 +1,18 @@
 #include "TerminalPanel.h"
 
 #include "../core/SshSession.h"
+#include "../core/ServerRepository.h"
+#include "CommandHistoryPanel.h"
 #include "TerminalView.h"
 
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QStackedLayout>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace noxshell::ui {
@@ -22,7 +26,7 @@ bool isConnectionProgress(const QString &message)
 }
 } // namespace
 
-TerminalPanel::TerminalPanel(SshSession *session, QWidget *parent)
+TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, QWidget *parent)
     : QFrame(parent)
     , m_session(session)
 {
@@ -36,6 +40,8 @@ TerminalPanel::TerminalPanel(SshSession *session, QWidget *parent)
     auto *outputContainer = new QWidget;
     outputContainer->setObjectName(QStringLiteral("terminalOutputContainer"));
     auto *outputStack = new QStackedLayout(outputContainer);
+    // Keep the terminal canvas away from the panel edge without consuming
+    // space from the tab bar, command input, or connection status rows.
     outputStack->setContentsMargins(0, 0, 0, 0);
     outputStack->setStackingMode(QStackedLayout::StackAll);
     outputStack->addWidget(m_output);
@@ -75,28 +81,42 @@ TerminalPanel::TerminalPanel(SshSession *session, QWidget *parent)
     outputStack->addWidget(m_loadingOverlay);
     m_loadingOverlay->hide();
 
+    m_commandHistory = new CommandHistoryPanel(repository);
+    m_commandHistory->hide();
+
+    auto *inputRow = new QWidget;
+    inputRow->setObjectName(QStringLiteral("terminalInputRow"));
+    auto *inputLayout = new QHBoxLayout(inputRow);
+    inputLayout->setContentsMargins(0, 0, 5, 0);
+    inputLayout->setSpacing(3);
     m_input = new QLineEdit;
     m_input->setObjectName(QStringLiteral("terminalInput"));
     m_input->setPlaceholderText(QStringLiteral("输入命令并按 Enter（输入 help 查看原型命令）"));
     m_input->setEnabled(false);
     m_output->setEnabled(false);
     m_input->installEventFilter(this);
-
-    auto *status = new QWidget;
-    status->setObjectName(QStringLiteral("terminalStatus"));
-    auto *statusLayout = new QHBoxLayout(status);
-    statusLayout->setContentsMargins(11, 0, 11, 0);
-    m_connectionLabel = new QLabel(QStringLiteral("○ 待连接 · 双击左侧主机或右键连接"));
-    m_sizeLabel = new QLabel(QStringLiteral("UTF-8   |   120 × 36"));
-    statusLayout->addWidget(m_connectionLabel);
-    statusLayout->addStretch();
-    statusLayout->addWidget(m_sizeLabel);
+    m_historyButton = new QToolButton;
+    m_historyButton->setObjectName(QStringLiteral("commandHistoryButton"));
+    m_historyButton->setIcon(QIcon(QStringLiteral(":/assets/command-history.svg")));
+    m_historyButton->setIconSize(QSize(18, 18));
+    m_historyButton->setFixedSize(29, 29);
+    m_historyButton->setCheckable(true);
+    m_historyButton->setToolTip(QStringLiteral("命令历史与收藏"));
+    m_fileWorkspaceButton = new QToolButton;
+    m_fileWorkspaceButton->setObjectName(QStringLiteral("fileWorkspaceToggleButton"));
+    m_fileWorkspaceButton->setIcon(QIcon(QStringLiteral(":/assets/file-panel-hide.svg")));
+    m_fileWorkspaceButton->setIconSize(QSize(18, 18));
+    m_fileWorkspaceButton->setFixedSize(29, 29);
+    m_fileWorkspaceButton->setToolTip(QStringLiteral("隐藏文件管理"));
+    inputLayout->addWidget(m_input, 1);
+    inputLayout->addWidget(m_historyButton);
+    inputLayout->addWidget(m_fileWorkspaceButton);
 
     m_input->setFixedHeight(35);
-    status->setFixedHeight(27);
+    inputRow->setFixedHeight(35);
     layout->addWidget(outputContainer, 1);
-    layout->addWidget(m_input);
-    layout->addWidget(status);
+    layout->addWidget(m_commandHistory);
+    layout->addWidget(inputRow);
 
     connect(m_input, &QLineEdit::textEdited, m_output, &TerminalView::clearSelection);
     connect(m_input, &QLineEdit::returnPressed, this, &TerminalPanel::submitCommand);
@@ -108,10 +128,32 @@ TerminalPanel::TerminalPanel(SshSession *session, QWidget *parent)
     });
     connect(m_session, &SshSession::rawOutputReceived, m_output, &TerminalView::feedData);
     connect(m_output, &TerminalView::inputGenerated, m_session, &SshSession::sendInput);
-    connect(m_output, &TerminalView::commandSubmitted, this, &TerminalPanel::commandSubmitted);
+    connect(m_output, &TerminalView::commandSubmitted, this, [this](const QString &command) {
+        rememberCommand(command);
+        emit commandSubmitted(command);
+    });
+    connect(m_historyButton, &QToolButton::toggled, this, [this](bool visible) {
+        if (visible) m_commandHistory->refresh();
+        m_commandHistory->setVisible(visible);
+        m_historyButton->setToolTip(visible ? QStringLiteral("收起命令历史")
+                                            : QStringLiteral("命令历史与收藏"));
+    });
+    connect(m_commandHistory, &CommandHistoryPanel::closeRequested, this, [this] {
+        m_historyButton->setChecked(false);
+    });
+    connect(m_commandHistory, &CommandHistoryPanel::commandSelected, this, [this](const QString &command) {
+        m_input->setText(command);
+        m_input->setFocus();
+        m_input->setCursorPosition(m_input->text().size());
+    });
+    connect(m_commandHistory, &CommandHistoryPanel::commandExecutionRequested, this, [this](const QString &command) {
+        if (!m_session || !m_session->isConnected()) return;
+        m_input->setText(command);
+        submitCommand();
+    });
+    connect(m_fileWorkspaceButton, &QToolButton::clicked, this, &TerminalPanel::fileWorkspaceToggleRequested);
     connect(m_output, &TerminalView::terminalSizeChanged, this,
         [this](int columns, int rows, int pixelWidth, int pixelHeight) {
-            m_sizeLabel->setText(QStringLiteral("UTF-8   |   %1 × %2").arg(columns).arg(rows));
             m_session->resizeTerminal(columns, rows, pixelWidth, pixelHeight);
         });
     connect(m_session, &SshSession::promptChanged, this, [this](const QString &prompt) {
@@ -120,8 +162,6 @@ TerminalPanel::TerminalPanel(SshSession *session, QWidget *parent)
         m_input->setFocus();
     });
     connect(m_session, &SshSession::connectionChanged, this, [this](bool connected, const QString &message) {
-        m_connectionLabel->setText((connected ? QStringLiteral("● ") : QStringLiteral("○ ")) + message);
-        m_connectionLabel->setStyleSheet(connected ? QStringLiteral("color:#53C99C;") : QStringLiteral("color:#C5D3DF;"));
         m_input->setEnabled(connected);
         m_output->setEnabled(connected);
         if (connected) {
@@ -139,14 +179,22 @@ TerminalPanel::TerminalPanel(SshSession *session, QWidget *parent)
 void TerminalPanel::setServer(const ServerProfile &profile)
 {
     m_profile = profile;
+    m_commandHistory->setServerId(profile.id);
     m_output->clear();
     m_prompt.clear();
     m_input->clear();
     m_input->setEnabled(false);
     m_output->setEnabled(false);
-    m_connectionLabel->setText(QStringLiteral("○ 待连接 · 双击左侧主机或右键连接"));
-    m_connectionLabel->setStyleSheet(QStringLiteral("color:#C5D3DF;"));
     hideConnectionLoading();
+}
+
+void TerminalPanel::setFileWorkspaceVisible(bool visible)
+{
+    if (!m_fileWorkspaceButton) return;
+    m_fileWorkspaceButton->setIcon(QIcon(visible ? QStringLiteral(":/assets/file-panel-hide.svg")
+                                                   : QStringLiteral(":/assets/file-panel-show.svg")));
+    m_fileWorkspaceButton->setToolTip(visible ? QStringLiteral("隐藏文件管理")
+                                              : QStringLiteral("显示文件管理"));
 }
 
 void TerminalPanel::connectToServer(const ServerProfile &profile)
@@ -156,7 +204,6 @@ void TerminalPanel::connectToServer(const ServerProfile &profile)
         return;
     }
     setServer(profile);
-    m_connectionLabel->setText(QStringLiteral("○ 正在建立 SSH 会话…"));
     showConnectionLoading(QStringLiteral("正在连接 %1@%2:%3…").arg(profile.user, profile.host).arg(profile.port));
     m_session->connectTo(profile);
 }
@@ -229,6 +276,7 @@ void TerminalPanel::submitCommand()
     const auto command = m_input->text();
     m_output->clearSelection();
     m_input->clear();
+    rememberCommand(command);
     emit commandSubmitted(command);
     if (m_session->profile().connectionMode == ConnectionMode::Demo) {
         m_output->feedText(m_prompt + command + QLatin1Char('\n'));
@@ -237,6 +285,11 @@ void TerminalPanel::submitCommand()
     // Interactive commands such as top/vim keep running in the PTY. Give the
     // raw terminal focus so Ctrl/Cmd+C and subsequent keys reach that process.
     m_output->setFocus();
+}
+
+void TerminalPanel::rememberCommand(const QString &command)
+{
+    if (m_commandHistory) m_commandHistory->recordCommand(command);
 }
 
 void TerminalPanel::appendOutput(const QString &text)

@@ -33,6 +33,7 @@ public:
     void duplicateSession(const ServerProfile &profile);
     void updateServer(const ServerProfile &profile);
     void closeServer(const QString &serverId);
+    void setFileWorkspaceVisible(bool visible);
 
 signals:
     void sessionCountChanged(int count);
@@ -40,12 +41,15 @@ signals:
     void sessionClosed(SshSession *session);
     void sessionConnectionChanged(const QString &serverId, bool connected, const QString &message);
     void commandSubmitted(const QString &serverId, const QString &command);
+    void fileWorkspaceToggleRequested();
+    void hostSidebarVisibilityRequested(bool visible);
 
 private:
     Q_INVOKABLE bool prepareTabContextMenu(int index);
     void addSession(const ServerProfile &profile, bool activate, bool persist, bool connectNow);
     void duplicateSessionAt(int index);
     void closeSession(int index);
+    void installCloseButton(int index);
     void closeOtherSessions(int index);
     void closeAllSessions();
     void updateWorkspaceState();
@@ -61,6 +65,7 @@ private:
     QStackedWidget *m_viewStack{};
     QWidget *m_emptyPage{};
     QWidget *m_sessionsPage{};
+    QWidget *m_tabToolbar{};
     QTreeWidget *m_recentLogins{};
     QLabel *m_recentEmptyLabel{};
     QMenu *m_tabMenu{};
@@ -68,6 +73,7 @@ private:
     QAction *m_disconnectAction{};
     QAction *m_closeOthersAction{};
     int m_tabContextIndex{-1};
+    bool m_fileWorkspaceVisible{true};
 };
 
 } // namespace noxshell::ui

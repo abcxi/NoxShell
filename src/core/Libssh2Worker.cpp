@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 
 #ifdef Q_OS_WIN
 #define NOMINMAX
@@ -981,6 +982,91 @@ void Libssh2Worker::removePath(quint64 requestId, const QString &path, bool dire
     else emit fileOperationFailed(requestId, RemoteFileOperation::Remove, path,
         directory ? QStringLiteral("删除目录失败；仅支持删除空目录（SFTP %1）").arg(sftpError)
                   : QStringLiteral("删除文件失败（SFTP %1）").arg(sftpError));
+}
+
+void Libssh2Worker::changePermissions(quint64 requestId, const QString &path, quint32 permissions,
+    bool recursive, PermissionScope scope)
+{
+    LIBSSH2_SFTP *sftp = nullptr;
+    if (!beginSftpOperation(requestId, RemoteFileOperation::ChangePermissions, path, sftp)) return;
+
+    QString failure;
+    qsizetype changedCount = 0;
+    std::function<bool(const QString &, bool)> applyToPath;
+    applyToPath = [sftp, permissions, recursive, scope, &failure, &changedCount, &applyToPath](
+                      const QString &targetPath, bool selectedRoot) -> bool {
+        const auto bytes = targetPath.toUtf8();
+        LIBSSH2_SFTP_ATTRIBUTES current{};
+        if (libssh2_sftp_lstat(sftp, bytes.constData(), &current) != 0
+            || !(current.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)) {
+            failure = QStringLiteral("读取权限失败：%1（SFTP %2）")
+                          .arg(targetPath)
+                          .arg(libssh2_sftp_last_error(sftp));
+            return false;
+        }
+
+        const bool directory = LIBSSH2_SFTP_S_ISDIR(current.permissions);
+        const bool symbolicLink = LIBSSH2_SFTP_S_ISLNK(current.permissions);
+        if (symbolicLink) return true;
+        const bool shouldApply = !recursive || scope == PermissionScope::FilesAndDirectories
+            || (directory && scope == PermissionScope::DirectoriesOnly)
+            || (!directory && scope == PermissionScope::FilesOnly);
+        if (shouldApply) {
+            LIBSSH2_SFTP_ATTRIBUTES updated{};
+            updated.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
+            updated.permissions = (current.permissions & LIBSSH2_SFTP_S_IFMT) | (permissions & 07777U);
+            if (libssh2_sftp_setstat(sftp, bytes.constData(), &updated) != 0) {
+                failure = QStringLiteral("修改权限失败：%1（SFTP %2）")
+                              .arg(targetPath)
+                              .arg(libssh2_sftp_last_error(sftp));
+                return false;
+            }
+            ++changedCount;
+        }
+
+        if (!recursive || !directory) return true;
+        auto *handle = libssh2_sftp_opendir(sftp, bytes.constData());
+        if (!handle) {
+            failure = QStringLiteral("读取子目录失败：%1（SFTP %2）")
+                          .arg(targetPath)
+                          .arg(libssh2_sftp_last_error(sftp));
+            return false;
+        }
+        std::array<char, 4096> nameBuffer{};
+        bool ok = true;
+        for (;;) {
+            LIBSSH2_SFTP_ATTRIBUTES childAttributes{};
+            const auto length = libssh2_sftp_readdir(handle, nameBuffer.data(), nameBuffer.size(), &childAttributes);
+            if (length == 0) break;
+            if (length < 0) {
+                failure = QStringLiteral("遍历子目录失败：%1（SFTP %2）")
+                              .arg(targetPath)
+                              .arg(libssh2_sftp_last_error(sftp));
+                ok = false;
+                break;
+            }
+            const auto name = QString::fromUtf8(nameBuffer.data(), static_cast<qsizetype>(length));
+            if (name == QStringLiteral(".") || name == QStringLiteral("..")) continue;
+            const auto childPath = targetPath == QStringLiteral("/") ? QStringLiteral("/") + name
+                                                                       : targetPath + QLatin1Char('/') + name;
+            if (!applyToPath(childPath, false)) {
+                ok = false;
+                break;
+            }
+        }
+        libssh2_sftp_closedir(handle);
+        Q_UNUSED(selectedRoot);
+        return ok;
+    };
+
+    const bool success = applyToPath(path, true);
+    endSftpOperation(sftp);
+    if (success && failure.isEmpty()) {
+        emit fileOperationFinished(requestId, RemoteFileOperation::ChangePermissions, path);
+    } else {
+        emit fileOperationFailed(requestId, RemoteFileOperation::ChangePermissions, path,
+            failure.isEmpty() ? QStringLiteral("修改权限失败") : failure);
+    }
 }
 
 void Libssh2Worker::drainChannel()

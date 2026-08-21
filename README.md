@@ -1,20 +1,20 @@
 # 玄壳（NoxShell）
 
-面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.50`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
+面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.51`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
 
 ## 下载
 
 [前往 GitHub Releases 下载最新版本](https://github.com/abcxi/NoxShell/releases/latest)
 
-当前版本：`v0.2.50`
+当前版本：`v0.2.51`
 
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.50/%E7%8E%84%E5%A3%B3-v0.2.50-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.50/%E7%8E%84%E5%A3%B3-v0.2.50-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.50/NoxShell-v0.2.50-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.50/NoxShell-v0.2.50-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.50/SHA256SUMS.txt) | 用于验证下载文件完整性 |
+| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.51/%E7%8E%84%E5%A3%B3-v0.2.51-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.51/%E7%8E%84%E5%A3%B3-v0.2.51-macOS-x86_64.dmg) | Intel 芯片 Mac |
+| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.51/NoxShell-v0.2.51-Windows-x64.exe) | 64 位 Windows，推荐使用 |
+| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.51/NoxShell-v0.2.51-Windows-x64.zip) | 64 位 Windows，解压即用 |
+| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.51/SHA256SUMS.txt) | 用于验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签并且 GitHub Actions 构建成功后出现。私有仓库的下载链接需要先登录具有仓库访问权限的 GitHub 账号。
 
@@ -22,15 +22,16 @@
 
 - 桌面应用统一使用去除外围黑边的黑色玻璃质感与金色终端符号图标；透明圆角主体铺满有效画布，macOS 发布包内置 16–1024px Retina `.icns`，Dock、Finder、窗口与应用切换器保持一致。
 - 单一主机导航栏采用“名称 / IP”单行紧凑列表，支持名称/IP/分组筛选；不展示也不承担会话在线状态，单击不切换终端标签，双击连接后自动收起主机栏。
-- 移除占用垂直空间的自定义顶栏和 Qt 工具栏；macOS 使用原生标题栏附件，将两个独立图标直接放在红黄绿系统按钮右侧，可分别收起或恢复主机列表和实时监控栏，内容区紧贴系统标题栏。
+- macOS 使用原生标题栏附件，将主机栏、监控栏和终端设置图标直接放入系统标题栏；Windows 使用单行应用标题栏，将同样三个工具图标与最小化、最大化、关闭按钮合并展示，避免额外工具栏占用内容高度。
 - 主机右键菜单支持连接、编辑、复制主机配置、复制连接地址和删除。
-- 真实 SSH 主机通过独立 exec channel 秒级采集 CPU/内核态、内存、1/5/15 分钟负载和根磁盘占用；演示主机提供可预测的离线数据。
+- 真实 SSH 主机通过独立 exec channel 秒级采集 CPU/内核态、内存、1/5/15 分钟负载和根磁盘占用；监控栏默认以四项单行摘要展示，点击“详细”一次展开全部趋势、阈值和告警信息；演示主机提供可预测的离线数据。
 - 监控历史在 SQLite 中保留 7 天，界面显示最近 1、15、60 分钟；每台服务器可独立设置 CPU、内存、负载与磁盘阈值，并保存告警事件。
 - SSH 终端使用 VT/ANSI 网格状态机渲染，支持常见颜色、光标控制、滚动区、备用屏幕、功能键、Ctrl 组合键、中文输入和括号粘贴；PTY 行列随窗口尺寸同步。
 - 终端保留最多 5000 行滚屏历史，支持滚轮浏览、鼠标拖选和双击选词；右键菜单提供复制、粘贴和全选，`Cmd+C/Cmd+V`、`Ctrl+C/Ctrl+V` 均可直接操作，有选区时 `Cmd/Ctrl+C` 智能复制、无选区时向远端发送中断信号以退出 `top` 等前台命令，并兼容 `Ctrl+Shift+C/Ctrl+Shift+V`。
 - 终端支持 X10/SGR 鼠标报告，按住 Shift 可临时进行本地选择；右键始终保留给本地复制/粘贴菜单，不会误发给远端程序。
+- 终端输入栏右侧提供命令记录与文件区开关：历史管理面板向上展开，按主机维护去重后的历史/收藏，支持再次执行、收藏、备注、删除与清空；文件区可一键收起或恢复，状态在多个终端标签间同步。
 - 应用启动时不恢复终端标签、也不自动连接；没有会话时隐藏标签与终端内容，改为展示按成功登录时间倒序排列的最近登录记录；同一主机只保留最新一次成功登录，双击记录可重新连接。
-- 多终端标签拥有独立 SSH 连接，使用灰色空心点、蓝色进度环和绿色实心点区分未连接、连接中和连接成功；标签右键支持连接、断开、复制会话及批量关闭。
+- 多终端标签拥有独立 SSH 连接，使用灰色空心点、蓝色进度环和绿色实心点区分未连接、连接中和连接成功；标签名称自适应宽度并最多显示 10 个字符，关闭按钮位于右侧。标签后的“+”可打开起始页，右键支持连接、断开、清屏、复制会话及批量关闭。
 - 已建立的终端是不可变的连接快照；在线时修改主机名、IP、端口或凭据不会断开、清空或重连旧会话，下一次显式连接会使用新配置创建新标签。
 - 终端标签、左侧主机选中项、监控栏和 SFTP 文件区双向联动；监控与文件管理直接复用当前标签的 SSH 会话，切换时不重新连接。
 - SFTP 文件区采用双栏布局：左侧目录树按展开节点逐层加载，右侧显示当前目录明细；支持路径输入、刷新、返回上级、历史返回和双击进入目录。
@@ -39,11 +40,12 @@
 - 远端编辑器采用无按钮的键盘工作流，支持 `Cmd/Ctrl+S` 保存、`Cmd/Ctrl+Z` 撤销、`Ctrl+/` 切换 Shell 风格 `#` 注释和 `Cmd/Ctrl+W` 关闭当前标签；文本区显示行号与当前行高亮。
 - 编辑器支持按需展开的查找/替换栏：`Cmd/Ctrl+F` 查找后可直接点击“替换”展开第二行，macOS 也可用 `Cmd+Option+F`（其他平台可用 `Ctrl+H`）；Enter/Shift+Enter 前后循环匹配，支持区分大小写、单个替换、全部替换和匹配计数，Esc 收起面板。
 - 关闭带未保存内容的文件标签或编辑窗口时会确认保存；二进制文件禁止文本编辑，单文件上限 4 MiB，保存通过远端临时文件原子替换并保留原权限。
+- 文件列表右键支持权限管理，可设置所有者、组、其他用户的读/写/执行位，目录可选择递归范围。
 - 终端执行 `cd` 后下方目录会同步绝对路径、相对路径、`..` 与 `~`；终端与文件面板之间可拖拽调整高度。
 - SFTP 文件操作支持上传、下载、新建文件、新建目录、重命名和删除；上传通过 Finder 拖拽完成，下载及新建文件/目录统一从右键或“⋯”菜单进入，已存在的同名目标不会被覆盖。
 - 文件管理采用单行工具栏，返回、上级、路径输入和刷新直接位于标题栏，不再占用第二行；上传/下载进入持久化传输队列，同一 SSH 会话串行执行，队列图标以弹出面板集中展示任务、限速、取消和失败重试；支持异常退出恢复及 `.noxshell.part` 断点续传。
 - 当前主机采用三块同时可见的运维工作区：左侧纵向监控，右上 SSH 终端，右下文件管理；水平和垂直分隔条均可拖动。
-- 终端区只保留会话标签和清屏按钮，复制与批量关闭统一从标签右键菜单操作；清屏等同于 `Ctrl+L`，清除历史后保留远端 Shell 当前提示符。连接期间显示居中 Loading 提示板，成功或失败后自动收起。
+- 终端区只保留左对齐的会话标签；清屏、复制与批量关闭统一从被点击标签的右键菜单操作。清屏等同于 `Ctrl+L`，清除历史后保留远端 Shell 当前提示符。连接期间显示居中 Loading 提示板，成功或失败后自动收起。
 - 监控栏主机信息精简为 `IP:端口`，支持一键复制 IP；在线/连接中/离线由实际 SSH 会话状态驱动。
 - 新增/编辑主机窗口内置“连接测试”，会直接验证尚未保存的地址、端口和凭据；测试不会占用或替换当前终端会话。
 - 已知主机指纹严格绑定 `IP/域名:端口`；编辑时改变 IP 或端口会清除窗口中的旧指纹，并在新地址首次连接时独立确认。
@@ -103,7 +105,7 @@ Windows 使用 CPack + NSIS 生成带开始菜单、桌面快捷方式和卸载�
 - macOS Intel `.dmg`
 - Windows x64 NSIS `.exe` 与便携 `.zip`
 
-标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.50`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
+标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.51`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
 
 本地生成的 macOS 包采用临时签名，未使用 Developer ID 签名或 Apple 公证，仅适合内测；公开分发仍需正式签名与公证。使用当前 Homebrew Qt 构建时应在目标最低版本的 macOS 机器上做一次实际启动测试，正式兼容构建建议使用 Qt Online Installer 提供的官方 Qt。
 

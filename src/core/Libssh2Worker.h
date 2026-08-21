@@ -40,6 +40,8 @@ public slots:
     void createDirectory(quint64 requestId, const QString &path);
     void renamePath(quint64 requestId, const QString &sourcePath, const QString &destinationPath);
     void removePath(quint64 requestId, const QString &path, bool directory);
+    void changePermissions(quint64 requestId, const QString &path, quint32 permissions,
+        bool recursive, PermissionScope scope);
     void disconnectFromHost();
 
 signals:

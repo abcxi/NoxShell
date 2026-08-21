@@ -17,6 +17,7 @@ class QListWidget;
 class QToolButton;
 class QToolBar;
 class QStackedWidget;
+class QSplitter;
 
 namespace noxshell {
 class SshSession;
@@ -38,6 +39,10 @@ class MainWindow final : public QMainWindow {
 public:
     explicit MainWindow(QString databasePath = {}, QWidget *parent = nullptr);
 
+protected:
+    void changeEvent(QEvent *event) override;
+    bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
+
 private:
     QToolBar *createWindowToolbar();
     QWidget *createWorkspace();
@@ -48,6 +53,8 @@ private:
     QWidget *createStatusBar();
     void setSidebarVisible(bool visible);
     void setMonitorVisible(bool visible);
+    void setFileWorkspaceVisible(bool visible);
+    void showTerminalSettings();
     void updateConnectionPresentation(const QString &serverId, bool connected, const QString &message);
     void setConnectionBadge(const QString &text, const QString &foreground, const QString &background);
     void selectServer(const ServerProfile &profile);
@@ -67,6 +74,7 @@ private:
     void evaluateMonitoringAlerts(const MetricSample &sample);
     void refreshAlertList();
     void addServer();
+    void addServerInGroup(const QString &group);
     void editServer(const ServerProfile &profile);
     void deleteServer(const ServerProfile &profile);
     bool persistProfile(ServerProfile &profile, bool preserveEmptySecret);
@@ -79,15 +87,19 @@ private:
     QLabel *m_sampleStatus{};
     QToolButton *m_sidebarToggleButton{};
     QToolButton *m_monitorToggleButton{};
+    QToolButton *m_settingsButton{};
+    QToolButton *m_maximizeWindowButton{};
     QWidget *m_monitorRail{};
     MetricCard *m_cpuCard{};
     MetricCard *m_memoryCard{};
     MetricCard *m_loadCard{};
     MetricCard *m_diskCard{};
     TerminalWorkspace *m_terminalWorkspace{};
+    QSplitter *m_terminalFileSplitter{};
     FilePanel *m_filePanel{};
     QStackedWidget *m_fileWorkspaceStack{};
     QWidget *m_filePlaceholder{};
+    QWidget *m_fileWorkspacePane{};
     TrendChart *m_cpuTrend{};
     TrendChart *m_memoryTrend{};
     TrendChart *m_loadTrend{};
@@ -108,6 +120,7 @@ private:
     bool m_hasMetricSample{false};
     bool m_serverDeletionInFlight{false};
     bool m_nativeTitleBarControls{false};
+    bool m_fileWorkspaceVisible{true};
 };
 
 } // namespace noxshell::ui

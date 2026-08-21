@@ -30,6 +30,13 @@ enum class RemoteFileOperation {
     MakeDirectory,
     Rename,
     Remove,
+    ChangePermissions,
+};
+
+enum class PermissionScope {
+    FilesAndDirectories,
+    FilesOnly,
+    DirectoriesOnly,
 };
 
 } // namespace noxshell
@@ -37,3 +44,4 @@ enum class RemoteFileOperation {
 Q_DECLARE_METATYPE(noxshell::RemoteFileEntry)
 Q_DECLARE_METATYPE(noxshell::RemoteFileEntries)
 Q_DECLARE_METATYPE(noxshell::RemoteFileOperation)
+Q_DECLARE_METATYPE(noxshell::PermissionScope)

@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.50 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.51 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -74,8 +74,12 @@ qt_add_executable(NoxShell
     ${NOXSHELL_CORE_SOURCES}
     src/ui/AppTheme.cpp
     src/ui/AppTheme.h
+    src/ui/CommandHistoryPanel.cpp
+    src/ui/CommandHistoryPanel.h
     src/ui/FilePanel.cpp
     src/ui/FilePanel.h
+    src/ui/FilePermissionDialog.cpp
+    src/ui/FilePermissionDialog.h
     src/ui/HostSidebar.cpp
     src/ui/HostSidebar.h
     src/ui/MainWindow.cpp
@@ -91,6 +95,8 @@ qt_add_executable(NoxShell
     src/ui/ServerDialog.h
     src/ui/TerminalPanel.cpp
     src/ui/TerminalPanel.h
+    src/ui/TerminalSettingsDialog.cpp
+    src/ui/TerminalSettingsDialog.h
     src/ui/TerminalWorkspace.cpp
     src/ui/TerminalWorkspace.h
     src/ui/TerminalView.cpp
@@ -121,8 +127,12 @@ if(BUILD_TESTING)
         ${NOXSHELL_CORE_SOURCES}
         src/ui/AppTheme.cpp
         src/ui/AppTheme.h
+        src/ui/CommandHistoryPanel.cpp
+        src/ui/CommandHistoryPanel.h
         src/ui/FilePanel.cpp
         src/ui/FilePanel.h
+        src/ui/FilePermissionDialog.cpp
+        src/ui/FilePermissionDialog.h
         src/ui/HostSidebar.cpp
         src/ui/HostSidebar.h
         src/ui/MainWindow.cpp
@@ -138,6 +148,8 @@ if(BUILD_TESTING)
         src/ui/ServerDialog.h
         src/ui/TerminalPanel.cpp
         src/ui/TerminalPanel.h
+        src/ui/TerminalSettingsDialog.cpp
+        src/ui/TerminalSettingsDialog.h
         src/ui/TerminalWorkspace.cpp
         src/ui/TerminalWorkspace.h
         src/ui/TerminalView.cpp

@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "noxshell",
-  "version-string": "0.2.50",
+  "version-string": "0.2.51",
   "description": "NoxShell SSH remote server management desktop application",
   "dependencies": [
     {

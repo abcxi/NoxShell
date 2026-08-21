@@ -3,13 +3,14 @@
 #include "../core/ServerProfile.h"
 
 #include <QDialog>
+#include <QStringList>
 
 class QComboBox;
+class QAction;
 class QLineEdit;
 class QSpinBox;
 class QStackedWidget;
 class QPushButton;
-class QToolButton;
 class QLabel;
 
 namespace noxshell {
@@ -28,6 +29,8 @@ public:
 
     [[nodiscard]] ServerProfile profile() const;
     void setConnectionServices(ServerRepository *repository, CredentialStore *credentialStore);
+    void setAvailableGroups(const QStringList &groups);
+    void setInitialGroup(const QString &group);
 
 private:
     void updateAuthenticationPage();
@@ -44,12 +47,12 @@ private:
     QLineEdit *m_host{};
     QSpinBox *m_port{};
     QLineEdit *m_user{};
-    QLineEdit *m_group{};
+    QComboBox *m_group{};
     QLineEdit *m_os{};
     QComboBox *m_authentication{};
     QStackedWidget *m_authPages{};
     QLineEdit *m_password{};
-    QToolButton *m_passwordReveal{};
+    QAction *m_passwordReveal{};
     QLabel *m_passwordHint{};
     QLineEdit *m_privateKey{};
     QLineEdit *m_publicKey{};

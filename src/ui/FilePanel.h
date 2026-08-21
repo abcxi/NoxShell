@@ -5,12 +5,13 @@
 
 #include <QFrame>
 #include <QHash>
+#include <QList>
+#include <QPair>
 #include <QStringList>
 
 class QLabel;
 class QLineEdit;
 class QTreeWidget;
-class QPushButton;
 class QMenu;
 class QToolButton;
 class QAction;
@@ -61,6 +62,9 @@ private:
     void renameSelected();
     void finishInlineRename(bool submit);
     void removeSelected();
+    void startNextRemoval();
+    void finishRemovalBatch();
+    void changeSelectedPermissions();
     void updateActionState();
     [[nodiscard]] QTreeWidgetItem *selectedEntry() const;
     [[nodiscard]] QList<QTreeWidgetItem *> selectedEntries() const;
@@ -72,16 +76,18 @@ private:
     QLineEdit *m_pathEdit{};
     QTreeWidget *m_directoryTree{};
     QTreeWidget *m_tree{};
-    QPushButton *m_backButton{};
-    QPushButton *m_upButton{};
-    QPushButton *m_refreshButton{};
-    QToolButton *m_moreButton{};
+    QToolButton *m_backButton{};
+    QToolButton *m_upButton{};
+    QToolButton *m_refreshButton{};
     QToolButton *m_transferQueueButton{};
+    QMenu *m_contextMenu{};
+    QMenu *m_transferQueueMenu{};
     QAction *m_downloadAction{};
     QAction *m_newFileAction{};
     QAction *m_newDirectoryAction{};
     QAction *m_renameAction{};
     QAction *m_removeAction{};
+    QAction *m_permissionsAction{};
     RemoteFileEditor *m_fileEditor{};
     TransferQueuePanel *m_transferQueuePanel{};
     ServerProfile m_profile;
@@ -100,6 +106,11 @@ private:
     QLineEdit *m_renameEditor{};
     QString m_renameSourcePath;
     QString m_renameOriginalName;
+    QList<QPair<QString, bool>> m_removeQueue;
+    int m_removeTotal{};
+    int m_removeSucceeded{};
+    QStringList m_removeFailures;
+    QString m_postRefreshStatus;
 };
 
 } // namespace noxshell::ui

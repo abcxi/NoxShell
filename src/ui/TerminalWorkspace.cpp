@@ -13,10 +13,12 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
-#include <QPushButton>
+#include <QProxyStyle>
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QTabBar>
+#include <QTimer>
+#include <QToolButton>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
@@ -25,6 +27,78 @@
 namespace noxshell::ui {
 
 namespace {
+class LeftAlignedTabStyle final : public QProxyStyle {
+public:
+    [[nodiscard]] int styleHint(StyleHint hint, const QStyleOption *option = nullptr,
+        const QWidget *widget = nullptr, QStyleHintReturn *returnData = nullptr) const override
+    {
+        if (hint == QStyle::SH_TabBar_Alignment) return Qt::AlignLeft;
+        if (hint == QStyle::SH_TabBar_CloseButtonPosition) return QTabBar::RightSide;
+        return QProxyStyle::styleHint(hint, option, widget, returnData);
+    }
+};
+
+class TerminalTabToolbar final : public QWidget {
+public:
+    explicit TerminalTabToolbar(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+    }
+
+    void setControls(QTabBar *tabs, QToolButton *addButton)
+    {
+        m_tabs = tabs;
+        m_addButton = addButton;
+        m_tabs->installEventFilter(this);
+        scheduleButtonPosition();
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == m_tabs && (event->type() == QEvent::LayoutRequest
+                || event->type() == QEvent::Resize || event->type() == QEvent::Show)) {
+            scheduleButtonPosition();
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QWidget::resizeEvent(event);
+        scheduleButtonPosition();
+    }
+
+private:
+    void scheduleButtonPosition()
+    {
+        QTimer::singleShot(0, this, [this] { positionButton(); });
+    }
+
+    void positionButton()
+    {
+        if (!m_tabs || !m_addButton) return;
+        if (layout()) layout()->activate();
+        int x = m_tabs->geometry().left() + 2;
+        if (m_tabs->count() > 0) {
+            x = m_tabs->geometry().left() + m_tabs->tabRect(m_tabs->count() - 1).right() + 5;
+        }
+        x = std::clamp(x, 2, std::max(2, width() - m_addButton->width() - 4));
+        m_addButton->move(x, std::max(0, (height() - m_addButton->height()) / 2));
+        m_addButton->raise();
+    }
+
+    QTabBar *m_tabs{};
+    QToolButton *m_addButton{};
+};
+
+QString compactTabTitle(const QString &title)
+{
+    constexpr int maximumCharacters = 10;
+    if (title.size() <= maximumCharacters) return title;
+    return title.left(maximumCharacters - 1) + QChar(0x2026);
+}
+
 enum class TabConnectionPhase {
     Disconnected,
     Connecting,
@@ -96,7 +170,7 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     emptyLayout->setSpacing(8);
     auto *recentTitle = new QLabel(QStringLiteral("最近登录"));
     recentTitle->setObjectName(QStringLiteral("recentLoginTitle"));
-    auto *recentHint = new QLabel(QStringLiteral("尚未建立 SSH 会话 · 双击记录可重新连接"));
+    auto *recentHint = new QLabel(QStringLiteral("双击最近登录记录可打开或返回 SSH 会话"));
     recentHint->setObjectName(QStringLiteral("recentLoginHint"));
     m_recentLogins = new QTreeWidget;
     m_recentLogins->setObjectName(QStringLiteral("recentLoginList"));
@@ -127,13 +201,17 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     sessionsLayout->setContentsMargins(0, 0, 0, 0);
     sessionsLayout->setSpacing(0);
 
-    auto *toolbar = new QWidget;
+    auto *toolbar = new TerminalTabToolbar;
+    m_tabToolbar = toolbar;
     toolbar->setObjectName(QStringLiteral("terminalTabToolbar"));
     auto *toolbarLayout = new QHBoxLayout(toolbar);
     toolbarLayout->setContentsMargins(8, 5, 7, 5);
     toolbarLayout->setSpacing(6);
     m_tabs = new QTabBar;
     m_tabs->setObjectName(QStringLiteral("terminalSessionTabs"));
+    auto *leftAlignedStyle = new LeftAlignedTabStyle;
+    leftAlignedStyle->setParent(m_tabs);
+    m_tabs->setStyle(leftAlignedStyle);
     // Cocoa's native tab style can report a near-zero height for a standalone
     // QTabBar. Keep the session strip explicit so its labels do not collapse
     // while the surrounding toolbar remains visible as an empty row.
@@ -148,6 +226,8 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     m_connectAction->setObjectName(QStringLiteral("terminalConnectAction"));
     m_disconnectAction->setObjectName(QStringLiteral("terminalDisconnectAction"));
     m_tabMenu->addSeparator();
+    auto *clearAction = m_tabMenu->addAction(QStringLiteral("清屏"));
+    clearAction->setObjectName(QStringLiteral("terminalClearAction"));
     auto *duplicateAction = m_tabMenu->addAction(QStringLiteral("复制会话"));
     duplicateAction->setObjectName(QStringLiteral("terminalDuplicateAction"));
     m_tabMenu->addSeparator();
@@ -157,23 +237,41 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     closeCurrentAction->setObjectName(QStringLiteral("terminalCloseCurrentAction"));
     m_closeOthersAction->setObjectName(QStringLiteral("terminalCloseOthersAction"));
     closeAllAction->setObjectName(QStringLiteral("terminalCloseAllAction"));
-    auto *clearButton = new QPushButton(QStringLiteral("清屏"));
-    clearButton->setObjectName(QStringLiteral("clearTerminalButton"));
-    clearButton->setToolTip(QStringLiteral("清空当前会话的本地终端显示"));
+    // 标签栏保持完整可用宽度，具体标签通过样式提示从左侧开始排列。
+    // 不能压缩 QTabBar 本身：macOS 原生样式会因此停止绘制标签。
     toolbarLayout->addWidget(m_tabs, 1);
-    toolbarLayout->addWidget(clearButton);
-    sessionsLayout->addWidget(toolbar);
+    auto *newTabButton = new QToolButton(toolbar);
+    newTabButton->setObjectName(QStringLiteral("terminalNewTabButton"));
+    newTabButton->setText(QStringLiteral("+"));
+    newTabButton->setToolTip(QStringLiteral("打开起始页"));
+    newTabButton->setFixedSize(28, 28);
+    toolbar->setControls(m_tabs, newTabButton);
 
     m_stack = new QStackedWidget;
+    m_stack->setObjectName(QStringLiteral("terminalSessionStack"));
     sessionsLayout->addWidget(m_stack, 1);
     m_viewStack->addWidget(m_emptyPage);
     m_viewStack->addWidget(m_sessionsPage);
+    layout->addWidget(toolbar);
     layout->addWidget(m_viewStack, 1);
 
     connect(m_tabs, &QTabBar::currentChanged, this, [this](int index) {
         if (index >= 0 && index < m_stack->count()) m_stack->setCurrentIndex(index);
+        if (index >= 0 && index < m_stack->count()) m_viewStack->setCurrentWidget(m_sessionsPage);
         publishActiveSession();
         persistState();
+    });
+    connect(m_tabs, &QTabBar::tabBarClicked, this, [this](int index) {
+        if (index < 0 || index >= m_stack->count()) return;
+        m_tabs->setCurrentIndex(index);
+        m_stack->setCurrentIndex(index);
+        m_viewStack->setCurrentWidget(m_sessionsPage);
+        publishActiveSession();
+    });
+    connect(newTabButton, &QToolButton::clicked, this, [this] {
+        refreshRecentLogins();
+        m_viewStack->setCurrentWidget(m_emptyPage);
+        emit hostSidebarVisibilityRequested(true);
     });
     connect(m_tabs, &QTabBar::tabCloseRequested, this, &TerminalWorkspace::closeSession);
     connect(m_tabs, &QTabBar::customContextMenuRequested, this,
@@ -202,15 +300,16 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
             session->disconnectFromHost();
         }
     });
+    connect(clearAction, &QAction::triggered, this, [this] {
+        if (m_tabContextIndex < 0 || m_tabContextIndex >= m_stack->count()) return;
+        if (auto *panel = m_stack->widget(m_tabContextIndex)->findChild<TerminalPanel *>()) {
+            panel->clearTerminal();
+        }
+    });
     connect(duplicateAction, &QAction::triggered, this, [this] { duplicateSessionAt(m_tabContextIndex); });
     connect(closeCurrentAction, &QAction::triggered, this, [this] { closeSession(m_tabContextIndex); });
     connect(m_closeOthersAction, &QAction::triggered, this, [this] { closeOtherSessions(m_tabContextIndex); });
     connect(closeAllAction, &QAction::triggered, this, &TerminalWorkspace::closeAllSessions);
-    connect(clearButton, &QPushButton::clicked, this, [this] {
-        const int index = m_tabs->currentIndex();
-        if (index < 0 || index >= m_stack->count()) return;
-        if (auto *panel = m_stack->widget(index)->findChild<TerminalPanel *>()) panel->clearTerminal();
-    });
     connect(m_recentLogins, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item) {
         if (!item || !m_repository) return;
         const auto serverId = item->data(0, Qt::UserRole).toString();
@@ -218,7 +317,10 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
         const auto found = std::find_if(servers.cbegin(), servers.cend(), [&serverId](const ServerProfile &profile) {
             return profile.id == serverId;
         });
-        if (found != servers.cend()) openOrActivate(*found, true);
+        if (found != servers.cend()) {
+            openOrActivate(*found, true);
+            emit hostSidebarVisibilityRequested(false);
+        }
     });
 
     refreshRecentLogins();
@@ -265,6 +367,7 @@ bool TerminalWorkspace::activateExisting(const QString &serverId)
         break;
     }
     if (fallbackIndex < 0) return false;
+    m_viewStack->setCurrentWidget(m_sessionsPage);
     const bool indexChanged = m_tabs->currentIndex() != fallbackIndex;
     m_tabs->setCurrentIndex(fallbackIndex);
     if (!indexChanged) publishActiveSession();
@@ -277,6 +380,7 @@ void TerminalWorkspace::openOrActivate(const ServerProfile &profile, bool connec
         if (m_tabs->tabData(index).toString() != profile.id) continue;
         auto *page = m_stack->widget(index);
         if (!page->property("serverConfigurationCurrent").toBool()) continue;
+        m_viewStack->setCurrentWidget(m_sessionsPage);
         const bool indexChanged = m_tabs->currentIndex() != index;
         m_tabs->setCurrentIndex(index);
         if (!indexChanged) publishActiveSession();
@@ -320,6 +424,16 @@ void TerminalWorkspace::closeServer(const QString &serverId)
     }
 }
 
+void TerminalWorkspace::setFileWorkspaceVisible(bool visible)
+{
+    m_fileWorkspaceVisible = visible;
+    for (int index = 0; index < m_stack->count(); ++index) {
+        if (auto *panel = m_stack->widget(index)->findChild<TerminalPanel *>()) {
+            panel->setFileWorkspaceVisible(visible);
+        }
+    }
+}
+
 void TerminalWorkspace::addSession(const ServerProfile &profile, bool activate, bool persist, bool connectNow)
 {
     auto *page = new QWidget;
@@ -330,12 +444,15 @@ void TerminalWorkspace::addSession(const ServerProfile &profile, bool activate, 
     layout->setContentsMargins(0, 0, 0, 0);
     auto *session = new SshSession(m_repository, m_credentialStore, page);
     session->setTransferPersistenceEnabled(false);
-    auto *panel = new TerminalPanel(session);
+    auto *panel = new TerminalPanel(session, m_repository);
+    panel->setFileWorkspaceVisible(m_fileWorkspaceVisible);
     layout->addWidget(panel);
     connect(panel, &TerminalPanel::commandSubmitted, this, [this, page](const QString &command) {
         const auto profile = page->property("serverProfile").value<ServerProfile>();
         if (!profile.id.isEmpty()) emit commandSubmitted(profile.id, command);
     });
+    connect(panel, &TerminalPanel::fileWorkspaceToggleRequested,
+        this, &TerminalWorkspace::fileWorkspaceToggleRequested);
     connect(session, &SshSession::connectionChanged, this, [this, page](bool connected, const QString &message) {
         const auto profile = page->property("serverProfile").value<ServerProfile>();
         const auto phase = connected ? TabConnectionPhase::Connected
@@ -369,10 +486,12 @@ void TerminalWorkspace::addSession(const ServerProfile &profile, bool activate, 
     int index = -1;
     {
         const QSignalBlocker blocker(m_tabs);
-        index = m_tabs->addTab(profile.name);
+        index = m_tabs->addTab(compactTabTitle(profile.name));
         m_tabs->setTabData(index, profile.id);
         m_tabs->setTabIcon(index, tabConnectionIcon(TabConnectionPhase::Disconnected));
-        m_tabs->setTabToolTip(index, QStringLiteral("未连接 · %1@%2:%3").arg(profile.user, profile.host).arg(profile.port));
+        m_tabs->setTabToolTip(index, QStringLiteral("%1 · 未连接 · %2@%3:%4")
+                .arg(profile.name, profile.user, profile.host).arg(profile.port));
+        installCloseButton(index);
         m_stack->addWidget(page);
         if (activate) m_tabs->setCurrentIndex(index);
     }
@@ -385,6 +504,33 @@ void TerminalWorkspace::addSession(const ServerProfile &profile, bool activate, 
     updateWorkspaceState();
     emit sessionCountChanged(m_tabs->count());
     if (persist) persistState();
+}
+
+void TerminalWorkspace::installCloseButton(int index)
+{
+    if (index < 0 || index >= m_tabs->count()) return;
+    auto *nativeButton = m_tabs->tabButton(index, QTabBar::RightSide);
+    auto *container = new QWidget(m_tabs);
+    container->setObjectName(QStringLiteral("terminalTabCloseContainer"));
+    container->setFixedSize(27, 22);
+    auto *containerLayout = new QHBoxLayout(container);
+    containerLayout->setContentsMargins(2, 0, 6, 0);
+    containerLayout->setSpacing(0);
+    auto *closeButton = new QToolButton(container);
+    closeButton->setObjectName(QStringLiteral("terminalTabCloseButton"));
+    closeButton->setText(QString::fromUtf8("×"));
+    closeButton->setToolTip(QStringLiteral("关闭标签"));
+    closeButton->setFixedSize(19, 19);
+    containerLayout->addWidget(closeButton);
+    m_tabs->setTabButton(index, QTabBar::RightSide, container);
+    if (nativeButton && nativeButton != container) nativeButton->deleteLater();
+    connect(closeButton, &QToolButton::clicked, this, [this, container] {
+        for (int candidate = 0; candidate < m_tabs->count(); ++candidate) {
+            if (m_tabs->tabButton(candidate, QTabBar::RightSide) != container) continue;
+            closeSession(candidate);
+            return;
+        }
+    });
 }
 
 void TerminalWorkspace::closeSession(int index)
@@ -430,9 +576,11 @@ void TerminalWorkspace::updateWorkspaceState()
 {
     if (!m_viewStack) return;
     if (m_tabs->count() == 0) {
+        if (m_tabToolbar) m_tabToolbar->hide();
         refreshRecentLogins();
         m_viewStack->setCurrentWidget(m_emptyPage);
     } else {
+        if (m_tabToolbar) m_tabToolbar->show();
         m_viewStack->setCurrentWidget(m_sessionsPage);
     }
 }

@@ -44,6 +44,8 @@ public:
     void createDirectory(const QString &path);
     void renamePath(const QString &sourcePath, const QString &destinationPath);
     void removePath(const QString &path, bool directory);
+    void changePermissions(const QString &path, quint32 permissions, bool recursive = false,
+        PermissionScope scope = PermissionScope::FilesAndDirectories);
     void approveHostKey(bool approved);
 
     [[nodiscard]] bool isConnected() const { return m_connected; }
@@ -65,6 +67,8 @@ signals:
     void createDirectoryRequested(quint64 requestId, const QString &path);
     void renamePathRequested(quint64 requestId, const QString &sourcePath, const QString &destinationPath);
     void removePathRequested(quint64 requestId, const QString &path, bool directory);
+    void changePermissionsRequested(quint64 requestId, const QString &path, quint32 permissions,
+        bool recursive, PermissionScope scope);
     void hostKeyApprovalRequested(bool approved);
     void connectionChanged(bool connected, const QString &message);
     void outputReceived(const QString &text);

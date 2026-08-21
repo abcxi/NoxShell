@@ -21,6 +21,31 @@
 
 namespace noxshell::ui {
 
+namespace {
+constexpr int kContentLeft = 14;
+constexpr int kContentTop = 10;
+constexpr int kContentRight = 6;
+constexpr int kContentBottom = 8;
+constexpr int kScrollBarWidth = 10;
+
+TerminalAppearance normalizedAppearance(TerminalAppearance appearance)
+{
+    if (appearance.fontFamily.trimmed().isEmpty()) {
+        appearance.fontFamily = QFontDatabase::systemFont(QFontDatabase::FixedFont).family();
+    }
+    appearance.pointSize = qBound(8, appearance.pointSize, 32);
+    appearance.lineSpacing = qBound<qreal>(1.0, appearance.lineSpacing, 2.0);
+    return appearance;
+}
+
+TerminalAppearance &sharedDefaultAppearance()
+{
+    static TerminalAppearance appearance{
+        QFontDatabase::systemFont(QFontDatabase::FixedFont).family(), 12, 1.05};
+    return appearance;
+}
+}
+
 TerminalView::TerminalView(QWidget *parent)
     : QWidget(parent)
 {
@@ -28,15 +53,7 @@ TerminalView::TerminalView(QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
     setAttribute(Qt::WA_InputMethodEnabled);
     setAutoFillBackground(false);
-    m_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    m_font.setPointSize(12);
-    m_font.setStyleHint(QFont::Monospace);
-    m_font.setFixedPitch(true);
-    const QFontMetricsF metrics(m_font);
-    m_cellWidth = qCeil(metrics.horizontalAdvance(QLatin1Char('M')));
-    m_cellHeight = qCeil(metrics.height() + 1.0);
-    m_ascent = metrics.ascent();
-    setMinimumSize(static_cast<int>(m_cellWidth * 20), static_cast<int>(m_cellHeight * 6));
+    setAppearance(defaultAppearance());
     setCursor(Qt::IBeamCursor);
     m_scrollBar = new QScrollBar(Qt::Vertical, this);
     m_scrollBar->setObjectName(QStringLiteral("terminalScrollBar"));
@@ -68,6 +85,40 @@ TerminalView::TerminalView(QWidget *parent)
         QTimer::singleShot(0, this, [this] { setFocus(); });
     });
     connect(m_selectAllAction, &QAction::triggered, this, &TerminalView::selectAllText);
+}
+
+TerminalAppearance TerminalView::defaultAppearance()
+{
+    return sharedDefaultAppearance();
+}
+
+void TerminalView::setDefaultAppearance(const TerminalAppearance &appearance)
+{
+    sharedDefaultAppearance() = normalizedAppearance(appearance);
+}
+
+void TerminalView::setAppearance(const TerminalAppearance &appearance)
+{
+    m_appearance = normalizedAppearance(appearance);
+    m_font = QFont(m_appearance.fontFamily);
+    m_font.setPointSize(m_appearance.pointSize);
+    m_font.setStyleHint(QFont::Monospace);
+    m_font.setFixedPitch(true);
+
+    const QFontMetricsF metrics(m_font);
+    m_cellWidth = qCeil(metrics.horizontalAdvance(QLatin1Char('M')));
+    const qreal naturalHeight = metrics.height();
+    m_cellHeight = qCeil(naturalHeight * m_appearance.lineSpacing);
+    m_ascent = metrics.ascent() + qMax<qreal>(0.0, (m_cellHeight - naturalHeight) / 2.0);
+    setMinimumSize(static_cast<int>(m_cellWidth * 20) + kContentLeft + kContentRight + kScrollBarWidth,
+        static_cast<int>(m_cellHeight * 6) + kContentTop + kContentBottom);
+    if (m_scrollBar) updateGridSize();
+    update();
+}
+
+QPointF TerminalView::contentOrigin() const
+{
+    return {kContentLeft, kContentTop};
 }
 
 void TerminalView::feedData(const QByteArray &data)
@@ -106,7 +157,23 @@ bool TerminalView::event(QEvent *event)
     if (event->type() == QEvent::KeyPress) {
         auto *keyEvent = static_cast<QKeyEvent *>(event);
         if (keyEvent->key() == Qt::Key_Tab || keyEvent->key() == Qt::Key_Backtab) {
+            // Readline treats two Tab bytes differently from one. Forward only
+            // the first press in each physical key-down cycle so platform key
+            // repeat cannot unexpectedly expand hundreds of shell candidates.
+            if (m_tabKeyDown || keyEvent->isAutoRepeat()) {
+                keyEvent->accept();
+                return true;
+            }
+            m_tabKeyDown = true;
             keyPressEvent(keyEvent);
+            return true;
+        }
+    }
+    if (event->type() == QEvent::KeyRelease) {
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        if (keyEvent->key() == Qt::Key_Tab || keyEvent->key() == Qt::Key_Backtab) {
+            if (!keyEvent->isAutoRepeat()) m_tabKeyDown = false;
+            keyEvent->accept();
             return true;
         }
     }
@@ -121,6 +188,9 @@ void TerminalView::paintEvent(QPaintEvent *event)
     const QColor defaultBackground(QStringLiteral("#0C1825"));
     const bool reverseVideo = m_model.reverseVideo();
     painter.fillRect(rect(), reverseVideo ? defaultForeground : defaultBackground);
+    painter.setClipRect(QRectF(kContentLeft, kContentTop,
+        qMax(0, width() - kContentLeft - kContentRight - kScrollBarWidth),
+        qMax(0, height() - kContentTop - kContentBottom)));
     painter.setFont(m_font);
     painter.setRenderHint(QPainter::TextAntialiasing);
 
@@ -134,7 +204,7 @@ void TerminalView::paintEvent(QPaintEvent *event)
             QColor background = cell.inverse ? cell.foreground : cell.background;
             if (reverseVideo) std::swap(foreground, background);
             const bool wide = column + 1 < m_model.columns() && m_model.documentCell(documentLine, column + 1).wideContinuation;
-            const QRectF cellRect(column * m_cellWidth, row * m_cellHeight,
+            const QRectF cellRect(kContentLeft + column * m_cellWidth, kContentTop + row * m_cellHeight,
                 wide ? m_cellWidth * 2 : m_cellWidth, m_cellHeight);
             if (background != (reverseVideo ? defaultForeground : defaultBackground)) painter.fillRect(cellRect, background);
             if (isSelected(documentLine, column)) painter.fillRect(cellRect, QColor(49, 84, 119, 180));
@@ -143,13 +213,15 @@ void TerminalView::paintEvent(QPaintEvent *event)
             font.setUnderline(cell.underline);
             painter.setFont(font);
             painter.setPen(foreground);
-            painter.drawText(QPointF(column * m_cellWidth, row * m_cellHeight + m_ascent), cell.text);
+            painter.drawText(QPointF(kContentLeft + column * m_cellWidth,
+                kContentTop + row * m_cellHeight + m_ascent), cell.text);
         }
     }
 
     if (m_hasFocus && m_model.cursorVisible() && firstLine == m_scrollBar->maximum()) {
-        const QRectF cursorRect(m_model.cursorColumn() * m_cellWidth,
-            m_model.cursorRow() * m_cellHeight + 2.0, 2.0, qMax(2.0, m_cellHeight - 4.0));
+        const QRectF cursorRect(kContentLeft + m_model.cursorColumn() * m_cellWidth,
+            kContentTop + m_model.cursorRow() * m_cellHeight + 2.0,
+            2.0, qMax(2.0, m_cellHeight - 4.0));
         painter.fillRect(cursorRect, QColor(QStringLiteral("#7DB1DE")));
     }
 }
@@ -157,19 +229,21 @@ void TerminalView::paintEvent(QPaintEvent *event)
 void TerminalView::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    m_scrollBar->setGeometry(width() - 10, 0, 10, height());
+    m_scrollBar->setGeometry(width() - kScrollBarWidth, 0, kScrollBarWidth, height());
     m_scrollBar->raise();
     updateGridSize();
 }
 
 void TerminalView::updateGridSize()
 {
-    const int columns = qMax(2, static_cast<int>(width() / m_cellWidth));
-    const int rows = qMax(2, static_cast<int>(height() / m_cellHeight));
+    const int contentWidth = qMax(1, width() - kContentLeft - kContentRight - kScrollBarWidth);
+    const int contentHeight = qMax(1, height() - kContentTop - kContentBottom);
+    const int columns = qMax(2, static_cast<int>(contentWidth / m_cellWidth));
+    const int rows = qMax(2, static_cast<int>(contentHeight / m_cellHeight));
     if (columns == m_model.columns() && rows == m_model.rows()) return;
     m_model.resize(columns, rows);
     updateScrollBar(true);
-    emit terminalSizeChanged(columns, rows, width(), height());
+    emit terminalSizeChanged(columns, rows, contentWidth, contentHeight);
     update();
 }
 
@@ -359,8 +433,8 @@ void TerminalView::updateScrollBar(bool followBottom)
 
 QPoint TerminalView::documentPosition(const QPointF &position) const
 {
-    const int column = qBound(0, static_cast<int>(position.x() / m_cellWidth), m_model.columns() - 1);
-    const int visibleRow = qBound(0, static_cast<int>(position.y() / m_cellHeight), m_model.rows() - 1);
+    const int column = qBound(0, static_cast<int>((position.x() - kContentLeft) / m_cellWidth), m_model.columns() - 1);
+    const int visibleRow = qBound(0, static_cast<int>((position.y() - kContentTop) / m_cellHeight), m_model.rows() - 1);
     return {column, qMin(m_model.documentLineCount() - 1, m_scrollBar->value() + visibleRow)};
 }
 
@@ -408,8 +482,8 @@ bool TerminalView::shouldReportMouse(Qt::KeyboardModifiers modifiers) const
 
 QByteArray TerminalView::mouseReport(int button, const QPointF &position, bool release) const
 {
-    const int column = qBound(0, static_cast<int>(position.x() / m_cellWidth), m_model.columns() - 1) + 1;
-    const int row = qBound(0, static_cast<int>(position.y() / m_cellHeight), m_model.rows() - 1) + 1;
+    const int column = qBound(0, static_cast<int>((position.x() - kContentLeft) / m_cellWidth), m_model.columns() - 1) + 1;
+    const int row = qBound(0, static_cast<int>((position.y() - kContentTop) / m_cellHeight), m_model.rows() - 1) + 1;
     const char final = release ? 'm' : 'M';
     if (m_model.sgrMouseEncoding()) {
         return QByteArray("\x1b[<") + QByteArray::number(button) + ';' + QByteArray::number(column) + ';'
@@ -541,6 +615,7 @@ void TerminalView::focusInEvent(QFocusEvent *event)
 void TerminalView::focusOutEvent(QFocusEvent *event)
 {
     m_hasFocus = false;
+    m_tabKeyDown = false;
     update();
     QWidget::focusOutEvent(event);
 }
@@ -568,7 +643,8 @@ QVariant TerminalView::inputMethodQuery(Qt::InputMethodQuery query) const
 {
     if (query == Qt::ImEnabled) return true;
     if (query == Qt::ImCursorRectangle) {
-        return QRectF(m_model.cursorColumn() * m_cellWidth, m_model.cursorRow() * m_cellHeight, m_cellWidth, m_cellHeight);
+        return QRectF(kContentLeft + m_model.cursorColumn() * m_cellWidth,
+            kContentTop + m_model.cursorRow() * m_cellHeight, m_cellWidth, m_cellHeight);
     }
     return QWidget::inputMethodQuery(query);
 }

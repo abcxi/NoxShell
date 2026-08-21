@@ -93,6 +93,18 @@ bool ServerRepository::migrate()
         return false;
     }
     if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS server_groups ("
+            "name TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"))) {
+        setError(QStringLiteral("迁移 server_groups"), query.lastError().text());
+        return false;
+    }
+    if (!query.exec(QStringLiteral(
+            "INSERT OR IGNORE INTO server_groups(name,position,created_at) "
+            "SELECT group_name,rowid,datetime('now') FROM servers WHERE group_name<>''"))) {
+        setError(QStringLiteral("整理服务器分组"), query.lastError().text());
+        return false;
+    }
+    if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS known_hosts ("
             "host TEXT NOT NULL, port INTEGER NOT NULL, algorithm TEXT NOT NULL DEFAULT '',"
             "fingerprint TEXT NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,"
@@ -170,6 +182,20 @@ bool ServerRepository::migrate()
         setError(QStringLiteral("创建登录历史主机索引"), query.lastError().text());
         return false;
     }
+    if (!query.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS command_history ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT NOT NULL, command TEXT NOT NULL,"
+            "note TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, executed_at TEXT NOT NULL,"
+            "UNIQUE(server_id,command), FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE)"))) {
+        setError(QStringLiteral("迁移命令历史"), query.lastError().text());
+        return false;
+    }
+    if (!query.exec(QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS idx_command_history_server_time "
+            "ON command_history(server_id,executed_at DESC,id DESC)"))) {
+        setError(QStringLiteral("创建命令历史索引"), query.lastError().text());
+        return false;
+    }
     return true;
 }
 
@@ -219,6 +245,21 @@ QVector<ServerProfile> ServerRepository::loadServers()
     return result;
 }
 
+QStringList ServerRepository::loadServerGroups()
+{
+    QStringList result;
+    QSqlQuery query(m_database);
+    if (!query.exec(QStringLiteral("SELECT name FROM server_groups ORDER BY position,name COLLATE NOCASE"))) {
+        setError(QStringLiteral("读取服务器分组"), query.lastError().text());
+        return result;
+    }
+    while (query.next()) {
+        const auto name = query.value(0).toString().trimmed();
+        if (!name.isEmpty() && !result.contains(name)) result.append(name);
+    }
+    return result;
+}
+
 bool ServerRepository::saveServer(ServerProfile &profile)
 {
     if (profile.id.isEmpty()) profile.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -250,6 +291,87 @@ bool ServerRepository::saveServer(ServerProfile &profile)
     query.addBindValue(now);
     if (!query.exec()) {
         setError(QStringLiteral("保存服务器"), query.lastError().text());
+        return false;
+    }
+    if (!profile.group.trimmed().isEmpty() && !saveServerGroup(profile.group.trimmed())) return false;
+    return true;
+}
+
+bool ServerRepository::saveServerGroup(const QString &name)
+{
+    const auto normalized = name.trimmed();
+    if (normalized.isEmpty()) return false;
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO server_groups(name,position,created_at) "
+        "VALUES(?,COALESCE((SELECT MAX(position)+1 FROM server_groups),0),?)"));
+    query.addBindValue(normalized);
+    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    if (!query.exec()) {
+        setError(QStringLiteral("保存服务器分组"), query.lastError().text());
+        return false;
+    }
+    return true;
+}
+
+bool ServerRepository::renameServerGroup(const QString &oldName, const QString &newName)
+{
+    const auto oldNormalized = oldName.trimmed();
+    const auto newNormalized = newName.trimmed();
+    if (oldNormalized.isEmpty() || newNormalized.isEmpty()) return false;
+    if (oldNormalized == newNormalized) return true;
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("重命名服务器分组"), m_database.lastError().text());
+        return false;
+    }
+    QSqlQuery insert(m_database);
+    insert.prepare(QStringLiteral(
+        "INSERT INTO server_groups(name,position,created_at) "
+        "SELECT ?,position,created_at FROM server_groups WHERE name=? "
+        "ON CONFLICT(name) DO NOTHING"));
+    insert.addBindValue(newNormalized);
+    insert.addBindValue(oldNormalized);
+    QSqlQuery update(m_database);
+    update.prepare(QStringLiteral("UPDATE servers SET group_name=?,updated_at=? WHERE group_name=?"));
+    update.addBindValue(newNormalized);
+    update.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    update.addBindValue(oldNormalized);
+    QSqlQuery remove(m_database);
+    remove.prepare(QStringLiteral("DELETE FROM server_groups WHERE name=?"));
+    remove.addBindValue(oldNormalized);
+    if (!insert.exec() || !update.exec() || !remove.exec() || !m_database.commit()) {
+        const auto detail = !insert.lastError().text().isEmpty() ? insert.lastError().text()
+            : !update.lastError().text().isEmpty() ? update.lastError().text()
+            : !remove.lastError().text().isEmpty() ? remove.lastError().text()
+                                                  : m_database.lastError().text();
+        m_database.rollback();
+        setError(QStringLiteral("重命名服务器分组"), detail);
+        return false;
+    }
+    return true;
+}
+
+bool ServerRepository::deleteServerGroup(const QString &name)
+{
+    const auto normalized = name.trimmed();
+    if (normalized.isEmpty()) return false;
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("删除服务器分组"), m_database.lastError().text());
+        return false;
+    }
+    QSqlQuery update(m_database);
+    update.prepare(QStringLiteral("UPDATE servers SET group_name='',updated_at=? WHERE group_name=?"));
+    update.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    update.addBindValue(normalized);
+    QSqlQuery remove(m_database);
+    remove.prepare(QStringLiteral("DELETE FROM server_groups WHERE name=?"));
+    remove.addBindValue(normalized);
+    if (!update.exec() || !remove.exec() || !m_database.commit()) {
+        const auto detail = !update.lastError().text().isEmpty() ? update.lastError().text()
+            : !remove.lastError().text().isEmpty() ? remove.lastError().text()
+                                                  : m_database.lastError().text();
+        m_database.rollback();
+        setError(QStringLiteral("删除服务器分组"), detail);
         return false;
     }
     return true;
@@ -395,6 +517,123 @@ QVector<LoginHistoryEntry> ServerRepository::loadRecentLogins(int limit)
         result.append(entry);
     }
     return result;
+}
+
+bool ServerRepository::recordCommand(const QString &serverId, const QString &command, const QDateTime &executedAt)
+{
+    const auto normalized = command.trimmed();
+    if (serverId.isEmpty() || normalized.isEmpty()) return false;
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "INSERT INTO command_history(server_id,command,note,favorite,executed_at) VALUES(?,?,'',0,?) "
+        "ON CONFLICT(server_id,command) DO UPDATE SET executed_at=excluded.executed_at"));
+    query.addBindValue(serverId);
+    query.addBindValue(normalized.left(4096));
+    query.addBindValue((executedAt.isValid() ? executedAt : QDateTime::currentDateTime())
+                           .toUTC().toString(Qt::ISODateWithMs));
+    if (!query.exec()) {
+        setError(QStringLiteral("记录命令历史"), query.lastError().text());
+        return false;
+    }
+    QSqlQuery prune(m_database);
+    prune.prepare(QStringLiteral(
+        "DELETE FROM command_history WHERE server_id=? AND favorite=0 AND id NOT IN ("
+        "SELECT id FROM command_history WHERE server_id=? ORDER BY executed_at DESC,id DESC LIMIT 500)"));
+    prune.addBindValue(serverId);
+    prune.addBindValue(serverId);
+    prune.exec();
+    return true;
+}
+
+QVector<CommandHistoryEntry> ServerRepository::loadCommandHistory(
+    const QString &serverId, bool favoritesOnly, int limit)
+{
+    QVector<CommandHistoryEntry> result;
+    if (serverId.isEmpty()) return result;
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "SELECT id,server_id,command,note,favorite,executed_at FROM command_history "
+        "WHERE server_id=? AND (?=0 OR favorite=1) ORDER BY executed_at DESC,id DESC LIMIT ?"));
+    query.addBindValue(serverId);
+    query.addBindValue(favoritesOnly ? 1 : 0);
+    query.addBindValue(qBound(1, limit, 500));
+    if (!query.exec()) {
+        setError(QStringLiteral("读取命令历史"), query.lastError().text());
+        return result;
+    }
+    while (query.next()) {
+        CommandHistoryEntry entry;
+        entry.id = query.value(0).toLongLong();
+        entry.serverId = query.value(1).toString();
+        entry.command = query.value(2).toString();
+        entry.note = query.value(3).toString();
+        entry.favorite = query.value(4).toBool();
+        entry.executedAt = QDateTime::fromString(query.value(5).toString(), Qt::ISODateWithMs).toLocalTime();
+        result.append(entry);
+    }
+    return result;
+}
+
+bool ServerRepository::setCommandFavorite(qint64 id, bool favorite)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("UPDATE command_history SET favorite=? WHERE id=?"));
+    query.addBindValue(favorite ? 1 : 0);
+    query.addBindValue(id);
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        setError(QStringLiteral("更新命令收藏"), query.lastError().text());
+        return false;
+    }
+    return true;
+}
+
+bool ServerRepository::setCommandNote(qint64 id, const QString &note)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("UPDATE command_history SET note=? WHERE id=?"));
+    query.addBindValue(note.trimmed().left(500));
+    query.addBindValue(id);
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        setError(QStringLiteral("更新命令备注"), query.lastError().text());
+        return false;
+    }
+    return true;
+}
+
+bool ServerRepository::deleteCommandHistory(qint64 id)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("DELETE FROM command_history WHERE id=?"));
+    query.addBindValue(id);
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        setError(QStringLiteral("删除命令历史"), query.lastError().text());
+        return false;
+    }
+    return true;
+}
+
+bool ServerRepository::clearCommandHistory(const QString &serverId)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("DELETE FROM command_history WHERE server_id=?"));
+    query.addBindValue(serverId);
+    if (!query.exec()) {
+        setError(QStringLiteral("清空命令历史"), query.lastError().text());
+        return false;
+    }
+    return true;
+}
+
+bool ServerRepository::clearCommandFavorites(const QString &serverId)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("UPDATE command_history SET favorite=0 WHERE server_id=? AND favorite=1"));
+    query.addBindValue(serverId);
+    if (!query.exec()) {
+        setError(QStringLiteral("清空命令收藏"), query.lastError().text());
+        return false;
+    }
+    return true;
 }
 
 bool ServerRepository::saveMetricSample(const QString &serverId, const MetricSample &sample)

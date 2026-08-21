@@ -7,5 +7,15 @@
         <file>assets/monitor-expand.svg</file>
         <file>assets/copy.svg</file>
         <file>assets/transfer-queue.svg</file>
+        <file>assets/file-back.svg</file>
+        <file>assets/file-up.svg</file>
+        <file>assets/file-refresh.svg</file>
+        <file>assets/command-history.svg</file>
+        <file>assets/file-panel-hide.svg</file>
+        <file>assets/file-panel-show.svg</file>
+        <file>assets/settings.svg</file>
+        <file>assets/eye.svg</file>
+        <file>assets/eye-off.svg</file>
+        <file>assets/chevron-down.svg</file>
   </qresource>
 </RCC>

@@ -2,6 +2,7 @@
 
 #include "VtTerminalModel.h"
 
+#include <QPointF>
 #include <QStringDecoder>
 #include <QWidget>
 
@@ -12,11 +13,24 @@ class QMenu;
 
 namespace noxshell::ui {
 
+struct TerminalAppearance {
+    QString fontFamily;
+    int pointSize{12};
+    qreal lineSpacing{1.05};
+
+    friend bool operator==(const TerminalAppearance &, const TerminalAppearance &) = default;
+};
+
 class TerminalView final : public QWidget {
     Q_OBJECT
 
 public:
     explicit TerminalView(QWidget *parent = nullptr);
+
+    static TerminalAppearance defaultAppearance();
+    static void setDefaultAppearance(const TerminalAppearance &appearance);
+    void setAppearance(const TerminalAppearance &appearance);
+    [[nodiscard]] TerminalAppearance appearance() const { return m_appearance; }
 
     void feedData(const QByteArray &data);
     void feedText(const QString &text);
@@ -28,6 +42,7 @@ public:
     [[nodiscard]] int columns() const { return m_model.columns(); }
     [[nodiscard]] int rows() const { return m_model.rows(); }
     [[nodiscard]] QSizeF cellSize() const { return {m_cellWidth, m_cellHeight}; }
+    [[nodiscard]] QPointF contentOrigin() const;
 
 signals:
     void inputGenerated(const QByteArray &data);
@@ -71,10 +86,12 @@ private:
     VtTerminalModel m_model;
     QStringDecoder m_decoder{QStringDecoder::Utf8};
     QFont m_font;
+    TerminalAppearance m_appearance;
     qreal m_cellWidth{};
     qreal m_cellHeight{};
     qreal m_ascent{};
     bool m_hasFocus{false};
+    bool m_tabKeyDown{false};
     QScrollBar *m_scrollBar{};
     QMenu *m_contextMenu{};
     QAction *m_copyAction{};

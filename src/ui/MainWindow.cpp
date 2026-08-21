@@ -11,6 +11,8 @@
 #include "MacTitleBarControls.h"
 #endif
 #include "ServerDialog.h"
+#include "TerminalSettingsDialog.h"
+#include "TerminalView.h"
 #include "TerminalWorkspace.h"
 #include "TrendChart.h"
 
@@ -18,6 +20,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QDebug>
+#include <QEvent>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -25,8 +28,11 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSettings>
+#include <QSizePolicy>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QTimer>
@@ -34,6 +40,12 @@
 #include <QToolButton>
 #include <QUuid>
 #include <QVBoxLayout>
+#include <QWindow>
+
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#include <windowsx.h>
+#endif
 
 #ifndef NOXSHELL_APP_VERSION
 #define NOXSHELL_APP_VERSION "0.0.0"
@@ -42,6 +54,35 @@
 namespace noxshell::ui {
 
 namespace {
+class WindowControlsToolbar final : public QToolBar {
+public:
+    explicit WindowControlsToolbar(QWidget *parent = nullptr)
+        : QToolBar(parent)
+    {
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            if (auto *handle = window()->windowHandle()) handle->startSystemMove();
+            event->accept();
+            return;
+        }
+        QToolBar::mousePressEvent(event);
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            window()->isMaximized() ? window()->showNormal() : window()->showMaximized();
+            event->accept();
+            return;
+        }
+        QToolBar::mouseDoubleClickEvent(event);
+    }
+};
+
 QString formatGib(quint64 bytes)
 {
     constexpr double bytesPerGib = 1024.0 * 1024.0 * 1024.0;
@@ -63,8 +104,23 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
     , m_credentialStore(new CredentialStore(this))
 {
     setWindowTitle(QStringLiteral("玄壳 · SSH 远程管理"));
+#ifdef Q_OS_WIN
+    // Windows 使用应用内标题栏，把三枚工作区工具按钮与最小化、最大化、
+    // 关闭按钮合并为一行；macOS 继续使用原生标题栏附件。
+    setWindowFlag(Qt::FramelessWindowHint, true);
+#endif
     setMinimumSize(1180, 720);
     resize(1440, 900);
+
+    auto terminalAppearance = TerminalView::defaultAppearance();
+    const QSettings settings;
+    terminalAppearance.fontFamily = settings.value(
+        QStringLiteral("terminal/fontFamily"), terminalAppearance.fontFamily).toString();
+    terminalAppearance.pointSize = settings.value(
+        QStringLiteral("terminal/fontSize"), terminalAppearance.pointSize).toInt();
+    terminalAppearance.lineSpacing = settings.value(
+        QStringLiteral("terminal/lineSpacing"), terminalAppearance.lineSpacing).toDouble();
+    TerminalView::setDefaultAppearance(terminalAppearance);
 #ifdef Q_OS_MACOS
     m_nativeTitleBarControls = QApplication::platformName() == QStringLiteral("cocoa");
 #endif
@@ -85,12 +141,16 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
     bodyLayout->setSpacing(0);
     auto servers = m_repository->loadServers();
     for (auto &server : servers) server.state = ServerState::Offline;
-    m_sidebar = new HostSidebar(std::move(servers));
+    m_sidebar = new HostSidebar(std::move(servers), m_repository->loadServerGroups());
     bodyLayout->addWidget(m_sidebar);
     bodyLayout->addWidget(createWorkspace(), 1);
     rootLayout->addWidget(body, 1);
     rootLayout->addWidget(createStatusBar());
     setCentralWidget(root);
+
+    // 主机列表只在选择新会话时按需展开，启动时为终端和文件区
+    // 保留更多可用空间。
+    setSidebarVisible(false);
 
     if (m_sidebarToggleButton) {
         connect(m_sidebarToggleButton, &QToolButton::clicked, this, [this] {
@@ -108,16 +168,24 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
             const auto install = [this] {
                 return installMacTitleBarControls(this,
                     [this] { setSidebarVisible(m_sidebar->isHidden()); },
-                    [this] { setMonitorVisible(m_monitorRail->isHidden()); });
+                    [this] { setMonitorVisible(m_monitorRail->isHidden()); },
+                    [this] { showTerminalSettings(); });
             };
             if (install()) {
+                updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
+                    m_monitorRail && m_monitorRail->isVisible());
                 qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
             } else {
                 QTimer::singleShot(100, this, [this] {
                     const bool installed = installMacTitleBarControls(this,
                         [this] { setSidebarVisible(m_sidebar->isHidden()); },
-                        [this] { setMonitorVisible(m_monitorRail->isHidden()); });
-                    if (installed) qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
+                        [this] { setMonitorVisible(m_monitorRail->isHidden()); },
+                        [this] { showTerminalSettings(); });
+                    if (installed) {
+                        updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
+                            m_monitorRail && m_monitorRail->isVisible());
+                        qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
+                    }
                     else qWarning().noquote() << QStringLiteral("macOS 原生标题栏双栏开关安装失败");
                 });
             }
@@ -133,6 +201,49 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
     connect(m_sidebar, &HostSidebar::serverDuplicateRequested, this, &MainWindow::duplicateServer);
     connect(m_sidebar, &HostSidebar::serverDeleteRequested, this, &MainWindow::selectAndDeleteServer);
     connect(m_sidebar, &HostSidebar::addServerRequested, this, &MainWindow::addServer);
+    connect(m_sidebar, &HostSidebar::addServerInGroupRequested, this, &MainWindow::addServerInGroup);
+    connect(m_sidebar, &HostSidebar::serverGroupChanged, this, [this](const ServerProfile &updated) {
+        auto profile = updated;
+        if (!m_repository->saveServer(profile)) {
+            QMessageBox::critical(this, QStringLiteral("移动主机失败"), m_repository->lastError());
+            for (const auto &saved : m_repository->loadServers()) {
+                if (saved.id == profile.id) {
+                    m_sidebar->updateServer(saved);
+                    break;
+                }
+            }
+            return;
+        }
+        if (m_terminalWorkspace) m_terminalWorkspace->updateServer(profile);
+    });
+    connect(m_sidebar, &HostSidebar::groupCreateRequested, this, [this](const QString &name) {
+        if (!m_repository->saveServerGroup(name)) {
+            QMessageBox::critical(this, QStringLiteral("新建分组失败"), m_repository->lastError());
+            return;
+        }
+        m_sidebar->addGroup(name);
+    });
+    connect(m_sidebar, &HostSidebar::groupRenameRequested, this,
+        [this](const QString &oldName, const QString &newName) {
+            if (!m_repository->renameServerGroup(oldName, newName)) {
+                QMessageBox::critical(this, QStringLiteral("重命名分组失败"), m_repository->lastError());
+                return;
+            }
+            m_sidebar->renameGroup(oldName, newName);
+            if (m_terminalWorkspace) {
+                for (const auto &server : m_sidebar->servers()) m_terminalWorkspace->updateServer(server);
+            }
+        });
+    connect(m_sidebar, &HostSidebar::groupDeleteRequested, this, [this](const QString &name) {
+        if (!m_repository->deleteServerGroup(name)) {
+            QMessageBox::critical(this, QStringLiteral("删除分组失败"), m_repository->lastError());
+            return;
+        }
+        m_sidebar->removeGroup(name);
+        if (m_terminalWorkspace) {
+            for (const auto &server : m_sidebar->servers()) m_terminalWorkspace->updateServer(server);
+        }
+    });
     m_metricTimer = new QTimer(this);
     m_metricTimer->setInterval(1000);
     connect(m_metricTimer, &QTimer::timeout, this, &MainWindow::requestMetrics);
@@ -145,12 +256,13 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
 
 QToolBar *MainWindow::createWindowToolbar()
 {
-    auto *toolbar = new QToolBar(this);
+    auto *toolbar = new WindowControlsToolbar(this);
     toolbar->setObjectName(QStringLiteral("windowControlsToolbar"));
     toolbar->setAllowedAreas(Qt::TopToolBarArea);
     toolbar->setMovable(false);
     toolbar->setFloatable(false);
     toolbar->setIconSize(QSize(20, 20));
+    toolbar->setFixedHeight(34);
 
     m_sidebarToggleButton = new QToolButton;
     m_sidebarToggleButton->setObjectName(QStringLiteral("sidebarToggleButton"));
@@ -168,9 +280,118 @@ QToolBar *MainWindow::createWindowToolbar()
     m_monitorToggleButton->setToolTip(QStringLiteral("隐藏实时监控栏"));
     m_monitorToggleButton->setAccessibleName(QStringLiteral("隐藏实时监控栏"));
 
+    m_settingsButton = new QToolButton;
+    m_settingsButton->setObjectName(QStringLiteral("terminalSettingsButton"));
+    m_settingsButton->setIcon(QIcon(QStringLiteral(":/assets/settings.svg")));
+    m_settingsButton->setIconSize(QSize(19, 19));
+    m_settingsButton->setFixedSize(30, 28);
+    m_settingsButton->setToolTip(QStringLiteral("终端显示设置"));
+    m_settingsButton->setAccessibleName(QStringLiteral("终端显示设置"));
+
     toolbar->addWidget(m_sidebarToggleButton);
     toolbar->addWidget(m_monitorToggleButton);
+    toolbar->addWidget(m_settingsButton);
+
+    auto *leftSpacer = new QWidget;
+    leftSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(leftSpacer);
+    auto *title = new QLabel(QStringLiteral("玄壳 · SSH 远程管理"));
+    title->setObjectName(QStringLiteral("windowToolbarTitle"));
+    title->setAlignment(Qt::AlignCenter);
+    toolbar->addWidget(title);
+    auto *rightSpacer = new QWidget;
+    rightSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(rightSpacer);
+
+#ifdef Q_OS_WIN
+    const auto systemButton = [toolbar](const QString &text, const QString &name, const QString &toolTip) {
+        auto *button = new QToolButton;
+        button->setObjectName(name);
+        button->setText(text);
+        button->setToolTip(toolTip);
+        button->setAccessibleName(toolTip);
+        button->setFixedSize(44, 32);
+        toolbar->addWidget(button);
+        return button;
+    };
+    auto *minimizeButton = systemButton(QStringLiteral("—"),
+        QStringLiteral("windowMinimizeButton"), QStringLiteral("最小化"));
+    m_maximizeWindowButton = systemButton(QStringLiteral("□"),
+        QStringLiteral("windowMaximizeButton"), QStringLiteral("最大化"));
+    auto *closeButton = systemButton(QStringLiteral("×"),
+        QStringLiteral("windowCloseButton"), QStringLiteral("关闭"));
+    connect(minimizeButton, &QToolButton::clicked, this, &QWidget::showMinimized);
+    connect(m_maximizeWindowButton, &QToolButton::clicked, this, [this] {
+        isMaximized() ? showNormal() : showMaximized();
+    });
+    connect(closeButton, &QToolButton::clicked, this, &QWidget::close);
+#endif
+    connect(m_settingsButton, &QToolButton::clicked, this, &MainWindow::showTerminalSettings);
     return toolbar;
+}
+
+void MainWindow::changeEvent(QEvent *event)
+{
+    QMainWindow::changeEvent(event);
+    if (event->type() != QEvent::WindowStateChange || !m_maximizeWindowButton) return;
+    const bool maximized = isMaximized();
+    m_maximizeWindowButton->setText(maximized ? QStringLiteral("❐") : QStringLiteral("□"));
+    m_maximizeWindowButton->setToolTip(maximized ? QStringLiteral("还原") : QStringLiteral("最大化"));
+    m_maximizeWindowButton->setAccessibleName(m_maximizeWindowButton->toolTip());
+}
+
+bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr *result)
+{
+#ifdef Q_OS_WIN
+    Q_UNUSED(eventType)
+    const auto *nativeMessage = static_cast<MSG *>(message);
+    if (nativeMessage && nativeMessage->message == WM_NCHITTEST && !isMaximized()) {
+        const auto local = mapFromGlobal(QPoint(
+            GET_X_LPARAM(nativeMessage->lParam), GET_Y_LPARAM(nativeMessage->lParam)));
+        constexpr int border = 6;
+        const bool left = local.x() >= 0 && local.x() < border;
+        const bool right = local.x() < width() && local.x() >= width() - border;
+        const bool top = local.y() >= 0 && local.y() < border;
+        const bool bottom = local.y() < height() && local.y() >= height() - border;
+        if (top && left) *result = HTTOPLEFT;
+        else if (top && right) *result = HTTOPRIGHT;
+        else if (bottom && left) *result = HTBOTTOMLEFT;
+        else if (bottom && right) *result = HTBOTTOMRIGHT;
+        else if (left) *result = HTLEFT;
+        else if (right) *result = HTRIGHT;
+        else if (top) *result = HTTOP;
+        else if (bottom) *result = HTBOTTOM;
+        else return QMainWindow::nativeEvent(eventType, message, result);
+        return true;
+    }
+#endif
+    return QMainWindow::nativeEvent(eventType, message, result);
+}
+
+void MainWindow::showTerminalSettings()
+{
+    const auto previous = TerminalView::defaultAppearance();
+    TerminalSettingsDialog dialog(previous, this);
+    const auto applyAppearance = [this](const TerminalAppearance &appearance) {
+        TerminalView::setDefaultAppearance(appearance);
+        const auto terminals = findChildren<TerminalView *>();
+        for (auto *terminal : terminals) terminal->setAppearance(appearance);
+    };
+    connect(&dialog, &TerminalSettingsDialog::appearancePreviewRequested, this,
+        [applyAppearance](const QString &family, int size, double spacing) {
+            applyAppearance({family, size, spacing});
+        });
+
+    if (dialog.exec() == QDialog::Accepted) {
+        const auto selected = dialog.appearance();
+        applyAppearance(selected);
+        QSettings settings;
+        settings.setValue(QStringLiteral("terminal/fontFamily"), selected.fontFamily);
+        settings.setValue(QStringLiteral("terminal/fontSize"), selected.pointSize);
+        settings.setValue(QStringLiteral("terminal/lineSpacing"), selected.lineSpacing);
+    } else {
+        applyAppearance(previous);
+    }
 }
 
 void MainWindow::setSidebarVisible(bool visible)
@@ -207,6 +428,17 @@ void MainWindow::setMonitorVisible(bool visible)
 #endif
 }
 
+void MainWindow::setFileWorkspaceVisible(bool visible)
+{
+    m_fileWorkspaceVisible = visible;
+    if (m_fileWorkspacePane) m_fileWorkspacePane->setVisible(visible);
+    if (visible && m_terminalFileSplitter) {
+        const int available = qMax(400, m_terminalFileSplitter->height());
+        m_terminalFileSplitter->setSizes({available * 65 / 100, available * 35 / 100});
+    }
+    if (m_terminalWorkspace) m_terminalWorkspace->setFileWorkspaceVisible(visible);
+}
+
 QWidget *MainWindow::createWorkspace()
 {
     auto *workspace = new QWidget;
@@ -226,6 +458,7 @@ QWidget *MainWindow::createWorkspace()
     operationsLayout->setSpacing(0);
 
     auto *terminalFileSplitter = new QSplitter(Qt::Vertical);
+    m_terminalFileSplitter = terminalFileSplitter;
     terminalFileSplitter->setObjectName(QStringLiteral("terminalFileSplitter"));
     terminalFileSplitter->setChildrenCollapsible(false);
     terminalFileSplitter->addWidget(createTerminalWorkspace());
@@ -290,9 +523,17 @@ QWidget *MainWindow::createMetricStrip()
     heading->setStyleSheet(QStringLiteral("font-size:15px;font-weight:650;"));
     auto *sampleHint = new QLabel(QStringLiteral("1 秒"));
     sampleHint->setObjectName(QStringLiteral("mutedLabel"));
+    auto *trendToggle = new QToolButton;
+    trendToggle->setObjectName(QStringLiteral("monitorTrendToggle"));
+    trendToggle->setText(QStringLiteral("详细"));
+    trendToggle->setCheckable(true);
+    trendToggle->setArrowType(Qt::RightArrow);
+    trendToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    trendToggle->setToolTip(QStringLiteral("展开全部实时监控详情"));
     headingLayout->addWidget(heading);
     headingLayout->addStretch();
     headingLayout->addWidget(sampleHint);
+    headingLayout->addWidget(trendToggle);
     railLayout->addWidget(monitorHeading);
 
     auto *scroll = new QScrollArea;
@@ -302,45 +543,34 @@ QWidget *MainWindow::createMetricStrip()
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto *content = new QWidget;
     auto *layout = new QVBoxLayout(content);
-    layout->setContentsMargins(10, 2, 10, 10);
+    layout->setContentsMargins(10, 7, 10, 10);
     layout->setSpacing(8);
 
     m_cpuCard = new MetricCard(QStringLiteral("CPU 使用率"), QColor(QStringLiteral("#006EFF")));
     m_memoryCard = new MetricCard(QStringLiteral("内存使用率"), QColor(QStringLiteral("#8B5CF6")));
     m_loadCard = new MetricCard(QStringLiteral("系统负载"), QColor(QStringLiteral("#00A870")));
     m_diskCard = new MetricCard(QStringLiteral("磁盘使用率"), QColor(QStringLiteral("#ED7B2F")));
+    auto *summary = new QFrame;
+    summary->setObjectName(QStringLiteral("monitorMetricSummary"));
+    summary->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    auto *summaryLayout = new QVBoxLayout(summary);
+    summaryLayout->setContentsMargins(0, 0, 0, 0);
+    summaryLayout->setSpacing(0);
     for (auto *card : {m_cpuCard, m_memoryCard, m_loadCard, m_diskCard}) {
-        layout->addWidget(card);
+        summaryLayout->addWidget(card);
     }
+    m_diskCard->setProperty("lastRow", true);
+    layout->addWidget(summary);
 
-    auto *alert = new QFrame;
-    alert->setObjectName(QStringLiteral("alertCard"));
-    auto *alertLayout = new QVBoxLayout(alert);
-    alertLayout->setContentsMargins(13, 11, 13, 9);
-    m_alertTitle = new QLabel(QStringLiteral("磁盘空间状态"));
-    m_alertTitle->setObjectName(QStringLiteral("alertTitle"));
-    m_alertText = new QLabel(QStringLiteral("等待磁盘采样数据…"));
-    m_alertText->setObjectName(QStringLiteral("alertText"));
-    m_alertText->setWordWrap(true);
-    alertLayout->addWidget(m_alertTitle);
-    alertLayout->addWidget(m_alertText);
-    layout->addWidget(alert);
-
-    auto *trendToggle = new QToolButton;
-    trendToggle->setObjectName(QStringLiteral("monitorTrendToggle"));
-    trendToggle->setText(QStringLiteral("展开实时趋势"));
-    trendToggle->setCheckable(true);
-    trendToggle->setArrowType(Qt::RightArrow);
-    trendToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    trendToggle->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto *monitorDetails = createMonitorWorkspace();
     monitorDetails->setVisible(false);
     connect(trendToggle, &QToolButton::toggled, this, [trendToggle, monitorDetails](bool expanded) {
         trendToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
-        trendToggle->setText(expanded ? QStringLiteral("收起实时趋势") : QStringLiteral("展开实时趋势"));
+        trendToggle->setText(expanded ? QStringLiteral("收起") : QStringLiteral("详细"));
+        trendToggle->setToolTip(expanded ? QStringLiteral("收起实时监控详情")
+                                         : QStringLiteral("展开全部实时监控详情"));
         monitorDetails->setVisible(expanded);
     });
-    layout->addWidget(trendToggle);
     layout->addWidget(monitorDetails);
     layout->addStretch();
     scroll->setWidget(content);
@@ -375,6 +605,11 @@ QWidget *MainWindow::createTerminalWorkspace()
                 }
             });
         });
+    connect(m_terminalWorkspace, &TerminalWorkspace::fileWorkspaceToggleRequested, this, [this] {
+        setFileWorkspaceVisible(!m_fileWorkspaceVisible);
+    });
+    connect(m_terminalWorkspace, &TerminalWorkspace::hostSidebarVisibilityRequested,
+        this, &MainWindow::setSidebarVisible);
     return container;
 }
 
@@ -403,6 +638,20 @@ QWidget *MainWindow::createMonitorWorkspace()
     toolbarLayout->addWidget(m_historyRange);
     layout->addWidget(toolbar);
 
+    auto *alert = new QFrame;
+    alert->setObjectName(QStringLiteral("alertCard"));
+    auto *alertLayout = new QVBoxLayout(alert);
+    alertLayout->setContentsMargins(11, 8, 11, 8);
+    alertLayout->setSpacing(3);
+    m_alertTitle = new QLabel(QStringLiteral("磁盘空间状态"));
+    m_alertTitle->setObjectName(QStringLiteral("alertTitle"));
+    m_alertText = new QLabel(QStringLiteral("等待磁盘采样数据…"));
+    m_alertText->setObjectName(QStringLiteral("alertText"));
+    m_alertText->setWordWrap(true);
+    alertLayout->addWidget(m_alertTitle);
+    alertLayout->addWidget(m_alertText);
+    layout->addWidget(alert);
+
     m_cpuTrend = new TrendChart(QStringLiteral("CPU 使用率"), TrendMetric::Cpu, QColor(QStringLiteral("#006EFF")));
     m_memoryTrend = new TrendChart(QStringLiteral("内存使用率"), TrendMetric::Memory, QColor(QStringLiteral("#8B5CF6")));
     m_loadTrend = new TrendChart(QStringLiteral("系统负载 / CPU 容量"), TrendMetric::Load, QColor(QStringLiteral("#00A870")));
@@ -412,8 +661,8 @@ QWidget *MainWindow::createMonitorWorkspace()
     m_loadTrend->setObjectName(QStringLiteral("loadTrendChart"));
     m_diskTrend->setObjectName(QStringLiteral("diskTrendChart"));
     for (auto *chart : {m_cpuTrend, m_memoryTrend, m_loadTrend, m_diskTrend}) {
-        chart->setMinimumHeight(170);
-        chart->setMaximumHeight(210);
+        chart->setMinimumHeight(145);
+        chart->setMaximumHeight(175);
         layout->addWidget(chart);
     }
 
@@ -442,6 +691,7 @@ QWidget *MainWindow::createMonitorWorkspace()
 QWidget *MainWindow::createFileWorkspace()
 {
     auto *widget = new QWidget;
+    m_fileWorkspacePane = widget;
     widget->setObjectName(QStringLiteral("fileWorkspacePane"));
     auto *layout = new QVBoxLayout(widget);
     layout->setContentsMargins(8, 4, 8, 8);
@@ -492,7 +742,7 @@ void MainWindow::selectServer(const ServerProfile &profile)
     refreshAlertList();
     refreshTrendCharts();
     resetMetrics(QStringLiteral("等待连接 · 双击主机或右键连接"));
-    m_serverMeta->setText(QStringLiteral("%1:%2").arg(profile.host).arg(profile.port));
+    m_serverMeta->setText(profile.host);
     const bool connectedNow = m_terminalWorkspace && m_terminalWorkspace->hasConnectedSession(profile.id);
     if (connectedNow) {
         m_currentServer.state = ServerState::Online;
@@ -631,7 +881,14 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
 
 void MainWindow::addServer()
 {
+    addServerInGroup(QStringLiteral("我的主机"));
+}
+
+void MainWindow::addServerInGroup(const QString &group)
+{
     ServerDialog dialog(this);
+    dialog.setAvailableGroups(m_repository->loadServerGroups());
+    dialog.setInitialGroup(group);
     dialog.setConnectionServices(m_repository, m_credentialStore);
     if (dialog.exec() != QDialog::Accepted) return;
     auto profile = dialog.profile();
@@ -644,6 +901,7 @@ void MainWindow::editServer(const ServerProfile &sourceProfile)
     auto editable = sourceProfile;
     editable.expectedFingerprint = m_repository->knownHostFingerprint(editable.host, editable.port);
     ServerDialog dialog(editable, this);
+    dialog.setAvailableGroups(m_repository->loadServerGroups());
     dialog.setConnectionServices(m_repository, m_credentialStore);
     if (dialog.exec() != QDialog::Accepted) return;
     auto profile = dialog.profile();

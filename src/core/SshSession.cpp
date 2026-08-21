@@ -13,6 +13,7 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <functional>
 
 namespace noxshell {
 
@@ -33,6 +34,7 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     qRegisterMetaType<MetricSample>();
     qRegisterMetaType<RemoteFileEntries>();
     qRegisterMetaType<RemoteFileOperation>();
+    qRegisterMetaType<PermissionScope>();
     qRegisterMetaType<FileTransferTask>();
     m_worker->moveToThread(&m_workerThread);
     connect(&m_workerThread, &QThread::finished, m_worker, &QObject::deleteLater);
@@ -51,6 +53,7 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     connect(this, &SshSession::createDirectoryRequested, m_worker, &Libssh2Worker::createDirectory, Qt::QueuedConnection);
     connect(this, &SshSession::renamePathRequested, m_worker, &Libssh2Worker::renamePath, Qt::QueuedConnection);
     connect(this, &SshSession::removePathRequested, m_worker, &Libssh2Worker::removePath, Qt::QueuedConnection);
+    connect(this, &SshSession::changePermissionsRequested, m_worker, &Libssh2Worker::changePermissions, Qt::QueuedConnection);
     connect(this, &SshSession::hostKeyApprovalRequested, m_worker, &Libssh2Worker::approveHostKey, Qt::QueuedConnection);
     connect(m_worker, &Libssh2Worker::connectionChanged, this, [this](bool connected, const QString &message) {
         m_connected = connected;
@@ -742,6 +745,50 @@ void SshSession::removePath(const QString &path, bool directory)
         m_demoFileContents.remove(path);
         completeDemoOperation(requestId, RemoteFileOperation::Remove, path);
     }
+}
+
+void SshSession::changePermissions(const QString &path, quint32 permissions, bool recursive, PermissionScope scope)
+{
+    const auto requestId = nextFileRequestId();
+    if (!m_connected) {
+        emit fileOperationFailed(RemoteFileOperation::ChangePermissions, path, QStringLiteral("SSH 会话未连接"));
+        return;
+    }
+    if (!m_demo) {
+        emit changePermissionsRequested(requestId, path, permissions & 07777U, recursive, scope);
+        return;
+    }
+
+    bool found = false;
+    std::function<void(const QString &, bool)> applyToPath;
+    applyToPath = [this, permissions, recursive, scope, &found, &applyToPath](const QString &targetPath, bool selectedRoot) {
+        const auto parent = QFileInfo(targetPath).path();
+        auto siblings = demoEntriesFor(parent);
+        auto target = std::find_if(siblings.begin(), siblings.end(), [&targetPath](const RemoteFileEntry &entry) {
+            return entry.path == targetPath;
+        });
+        if (target == siblings.end()) return;
+        found = true;
+        const bool directory = target->directory;
+        const bool apply = !recursive || scope == PermissionScope::FilesAndDirectories
+            || (directory && scope == PermissionScope::DirectoriesOnly)
+            || (!directory && scope == PermissionScope::FilesOnly);
+        if (apply) {
+            target->permissions = (target->permissions & ~07777U) | (permissions & 07777U);
+            target->modifiedAt = QDateTime::currentDateTime();
+            m_demoFileOverrides.insert(parent, siblings);
+        }
+        if (!recursive || !directory || target->symbolicLink) return;
+        const auto children = demoEntriesFor(targetPath);
+        for (const auto &child : children) applyToPath(child.path, false);
+        Q_UNUSED(selectedRoot);
+    };
+    applyToPath(path, true);
+    if (!found) {
+        emit fileOperationFailed(RemoteFileOperation::ChangePermissions, path, QStringLiteral("目标不存在"));
+        return;
+    }
+    completeDemoOperation(requestId, RemoteFileOperation::ChangePermissions, path);
 }
 
 void SshSession::completeDemoOperation(quint64 requestId, RemoteFileOperation operation, const QString &path)
