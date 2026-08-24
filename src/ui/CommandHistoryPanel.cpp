@@ -149,6 +149,9 @@ void CommandHistoryPanel::refresh()
         item->setToolTip(2, QStringLiteral("双击修改备注"));
     }
     m_clearButton->setText(favoritesOnly ? QStringLiteral("清空收藏") : QStringLiteral("清空历史"));
+    m_clearButton->setToolTip(favoritesOnly
+        ? QStringLiteral("取消全部收藏标记，命令仍保留在历史中")
+        : QStringLiteral("清空未收藏的历史记录，已收藏命令保持不变"));
 }
 
 bool CommandHistoryPanel::prepareItemActions(int row)
@@ -174,8 +177,9 @@ void CommandHistoryPanel::clearCurrentView()
 {
     if (!m_repository || m_serverId.isEmpty() || m_tree->topLevelItemCount() == 0) return;
     const bool favoritesOnly = m_tabs->currentIndex() == 1;
-    const auto question = favoritesOnly ? QStringLiteral("清空本主机的全部收藏标记？")
-                                        : QStringLiteral("清空本主机的全部命令历史？收藏和备注也会删除。");
+    const auto question = favoritesOnly
+        ? QStringLiteral("取消本主机的全部收藏标记？命令仍会保留在历史中。")
+        : QStringLiteral("清空本主机的全部未收藏历史？已收藏命令及其备注会保留。");
     if (QMessageBox::question(this, QStringLiteral("确认清空"), question,
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
     const bool saved = favoritesOnly ? m_repository->clearCommandFavorites(m_serverId)

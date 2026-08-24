@@ -199,7 +199,11 @@ private slots:
     void terminalSettingsDialogExposesFontSizeAndSpacingControls()
     {
         noxshell::ui::TerminalSettingsDialog dialog(noxshell::ui::TerminalView::defaultAppearance());
-        QVERIFY(dialog.findChild<QFontComboBox *>(QStringLiteral("terminalFontFamilyCombo")));
+        auto *fontFamily = dialog.findChild<QFontComboBox *>(QStringLiteral("terminalFontFamilyCombo"));
+        QVERIFY(fontFamily);
+        QVERIFY(!fontFamily->isEditable());
+        QVERIFY(fontFamily->count() > 0);
+        QVERIFY(fontFamily->toolTip().contains(QStringLiteral("系统")));
         QVERIFY(dialog.findChild<QSpinBox *>(QStringLiteral("terminalFontSizeSpin")));
         QVERIFY(dialog.findChild<QDoubleSpinBox *>(QStringLiteral("terminalLineSpacingSpin")));
         QVERIFY(dialog.findChild<QLabel *>(QStringLiteral("terminalAppearancePreview")));
@@ -348,6 +352,34 @@ private slots:
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostRenameGroupAction")));
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostDeleteGroupAction")));
         QVERIFY(sidebar.findChild<QMenu *>(QStringLiteral("hostMoveGroupMenu")));
+    }
+
+    void ungroupedHostsStayAtSidebarTopLevel()
+    {
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("ungrouped-host");
+        profile.name = QStringLiteral("无分组主机");
+        profile.host = QStringLiteral("192.0.2.30");
+        profile.group.clear();
+        noxshell::ui::HostSidebar sidebar({profile}, {QStringLiteral("demo")});
+        sidebar.show();
+
+        auto *tree = sidebar.findChild<QTreeWidget *>(QStringLiteral("hostList"));
+        QVERIFY(tree);
+        QCOMPARE(tree->topLevelItemCount(), 2);
+        auto *hostItem = tree->topLevelItem(0);
+        QVERIFY(hostItem);
+        QCOMPARE(hostItem->childCount(), 0);
+        QVERIFY(!hostItem->parent());
+        auto *rowWidget = tree->itemWidget(hostItem, 0);
+        QVERIFY(rowWidget);
+        QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemName"))->text(),
+            QStringLiteral("无分组主机"));
+        QVERIFY(!tree->topLevelItem(0)->text(0).contains(QStringLiteral("未分组")));
+        QVERIFY(tree->topLevelItem(1)->text(0).startsWith(QStringLiteral("demo")));
+
+        sidebar.selectFirstServer();
+        QCOMPARE(tree->currentItem(), hostItem);
     }
 
     void terminalTabContextMenuDuplicatesAndClosesSessions()
@@ -941,8 +973,20 @@ private slots:
         QCOMPARE(entries.size(), 1);
         QCOMPARE(entries.first().note, QStringLiteral("查看当前目录"));
         QVERIFY(entries.first().favorite);
+        QVERIFY(repository.clearCommandHistory(profile.id));
+        entries = repository.loadCommandHistory(profile.id);
+        QCOMPARE(entries.size(), 1);
+        QCOMPARE(entries.first().command, QStringLiteral("pwd"));
+        QCOMPARE(entries.first().note, QStringLiteral("查看当前目录"));
+        QVERIFY(entries.first().favorite);
+        QCOMPARE(repository.loadCommandHistory(profile.id, true).size(), 1);
+
         QVERIFY(repository.clearCommandFavorites(profile.id));
         QVERIFY(repository.loadCommandHistory(profile.id, true).isEmpty());
+        entries = repository.loadCommandHistory(profile.id);
+        QCOMPARE(entries.size(), 1);
+        QVERIFY(!entries.first().favorite);
+        QVERIFY(repository.recordCommand(profile.id, QStringLiteral("whoami")));
         entries = repository.loadCommandHistory(profile.id);
         QCOMPARE(entries.size(), 2);
         QVERIFY(repository.deleteCommandHistory(entries.last().id));
@@ -1995,10 +2039,14 @@ private slots:
         QVERIFY(historyPanel->isVisible());
         auto *commandHistory = historyPanel->findChild<QTreeWidget *>(QStringLiteral("commandHistoryList"));
         auto *commandHistoryTabs = historyPanel->findChild<QTabBar *>(QStringLiteral("commandHistoryTabs"));
+        auto *commandHistoryClear = historyPanel->findChild<QToolButton *>(QStringLiteral("commandHistoryClearButton"));
         auto *favoriteAction = historyPanel->findChild<QAction *>(QStringLiteral("commandHistoryFavoriteAction"));
         QVERIFY(commandHistory);
         QVERIFY(commandHistoryTabs);
+        QVERIFY(commandHistoryClear);
         QVERIFY(favoriteAction);
+        QCOMPARE(commandHistoryClear->text(), QStringLiteral("清空历史"));
+        QVERIFY(commandHistoryClear->toolTip().contains(QStringLiteral("已收藏命令保持不变")));
         QTRY_COMPARE_WITH_TIMEOUT(commandHistory->topLevelItemCount(), 1, 1000);
         QCOMPARE(commandHistory->topLevelItem(0)->text(1), QStringLiteral("pwd"));
         bool historyPrepared = false;
@@ -2008,6 +2056,8 @@ private slots:
         favoriteAction->trigger();
         commandHistoryTabs->setCurrentIndex(1);
         QTRY_COMPARE_WITH_TIMEOUT(commandHistory->topLevelItemCount(), 1, 1000);
+        QCOMPARE(commandHistoryClear->text(), QStringLiteral("清空收藏"));
+        QVERIFY(commandHistoryClear->toolTip().contains(QStringLiteral("保留在历史")));
         QTest::mouseClick(historyButton, Qt::LeftButton);
         QVERIFY(!historyPanel->isVisible());
 
@@ -2189,7 +2239,7 @@ private slots:
         QVERIFY(!groupEditor->isEditable());
         QCOMPARE(groupEditor->currentText(), QStringLiteral("测试环境"));
         QCOMPARE(groupEditor->currentData().toString(), QStringLiteral("测试环境"));
-        QVERIFY(groupEditor->findText(QStringLiteral("未分组")) >= 0);
+        QVERIFY(groupEditor->findText(QStringLiteral("不设置分组（可选）")) >= 0);
         QVERIFY(groupEditor->findText(QStringLiteral("生产环境")) >= 0);
         QVERIFY(groupEditor->findText(QStringLiteral("测试环境")) >= 0);
         addDialog.show();

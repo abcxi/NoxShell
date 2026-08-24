@@ -615,7 +615,8 @@ bool ServerRepository::deleteCommandHistory(qint64 id)
 bool ServerRepository::clearCommandHistory(const QString &serverId)
 {
     QSqlQuery query(m_database);
-    query.prepare(QStringLiteral("DELETE FROM command_history WHERE server_id=?"));
+    // 收藏记录是独立资产；清空普通历史时必须保留收藏及其备注。
+    query.prepare(QStringLiteral("DELETE FROM command_history WHERE server_id=? AND favorite=0"));
     query.addBindValue(serverId);
     if (!query.exec()) {
         setError(QStringLiteral("清空命令历史"), query.lastError().text());

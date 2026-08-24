@@ -25,7 +25,7 @@
 namespace noxshell::ui {
 
 namespace {
-const auto kUngroupedLabel = QStringLiteral("未分组");
+const auto kNoGroupLabel = QStringLiteral("不设置分组（可选）");
 
 void addGroupOption(QComboBox *editor, const QString &group)
 {
@@ -119,7 +119,7 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_group->setObjectName(QStringLiteral("groupEditor"));
     m_group->setEditable(false);
     m_group->setMaxVisibleItems(12);
-    m_group->addItem(kUngroupedLabel, QString{});
+    m_group->addItem(kNoGroupLabel, QString{});
     m_group->setStyleSheet(QStringLiteral(
         "QComboBox{padding-right:30px;}"
         "QComboBox::drop-down{width:30px;border-left:1px solid #E1E7EF;}"
@@ -160,7 +160,7 @@ ServerDialog::ServerDialog(QWidget *parent)
     form->addRow(QStringLiteral("主机/IP"), endpointRow);
     form->insertRow(0, QStringLiteral("主机名称"), m_name);
     form->addRow(QStringLiteral("用户名"), m_user);
-    form->addRow(QStringLiteral("分组"), m_group);
+    form->addRow(QStringLiteral("分组（可选）"), m_group);
     form->addRow(QStringLiteral("系统标识"), m_os);
     form->addRow(QStringLiteral("认证方式"), m_authentication);
 
@@ -318,7 +318,7 @@ void ServerDialog::setAvailableGroups(const QStringList &groups)
 {
     const auto current = m_group->currentData().toString().trimmed();
     m_group->clear();
-    m_group->addItem(kUngroupedLabel, QString{});
+    m_group->addItem(kNoGroupLabel, QString{});
     for (const auto &group : groups) addGroupOption(m_group, group);
     selectGroupOption(m_group, current);
 }

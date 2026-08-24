@@ -38,7 +38,16 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     form->setVerticalSpacing(11);
     m_fontFamily = new QFontComboBox;
     m_fontFamily->setObjectName(QStringLiteral("terminalFontFamilyCombo"));
-    m_fontFamily->setFontFilters(QFontComboBox::MonospacedFonts | QFontComboBox::ScalableFonts);
+    m_fontFamily->setEditable(false);
+    m_fontFamily->setFontFilters(QFontComboBox::ScalableFonts);
+    m_fontFamily->setMinimumHeight(32);
+    m_fontFamily->setMinimumContentsLength(18);
+    m_fontFamily->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_fontFamily->setToolTip(QStringLiteral("选择本机系统中已安装的字体"));
+    m_fontFamily->setStyleSheet(QStringLiteral(
+        "QComboBox{padding-right:32px;}"
+        "QComboBox::drop-down{width:30px;border-left:1px solid #E1E7EF;}"
+        "QComboBox::down-arrow{image:url(:/assets/chevron-down.svg);width:12px;height:12px;}"));
     m_fontFamily->setCurrentFont(QFont(appearance.fontFamily));
     m_fontSize = new QSpinBox;
     m_fontSize->setObjectName(QStringLiteral("terminalFontSizeSpin"));
@@ -52,7 +61,7 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     m_lineSpacing->setSingleStep(0.05);
     m_lineSpacing->setSuffix(QStringLiteral(" 倍"));
     m_lineSpacing->setValue(appearance.lineSpacing);
-    form->addRow(QStringLiteral("字体"), m_fontFamily);
+    form->addRow(QStringLiteral("系统字体"), m_fontFamily);
     form->addRow(QStringLiteral("字号"), m_fontSize);
     form->addRow(QStringLiteral("行间距"), m_lineSpacing);
     layout->addLayout(form);

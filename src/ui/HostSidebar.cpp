@@ -28,12 +28,7 @@ constexpr int kGroupNameRole = Qt::UserRole + 2;
 constexpr int kServerIdRole = Qt::UserRole + 3;
 constexpr int kGroupItem = 1;
 constexpr int kServerItem = 2;
-const auto kUngroupedLabel = QStringLiteral("未分组");
-
-QString displayGroupName(const QString &group)
-{
-    return group.isEmpty() ? kUngroupedLabel : group;
-}
+const auto kNoGroupLabel = QStringLiteral("不设置分组");
 
 class HostTreeWidget final : public QTreeWidget {
 public:
@@ -49,13 +44,17 @@ protected:
             event->ignore();
             return;
         }
-        auto *group = target->data(0, kItemKindRole).toInt() == kGroupItem ? target : target->parent();
-        if (!group || group->data(0, kItemKindRole).toInt() != kGroupItem) {
+        QTreeWidgetItem *group = nullptr;
+        if (target->data(0, kItemKindRole).toInt() == kGroupItem) group = target;
+        else if (target->parent()
+            && target->parent()->data(0, kItemKindRole).toInt() == kGroupItem) group = target->parent();
+        const bool moveToTopLevel = target->data(0, kItemKindRole).toInt() == kServerItem && !target->parent();
+        if (!group && !moveToTopLevel) {
             event->ignore();
             return;
         }
         const auto serverId = source->data(0, kServerIdRole).toString();
-        const auto groupName = group->data(0, kGroupNameRole).toString();
+        const auto groupName = group ? group->data(0, kGroupNameRole).toString() : QString{};
         if (!serverId.isEmpty() && hostDropRequested) hostDropRequested(serverId, groupName);
         event->acceptProposedAction();
     }
@@ -228,7 +227,7 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
         const auto group = m_contextMenu->property("groupName").toString();
         if (group.isEmpty()) return;
         const auto answer = QMessageBox::question(this, QStringLiteral("删除分组"),
-            QStringLiteral("删除分组“%1”吗？组内主机将移动到“未分组”，主机配置不会被删除。").arg(group),
+            QStringLiteral("删除分组“%1”吗？组内主机将改为不设置分组，主机配置不会被删除。").arg(group),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (answer == QMessageBox::Yes) emit groupDeleteRequested(group);
     });
@@ -260,10 +259,14 @@ QString HostSidebar::groupForItem(const QTreeWidgetItem *item) const
 
 void HostSidebar::selectFirstServer()
 {
-    for (int groupIndex = 0; groupIndex < m_list->topLevelItemCount(); ++groupIndex) {
-        auto *group = m_list->topLevelItem(groupIndex);
-        if (group->childCount() > 0) {
-            m_list->setCurrentItem(group->child(0));
+    for (int row = 0; row < m_list->topLevelItemCount(); ++row) {
+        auto *item = m_list->topLevelItem(row);
+        if (item->data(0, kItemKindRole).toInt() == kServerItem) {
+            m_list->setCurrentItem(item);
+            return;
+        }
+        if (item->data(0, kItemKindRole).toInt() == kGroupItem && item->childCount() > 0) {
+            m_list->setCurrentItem(item->child(0));
             return;
         }
     }
@@ -383,10 +386,28 @@ void HostSidebar::populate()
         item->setSizeHint(0, QSize(218, 72));
         return;
     }
+    const auto addServerItem = [this](QTreeWidgetItem *parent, qsizetype index) {
+        const auto &server = m_servers.at(index);
+        auto *item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(m_list);
+        item->setData(0, kItemKindRole, kServerItem);
+        item->setData(0, kServerIndexRole, static_cast<int>(index));
+        item->setData(0, kServerIdRole, server.id);
+        const auto groupName = server.group.trimmed();
+        item->setToolTip(0, groupName.isEmpty()
+                ? QStringLiteral("%1@%2:%3").arg(server.user, server.host).arg(server.port)
+                : QStringLiteral("%1@%2:%3 · %4").arg(server.user, server.host).arg(server.port).arg(groupName));
+        item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled);
+        item->setSizeHint(0, QSize(198, 38));
+        m_list->setItemWidget(item, 0, createHostItem(server));
+    };
+
+    // 未设置分组的主机直接平铺；只有真实分组才使用目录节点。
+    for (qsizetype index = 0; index < m_servers.size(); ++index) {
+        if (m_servers.at(index).group.trimmed().isEmpty()) addServerItem(nullptr, index);
+    }
+
     QStringList groups = m_groups;
-    const bool hasUngrouped = std::any_of(m_servers.cbegin(), m_servers.cend(),
-        [](const ServerProfile &server) { return server.group.trimmed().isEmpty(); });
-    if (hasUngrouped) groups.prepend(QString{});
+    groups.removeAll(QString{});
     groups.removeDuplicates();
     for (const auto &groupName : groups) {
         auto *group = new QTreeWidgetItem(m_list);
@@ -402,17 +423,9 @@ void HostSidebar::populate()
         for (qsizetype index = 0; index < m_servers.size(); ++index) {
             const auto &server = m_servers.at(index);
             if (server.group.trimmed() != groupName) continue;
-            auto *item = new QTreeWidgetItem(group);
-            item->setData(0, kItemKindRole, kServerItem);
-            item->setData(0, kServerIndexRole, static_cast<int>(index));
-            item->setData(0, kServerIdRole, server.id);
-            item->setToolTip(0, QStringLiteral("%1@%2:%3 · %4")
-                    .arg(server.user, server.host).arg(server.port).arg(displayGroupName(groupName)));
-            item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled);
-            item->setSizeHint(0, QSize(198, 38));
-            m_list->setItemWidget(item, 0, createHostItem(server));
+            addServerItem(group, index);
         }
-        group->setText(0, QStringLiteral("%1  %2").arg(displayGroupName(groupName)).arg(group->childCount()));
+        group->setText(0, QStringLiteral("%1  %2").arg(groupName).arg(group->childCount()));
     }
     if (!selected.isEmpty()) selectServerById(selected);
     applyFilter(m_search->text());
@@ -423,8 +436,16 @@ void HostSidebar::applyFilter(const QString &text)
     const auto filter = text.trimmed();
     for (int row = 0; row < m_list->topLevelItemCount(); ++row) {
         auto *group = m_list->topLevelItem(row);
+        if (group->data(0, kItemKindRole).toInt() == kServerItem) {
+            const auto profile = profileForItem(group);
+            const bool matches = filter.isEmpty()
+                || profile.name.contains(filter, Qt::CaseInsensitive)
+                || profile.host.contains(filter, Qt::CaseInsensitive);
+            group->setHidden(!matches);
+            continue;
+        }
         if (group->data(0, kItemKindRole).toInt() != kGroupItem) continue;
-        const bool groupMatch = displayGroupName(group->data(0, kGroupNameRole).toString())
+        const bool groupMatch = group->data(0, kGroupNameRole).toString()
                                     .contains(filter, Qt::CaseInsensitive);
         bool visibleChild = false;
         for (int childIndex = 0; childIndex < group->childCount(); ++childIndex) {
@@ -454,7 +475,7 @@ void HostSidebar::rebuildMoveMenu()
             moveServerToGroup(id, group);
         });
     };
-    addTarget(kUngroupedLabel, QString{});
+    addTarget(kNoGroupLabel, QString{});
     for (const auto &group : std::as_const(m_groups)) addTarget(group, group);
 }
 
