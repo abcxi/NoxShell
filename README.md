@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/abcxi/NoxShell/releases/latest"><img src="https://img.shields.io/github/v/release/abcxi/NoxShell?label=Release&color=006EFF" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128" alt="Apache License 2.0"></a>
   <img src="https://img.shields.io/badge/C%2B%2B-20-00599C" alt="C++20">
   <img src="https://img.shields.io/badge/Qt-6-41CD52" alt="Qt 6">
   <img src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%7C%20Intel-111111" alt="macOS">
@@ -19,8 +20,8 @@
 
 <p align="center">
   <a href="#下载">下载</a> ·
-  <a href="#界面预览">界面预览</a> ·
   <a href="#核心功能">核心功能</a> ·
+  <a href="#开源许可">开源许可</a> ·
   <a href="#本地构建">本地构建</a>
 </p>
 
@@ -35,26 +36,6 @@
 | 终端、监控、文件和编辑器同屏协作 | C++20 + Qt 6，界面紧凑、启动迅速 | 每个标签拥有独立 SSH 连接与配置快照 | 密码和私钥口令进入系统凭据库，不写入 SQLite |
 
 玄壳适合需要同时管理多台 Linux 服务器、频繁查看资源状态、编辑配置文件和传输文件的开发与运维人员。它不试图把功能藏进层层页面，而是把最常用的操作放在一个可拖动、可收起的工作区内。
-
-## 界面预览
-
-### 起始页与最近登录
-
-应用启动时不会自动连接服务器，也不会恢复旧终端。起始页按时间倒序显示最近成功登录记录，相同主机只保留最新一条，双击即可重新建立会话。
-
-![玄壳起始页和最近登录](docs/images/noxshell-overview.png)
-
-### 终端、监控与文件管理
-
-连接后，左侧展示 CPU、内存、负载、网络流速、进程和挂载点信息；右侧上方是多标签终端，下方是与当前会话联动的 SFTP 文件管理器。各区域可以收起，也可以拖动分隔条调整大小。
-
-![玄壳终端监控和 SFTP 文件管理](docs/images/noxshell-workspace.png)
-
-### 远程文件编辑
-
-双击远端文本文件即可打开独立编辑窗口。编辑器支持多标签、行号、当前行高亮、查找/替换、撤销、快捷保存和 Shell 注释切换；文件有未保存修改时会显示红点，关闭前主动提醒。
-
-![玄壳远程文件编辑器和查找替换](docs/images/noxshell-editor.png)
 
 ## 核心功能
 
@@ -118,6 +99,14 @@
 | 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.55/SHA256SUMS.txt) | 验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签且 GitHub Actions 构建成功后出现。当前 macOS 包使用临时签名，尚未进行 Apple Developer ID 签名和公证；首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
+
+## 开源许可
+
+玄壳 NoxShell 是开源软件。本仓库中的原创代码以 [Apache License 2.0](LICENSE) 发布，允许个人、团队和企业使用、修改与再分发；分发修改版或二进制版本时，请按许可证要求保留版权、许可证及变更声明。软件按“现状”提供，不附带任何明示或默示担保。
+
+项目名称“玄壳 / NoxShell”及图标不因源代码授权而自动授予商标使用权。Qt、libssh2 等第三方组件继续适用各自的许可证，详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+欢迎通过 [Issues](https://github.com/abcxi/NoxShell/issues) 报告问题，并通过 Pull Request 参与改进。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 数据与安全
 
@@ -186,6 +175,9 @@ script        增量编译、图标生成和发布打包脚本
 docs          发布说明与 README 图片
 tests         Qt Test / Smoke Test
 output        本地发布产物
+LICENSE       Apache License 2.0 开源许可证
+CONTRIBUTING.md 贡献指南
+THIRD_PARTY_NOTICES.md 第三方组件许可说明
 ```
 
 更多发布说明见 [docs/RELEASE.md](docs/RELEASE.md)。
