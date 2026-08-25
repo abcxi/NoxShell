@@ -1,69 +1,142 @@
-# 玄壳（NoxShell）
+<p align="center">
+  <img src="assets/app-icon.png" width="112" alt="玄壳 NoxShell 图标">
+</p>
 
-面向 SSH 远程管理的 C++20/Qt 6 桌面应用。当前版本为 `v0.2.53`，覆盖多会话终端、Linux 实时监控、告警和 SFTP 文件管理。
+<h1 align="center">玄壳 NoxShell</h1>
+
+<p align="center">
+  一款面向服务器运维的现代化 SSH 桌面客户端。<br>
+  在同一个紧凑工作区中完成终端操作、实时监控、SFTP 文件管理与远程文件编辑。
+</p>
+
+<p align="center">
+  <a href="https://github.com/abcxi/NoxShell/releases/latest"><img src="https://img.shields.io/github/v/release/abcxi/NoxShell?label=Release&color=006EFF" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/C%2B%2B-20-00599C" alt="C++20">
+  <img src="https://img.shields.io/badge/Qt-6-41CD52" alt="Qt 6">
+  <img src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%7C%20Intel-111111" alt="macOS">
+  <img src="https://img.shields.io/badge/Windows-x64-0078D4" alt="Windows x64">
+</p>
+
+<p align="center">
+  <a href="#下载">下载</a> ·
+  <a href="#界面预览">界面预览</a> ·
+  <a href="#核心功能">核心功能</a> ·
+  <a href="#本地构建">本地构建</a>
+</p>
+
+![玄壳 SSH 运维工作区](docs/images/noxshell-workspace.png)
+
+> 截图使用本地演示会话生成，不包含真实服务器凭据。当前版本：`v0.2.53`。
+
+## 为什么选择玄壳
+
+| 一站式运维 | 原生桌面体验 | 会话互不干扰 | 安全保存凭据 |
+| --- | --- | --- | --- |
+| 终端、监控、文件和编辑器同屏协作 | C++20 + Qt 6，界面紧凑、启动迅速 | 每个标签拥有独立 SSH 连接与配置快照 | 密码和私钥口令进入系统凭据库，不写入 SQLite |
+
+玄壳适合需要同时管理多台 Linux 服务器、频繁查看资源状态、编辑配置文件和传输文件的开发与运维人员。它不试图把功能藏进层层页面，而是把最常用的操作放在一个可拖动、可收起的工作区内。
+
+## 界面预览
+
+### 起始页与最近登录
+
+应用启动时不会自动连接服务器，也不会恢复旧终端。起始页按时间倒序显示最近成功登录记录，相同主机只保留最新一条，双击即可重新建立会话。
+
+![玄壳起始页和最近登录](docs/images/noxshell-overview.png)
+
+### 终端、监控与文件管理
+
+连接后，左侧展示 CPU、内存、负载、网络流速、进程和挂载点信息；右侧上方是多标签终端，下方是与当前会话联动的 SFTP 文件管理器。各区域可以收起，也可以拖动分隔条调整大小。
+
+![玄壳终端监控和 SFTP 文件管理](docs/images/noxshell-workspace.png)
+
+### 远程文件编辑
+
+双击远端文本文件即可打开独立编辑窗口。编辑器支持多标签、行号、当前行高亮、查找/替换、撤销、快捷保存和 Shell 注释切换；文件有未保存修改时会显示红点，关闭前主动提醒。
+
+![玄壳远程文件编辑器和查找替换](docs/images/noxshell-editor.png)
+
+## 核心功能
+
+### SSH 终端
+
+- 多终端标签，每个标签使用独立线程、socket、libssh2 session 和连接快照。
+- VT/ANSI 网格渲染，支持 256 色、光标与滚动区控制、备用屏幕、中文输入、功能键和鼠标报告。
+- 最多保留 5000 行滚屏历史，支持拖选、双击选词、复制、粘贴和全选。
+- `Cmd/Ctrl+C` 会根据场景智能复制或向远端发送中断信号，可正常退出 `top` 等前台程序。
+- 标签状态用空心点、进度环和绿色实心点区分未连接、连接中和已连接。
+- 标签右键支持连接、断开、清屏、复制会话、关闭当前/其他/全部标签。
+- 命令历史与收藏按主机去重保存，支持备注、再次执行、删除，以及分别清空历史或收藏。
+- 字体、字号和行间距可按系统字体实时设置，并同步到已打开及新建终端。
+
+### 实时监控
+
+- 秒级采集 CPU、内核态、内存、1/5/15 分钟负载和系统运行时长。
+- 展示全部网卡或指定网卡的实时上/下行速率与最近 60 秒曲线。
+- 查看 CPU、内存占用最高的进程和实时命令列表。
+- 展示目录与挂载点的可用空间/总量，便于快速定位容量问题。
+- 监控历史保留 7 天，可设置 CPU、内存、负载与磁盘阈值并记录告警事件。
+- 指标采集复用当前已认证 SSH 会话中的独立 channel，不会污染终端输入输出。
+
+### SFTP 文件管理
+
+- 左侧目录树逐层加载，右侧显示文件名、大小、类型、修改时间、权限和用户/用户组。
+- 支持路径输入、刷新、返回、上级目录和终端 `cd` 路径联动。
+- 支持 Shift/Cmd 多选、批量下载、批量删除、重命名、新建文件和新建目录。
+- 可从 Finder 或资源管理器拖入一个或多个本地文件，直接上传到当前目录或指定目录。
+- 上传/下载进入持久化队列，支持限速、取消、失败重试和 `.noxshell.part` 断点续传。
+- 权限管理支持所有者、组、其他用户的读/写/执行位，以及目录递归范围。
+- 文件区可一键收起，为终端释放更多空间；传输任务出现时自动展示队列。
+
+### 远程文件编辑
+
+- 同一服务器的文件复用一个多标签编辑窗口，标签显示“服务器 · 文件名”。
+- `Cmd/Ctrl+S` 保存、`Cmd/Ctrl+Z` 撤销、`Ctrl+/` 切换 `#` 注释、`Cmd/Ctrl+W` 关闭标签。
+- `Cmd/Ctrl+F` 查找，`Cmd+Option+F`（macOS）或 `Ctrl+H`（Windows）展开替换。
+- 支持前后循环匹配、区分大小写、单个替换、全部替换和匹配数量提示。
+- 保存通过远端临时文件原子替换，并保留原文件权限；二进制文件和超过 4 MiB 的文件不会误入文本编辑器。
+
+### 主机与连接管理
+
+- 主机按分组展示，支持搜索、拖动移动分组、右键新建连接、编辑、复制和删除。
+- 新增/编辑窗口提供连接测试，可在保存前校验 TCP、SSH 握手、主机指纹和认证凭据。
+- 已建立会话保持原配置快照；修改主机 IP、端口或凭据不会影响旧会话，下次连接才使用新配置。
+- 已知主机指纹严格绑定 `IP/域名:端口`，目标变化时不会错误复用旧指纹。
+- 支持密码、私钥、SSH Agent，以及自动协商 `keyboard-interactive` / `password` 认证。
+- 密码和私钥口令分别保存在 macOS Keychain 或 Windows Credential Manager；SQLite 只保存凭据引用。
 
 ## 下载
 
 [前往 GitHub Releases 下载最新版本](https://github.com/abcxi/NoxShell/releases/latest)
 
-当前版本：`v0.2.53`
-
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [下载 Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/%E7%8E%84%E5%A3%B3-v0.2.53-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [下载 Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/%E7%8E%84%E5%A3%B3-v0.2.53-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [下载安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/NoxShell-v0.2.53-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [下载便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/NoxShell-v0.2.53-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| 校验文件 | [下载 SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/SHA256SUMS.txt) | 用于验证下载文件完整性 |
+| macOS | [Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/%E7%8E%84%E5%A3%B3-v0.2.53-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | [Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/%E7%8E%84%E5%A3%B3-v0.2.53-macOS-x86_64.dmg) | Intel 芯片 Mac |
+| Windows | [安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/NoxShell-v0.2.53-Windows-x64.exe) | 64 位 Windows，推荐使用 |
+| Windows | [便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/NoxShell-v0.2.53-Windows-x64.zip) | 64 位 Windows，解压即用 |
+| 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.53/SHA256SUMS.txt) | 验证下载文件完整性 |
 
-> 安装包会在推送对应版本标签并且 GitHub Actions 构建成功后出现。私有仓库的下载链接需要先登录具有仓库访问权限的 GitHub 账号。
+> 安装包会在推送对应版本标签且 GitHub Actions 构建成功后出现。当前 macOS 包使用临时签名，尚未进行 Apple Developer ID 签名和公证；首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
 
-## 当前能力
+## 数据与安全
 
-- 桌面应用统一使用去除外围黑边的黑色玻璃质感与金色终端符号图标；透明圆角主体铺满有效画布，macOS 发布包内置 16–1024px Retina `.icns`，Dock、Finder、窗口与应用切换器保持一致。
-- 单一主机导航栏采用“名称 / IP”单行紧凑列表，支持名称/IP/分组筛选；不展示也不承担会话在线状态，单击不切换终端标签，双击连接后自动收起主机栏。
-- macOS 使用原生标题栏附件，将主机栏、监控栏和终端设置图标直接放入系统标题栏；Windows 使用单行应用标题栏，将同样三个工具图标与最小化、最大化、关闭按钮合并展示，避免额外工具栏占用内容高度。
-- 主机右键菜单支持连接、编辑、复制主机配置、复制连接地址和删除。
-- 真实 SSH 主机通过独立 exec channel 秒级采集 CPU/内核态、内存、1/5/15 分钟负载和根磁盘占用；监控栏默认以四项单行摘要展示，点击“详细”一次展开全部趋势、阈值和告警信息；演示主机提供可预测的离线数据。
-- 监控历史在 SQLite 中保留 7 天，界面显示最近 1、15、60 分钟；每台服务器可独立设置 CPU、内存、负载与磁盘阈值，并保存告警事件。
-- SSH 终端使用 VT/ANSI 网格状态机渲染，支持常见颜色、光标控制、滚动区、备用屏幕、功能键、Ctrl 组合键、中文输入和括号粘贴；PTY 行列随窗口尺寸同步。
-- 终端保留最多 5000 行滚屏历史，支持滚轮浏览、鼠标拖选和双击选词；右键菜单提供复制、粘贴和全选，`Cmd+C/Cmd+V`、`Ctrl+C/Ctrl+V` 均可直接操作，有选区时 `Cmd/Ctrl+C` 智能复制、无选区时向远端发送中断信号以退出 `top` 等前台命令，并兼容 `Ctrl+Shift+C/Ctrl+Shift+V`。
-- 终端支持 X10/SGR 鼠标报告，按住 Shift 可临时进行本地选择；右键始终保留给本地复制/粘贴菜单，不会误发给远端程序。
-- 终端输入栏右侧提供命令记录与文件区开关：历史管理面板向上展开，按主机维护去重后的历史/收藏，支持再次执行、收藏、备注、删除与清空；文件区可一键收起或恢复，状态在多个终端标签间同步。
-- 应用启动时不恢复终端标签、也不自动连接；没有会话时隐藏标签与终端内容，改为展示按成功登录时间倒序排列的最近登录记录；同一主机只保留最新一次成功登录，双击记录可重新连接。
-- 多终端标签拥有独立 SSH 连接，使用灰色空心点、蓝色进度环和绿色实心点区分未连接、连接中和连接成功；标签名称自适应宽度并最多显示 10 个字符，关闭按钮位于右侧。标签后的“+”可打开起始页，右键支持连接、断开、清屏、复制会话及批量关闭。
-- 已建立的终端是不可变的连接快照；在线时修改主机名、IP、端口或凭据不会断开、清空或重连旧会话，下一次显式连接会使用新配置创建新标签。
-- 终端标签、左侧主机选中项、监控栏和 SFTP 文件区双向联动；监控与文件管理直接复用当前标签的 SSH 会话，切换时不重新连接。
-- SFTP 文件区采用双栏布局：左侧目录树按展开节点逐层加载，右侧显示当前目录明细；支持路径输入、刷新、返回上级、历史返回和双击进入目录。
-- 右侧文件列表支持 Shift/Cmd 多选和右键批量下载；可从 Finder 拖入一个或多个本地文件上传，拖到远程目录行时直接上传到该目录。
-- 双击普通远端文件会打开独立多标签编辑窗口；同一服务器的文件复用一个窗口，标签显示“服务器名称 · 文件名”，未保存时显示红点。
-- 远端编辑器采用无按钮的键盘工作流，支持 `Cmd/Ctrl+S` 保存、`Cmd/Ctrl+Z` 撤销、`Ctrl+/` 切换 Shell 风格 `#` 注释和 `Cmd/Ctrl+W` 关闭当前标签；文本区显示行号与当前行高亮。
-- 编辑器支持按需展开的查找/替换栏：`Cmd/Ctrl+F` 查找后可直接点击“替换”展开第二行，macOS 也可用 `Cmd+Option+F`（其他平台可用 `Ctrl+H`）；Enter/Shift+Enter 前后循环匹配，支持区分大小写、单个替换、全部替换和匹配计数，Esc 收起面板。
-- 关闭带未保存内容的文件标签或编辑窗口时会确认保存；二进制文件禁止文本编辑，单文件上限 4 MiB，保存通过远端临时文件原子替换并保留原权限。
-- 文件列表右键支持权限管理，可设置所有者、组、其他用户的读/写/执行位，目录可选择递归范围。
-- 终端执行 `cd` 后下方目录会同步绝对路径、相对路径、`..` 与 `~`；终端与文件面板之间可拖拽调整高度。
-- SFTP 文件操作支持上传、下载、新建文件、新建目录、重命名和删除；上传通过 Finder 拖拽完成，下载及新建文件/目录统一从右键或“⋯”菜单进入，已存在的同名目标不会被覆盖。
-- 文件管理采用单行工具栏，返回、上级、路径输入和刷新直接位于标题栏，不再占用第二行；上传/下载进入持久化传输队列，同一 SSH 会话串行执行，队列图标以弹出面板集中展示任务、限速、取消和失败重试；支持异常退出恢复及 `.noxshell.part` 断点续传。
-- 当前主机采用三块同时可见的运维工作区：左侧纵向监控，右上 SSH 终端，右下文件管理；水平和垂直分隔条均可拖动。
-- 终端区只保留左对齐的会话标签；清屏、复制与批量关闭统一从被点击标签的右键菜单操作。清屏等同于 `Ctrl+L`，清除历史后保留远端 Shell 当前提示符。连接期间显示居中 Loading 提示板，成功或失败后自动收起。
-- 监控栏主机信息精简为 `IP:端口`，支持一键复制 IP；在线/连接中/离线由实际 SSH 会话状态驱动。
-- 新增/编辑主机窗口内置“连接测试”，会直接验证尚未保存的地址、端口和凭据；测试不会占用或替换当前终端会话。
-- 已知主机指纹严格绑定 `IP/域名:端口`；编辑时改变 IP 或端口会清除窗口中的旧指纹，并在新地址首次连接时独立确认。
-- 密码框支持显示/隐藏当前输入，并明确标识测试使用“当前输入”还是 Keychain 已保存密码；旧密码认证失败时会提示重新输入或切换私钥认证。
-- 密码与私钥口令输入固定为英文半角；`。`、`，` 等中文/全角标点自动转换为 `.`、`,` 等半角字符，其他非英文字符会被阻止并提示核对。
-- 工作区标题栏不放置刷新、测试、编辑和删除等高风险快捷按钮；主机操作统一从左侧右键菜单进入。
+- 服务器配置、监控历史、告警、传输状态和 `known_hosts` 记录保存在 Qt SQLite 数据库。
+- 数据库默认位于系统应用数据目录，文件名为 `noxshell-ops.sqlite3`。
+- 系统凭据服务名为 `com.noxshell.ops.ssh`，密码与私钥口令不会写入数据库。
+- 日志位于应用数据目录的 `logs/noxshell-ops.log`，单文件 5 MiB 后轮换并保留 3 份。
+- 日志会对常见密码、口令、令牌和 Authorization 字段进行脱敏。
 
-真实 SSH 基础层已接入 libssh2，支持 TCP/SSH 握手、SHA-256 主机指纹确认、密码（自动协商 `keyboard-interactive`/`password`）、私钥/SSH Agent 认证和交互式 PTY。每个会话使用独立线程、socket 与 libssh2 session，多开连接不会互相覆盖凭据；指标采集使用同一已认证 SSH 会话中的独立 channel，不会把采集命令写入用户终端。内置示例主机默认保持演示模式，避免误连不可达地址。
+## 技术实现
 
-Linux 指标来源为 `/proc/stat`、`/proc/meminfo`、`/proc/loadavg`、`getconf _NPROCESSORS_ONLN` 和 `df -Pk`。CPU/内核态比例基于相邻样本差分计算，因此真实主机的第一个样本用于建立基线，从第二个样本开始展示 CPU 百分比。
+- C++20 / Qt 6 Widgets
+- libssh2：SSH、PTY、exec channel 和 SFTP
+- Qt SQLite：配置、历史、告警和传输状态
+- Linux 指标来源：`/proc/stat`、`/proc/meminfo`、`/proc/loadavg`、`/proc/net/dev`、`df -Pk`
+- macOS Keychain / Windows Credential Manager：系统级凭据保存
+- CMake、CTest、CPack、NSIS、GitHub Actions：构建、测试和发布
 
-服务器元数据、监控历史、告警、传输状态和 `known_hosts` 信任记录保存在 Qt SQLite 数据库中。密码与私钥口令分别通过 macOS Keychain、Windows Credential Manager 或 Linux Secret Service 保存，SQLite 仅保存凭据引用。数据库默认位于系统应用数据目录的 `noxshell-ops.sqlite3`。
-
-系统凭据统一使用 `com.noxshell.ops.ssh` 服务名，应用数据、主机指纹和服务器配置均写入 NoxShell 专属数据目录。
-
-运行日志保存在系统应用数据目录的 `logs/noxshell-ops.log`，单文件达到 5 MiB 后轮换并保留 3 份历史；常见密码、口令、令牌和 Authorization 字段会脱敏。
-
-## 构建
+## 本地构建
 
 要求：CMake 3.25+、C++20 编译器、Qt 6.5+（Core、Gui、Network、Sql、Svg、Widgets）、libssh2 1.11+。
 
@@ -73,13 +146,13 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-macOS 运行：
+macOS 启动：
 
 ```bash
 open build/NoxShell.app
 ```
 
-日常界面开发推荐使用增量编译启动脚本：
+界面开发推荐使用增量编译脚本：
 
 ```bash
 ./script/qt-ui-start.sh
@@ -87,7 +160,7 @@ open build/NoxShell.app
 ./script/qt-ui-start.sh --build-only
 ```
 
-脚本会自动定位 Qt，复用 `build` 中的 CMake 缓存并只编译发生变化的文件；使用 `--clean` 可重新生成构建目录。
+脚本会自动定位 Qt 并复用 `build` 中的 CMake 缓存，只编译发生变化的文件；使用 `--clean` 可重新生成构建目录。
 
 生成 Release 包：
 
@@ -95,25 +168,24 @@ open build/NoxShell.app
 ./script/package-release.sh
 ```
 
-macOS 默认生成单文件、LZMA 压缩的 `.dmg`，挂载后把“玄壳”拖入 Applications 即可安装；最低部署版本默认为 macOS 14.0。若还需要备用 ZIP，可执行 `NOXSHELL_CREATE_ZIP=1 ./script/package-release.sh`。产物写入 `output/`。
+macOS 默认生成 LZMA 压缩的 `.dmg`。Windows 使用 CPack + NSIS 生成安装版 `.exe`，同时保留免安装 `.zip`。
 
-Windows 使用 CPack + NSIS 生成带开始菜单、桌面快捷方式和卸载入口的 `.exe` 安装程序，同时保留免安装 `.zip`。Windows 的 libssh2 由 `vcpkg.json` 管理并静态链接，Qt DLL 与平台插件由 Qt 部署脚本自动收集。
-
-仓库内的 `.github/workflows/release.yml` 支持手动运行，也会在推送 `v*` 标签时自动构建并测试以下产物：
+`.github/workflows/release.yml` 支持手动运行，也会在推送与 `CMakeLists.txt` 版本一致的 `v*` 标签时，自动构建：
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`
 - Windows x64 NSIS `.exe` 与便携 `.zip`
+- 所有产物的 `SHA256SUMS.txt`
 
-标签必须与 `CMakeLists.txt` 中的项目版本一致，例如当前版本使用 `v0.2.53`。标签构建完成后，工作流会创建或更新同名 GitHub Release，并附加所有安装包及 `SHA256SUMS.txt`。
-
-本地生成的 macOS 包采用临时签名，未使用 Developer ID 签名或 Apple 公证，仅适合内测；公开分发仍需正式签名与公证。使用当前 Homebrew Qt 构建时应在目标最低版本的 macOS 机器上做一次实际启动测试，正式兼容构建建议使用 Qt Online Installer 提供的官方 Qt。
-
-## 目录
+## 项目结构
 
 ```text
-src/core    主机模型、指标解析、持久化与 SSH 会话
-src/ui      Qt Widgets 界面组件
-output      产品文档和效果图
-docs        发布与维护文档
+src/core      主机模型、SSH 会话、指标解析、凭据与持久化
+src/ui        Qt Widgets 界面、终端、监控、文件管理和编辑器
+script        增量编译、图标生成和发布打包脚本
+docs          发布说明与 README 图片
+tests         Qt Test / Smoke Test
+output        本地发布产物
 ```
+
+更多发布说明见 [docs/RELEASE.md](docs/RELEASE.md)。
