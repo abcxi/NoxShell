@@ -6,19 +6,17 @@
 #include "FilePanel.h"
 #include "HostSidebar.h"
 #include "MetricCard.h"
-#include "MonitoringThresholdDialog.h"
 #ifdef Q_OS_MACOS
 #include "MacTitleBarControls.h"
 #endif
 #include "ServerDialog.h"
+#include "SystemDetailPanel.h"
 #include "TerminalSettingsDialog.h"
 #include "TerminalView.h"
 #include "TerminalWorkspace.h"
-#include "TrendChart.h"
 
 #include <QApplication>
 #include <QClipboard>
-#include <QComboBox>
 #include <QDebug>
 #include <QEvent>
 #include <QGridLayout>
@@ -26,7 +24,6 @@
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListWidget>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPushButton>
@@ -87,6 +84,16 @@ QString formatGib(quint64 bytes)
 {
     constexpr double bytesPerGib = 1024.0 * 1024.0 * 1024.0;
     return QString::number(static_cast<double>(bytes) / bytesPerGib, 'f', 1);
+}
+
+QString formatUptime(quint64 seconds)
+{
+    const auto days = seconds / 86400;
+    const auto hours = (seconds % 86400) / 3600;
+    const auto minutes = (seconds % 3600) / 60;
+    if (days > 0) return QStringLiteral("%1 天 %2 小时").arg(days).arg(hours);
+    if (hours > 0) return QStringLiteral("%1 小时 %2 分").arg(hours).arg(minutes);
+    return QStringLiteral("%1 分钟").arg(minutes);
 }
 
 bool isConnectingMessage(const QString &message)
@@ -515,27 +522,6 @@ QWidget *MainWindow::createMetricStrip()
         if (!m_currentServer.host.isEmpty()) QApplication::clipboard()->setText(m_currentServer.host);
     });
 
-    auto *monitorHeading = new QWidget;
-    monitorHeading->setObjectName(QStringLiteral("monitorHeading"));
-    auto *headingLayout = new QHBoxLayout(monitorHeading);
-    headingLayout->setContentsMargins(12, 8, 10, 7);
-    auto *heading = new QLabel(QStringLiteral("实时监控"));
-    heading->setStyleSheet(QStringLiteral("font-size:15px;font-weight:650;"));
-    auto *sampleHint = new QLabel(QStringLiteral("1 秒"));
-    sampleHint->setObjectName(QStringLiteral("mutedLabel"));
-    auto *trendToggle = new QToolButton;
-    trendToggle->setObjectName(QStringLiteral("monitorTrendToggle"));
-    trendToggle->setText(QStringLiteral("详细"));
-    trendToggle->setCheckable(true);
-    trendToggle->setArrowType(Qt::RightArrow);
-    trendToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    trendToggle->setToolTip(QStringLiteral("展开全部实时监控详情"));
-    headingLayout->addWidget(heading);
-    headingLayout->addStretch();
-    headingLayout->addWidget(sampleHint);
-    headingLayout->addWidget(trendToggle);
-    railLayout->addWidget(monitorHeading);
-
     auto *scroll = new QScrollArea;
     scroll->setObjectName(QStringLiteral("monitorScrollArea"));
     scroll->setWidgetResizable(true);
@@ -546,31 +532,43 @@ QWidget *MainWindow::createMetricStrip()
     layout->setContentsMargins(10, 7, 10, 10);
     layout->setSpacing(8);
 
-    m_cpuCard = new MetricCard(QStringLiteral("CPU 使用率"), QColor(QStringLiteral("#006EFF")));
-    m_memoryCard = new MetricCard(QStringLiteral("内存使用率"), QColor(QStringLiteral("#8B5CF6")));
-    m_loadCard = new MetricCard(QStringLiteral("系统负载"), QColor(QStringLiteral("#00A870")));
-    m_diskCard = new MetricCard(QStringLiteral("磁盘使用率"), QColor(QStringLiteral("#ED7B2F")));
+    m_cpuCard = new MetricCard(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
+    m_memoryCard = new MetricCard(QStringLiteral("内存"), QColor(QStringLiteral("#8B5CF6")));
+    m_loadCard = new MetricCard(QStringLiteral("负载"), QColor(QStringLiteral("#00A870")));
     auto *summary = new QFrame;
     summary->setObjectName(QStringLiteral("monitorMetricSummary"));
     summary->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     auto *summaryLayout = new QVBoxLayout(summary);
     summaryLayout->setContentsMargins(0, 0, 0, 0);
     summaryLayout->setSpacing(0);
-    for (auto *card : {m_cpuCard, m_memoryCard, m_loadCard, m_diskCard}) {
+
+    auto *systemInfo = new QFrame;
+    systemInfo->setObjectName(QStringLiteral("monitorSystemSummary"));
+    auto *systemInfoLayout = new QVBoxLayout(systemInfo);
+    systemInfoLayout->setContentsMargins(11, 7, 10, 7);
+    systemInfoLayout->setSpacing(4);
+    auto *systemTitle = new QLabel(QStringLiteral("系统信息"));
+    systemTitle->setObjectName(QStringLiteral("monitorSystemTitle"));
+    auto *uptimeRow = new QHBoxLayout;
+    uptimeRow->setContentsMargins(0, 0, 0, 0);
+    auto *uptimeTitle = new QLabel(QStringLiteral("运行时长"));
+    uptimeTitle->setObjectName(QStringLiteral("monitorSystemCaption"));
+    m_uptimeValue = new QLabel(QStringLiteral("--"));
+    m_uptimeValue->setObjectName(QStringLiteral("monitorUptimeValue"));
+    uptimeRow->addWidget(uptimeTitle);
+    uptimeRow->addStretch();
+    uptimeRow->addWidget(m_uptimeValue);
+    systemInfoLayout->addWidget(systemTitle);
+    systemInfoLayout->addLayout(uptimeRow);
+    summaryLayout->addWidget(systemInfo);
+
+    for (auto *card : {m_cpuCard, m_memoryCard, m_loadCard}) {
         summaryLayout->addWidget(card);
     }
-    m_diskCard->setProperty("lastRow", true);
+    m_loadCard->setProperty("lastRow", true);
     layout->addWidget(summary);
 
     auto *monitorDetails = createMonitorWorkspace();
-    monitorDetails->setVisible(false);
-    connect(trendToggle, &QToolButton::toggled, this, [trendToggle, monitorDetails](bool expanded) {
-        trendToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
-        trendToggle->setText(expanded ? QStringLiteral("收起") : QStringLiteral("详细"));
-        trendToggle->setToolTip(expanded ? QStringLiteral("收起实时监控详情")
-                                         : QStringLiteral("展开全部实时监控详情"));
-        monitorDetails->setVisible(expanded);
-    });
     layout->addWidget(monitorDetails);
     layout->addStretch();
     scroll->setWidget(content);
@@ -619,72 +617,9 @@ QWidget *MainWindow::createMonitorWorkspace()
     widget->setObjectName(QStringLiteral("monitorDetails"));
     auto *layout = new QVBoxLayout(widget);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(9);
-
-    auto *toolbar = new QWidget;
-    toolbar->setObjectName(QStringLiteral("monitorToolbar"));
-    auto *toolbarLayout = new QHBoxLayout(toolbar);
-    toolbarLayout->setContentsMargins(8, 6, 8, 6);
-    m_historyRange = new QComboBox;
-    m_historyRange->setObjectName(QStringLiteral("historyRange"));
-    m_historyRange->addItem(QStringLiteral("最近 1 分钟"), 60);
-    m_historyRange->addItem(QStringLiteral("最近 15 分钟"), 900);
-    m_historyRange->addItem(QStringLiteral("最近 60 分钟"), 3600);
-    m_historyRange->setCurrentIndex(1);
-    m_historyRange->setFixedWidth(118);
-    auto *thresholdButton = new QPushButton(QStringLiteral("告警阈值"));
-    thresholdButton->setObjectName(QStringLiteral("monitorThresholdButton"));
-    toolbarLayout->addWidget(thresholdButton);
-    toolbarLayout->addWidget(m_historyRange);
-    layout->addWidget(toolbar);
-
-    auto *alert = new QFrame;
-    alert->setObjectName(QStringLiteral("alertCard"));
-    auto *alertLayout = new QVBoxLayout(alert);
-    alertLayout->setContentsMargins(11, 8, 11, 8);
-    alertLayout->setSpacing(3);
-    m_alertTitle = new QLabel(QStringLiteral("磁盘空间状态"));
-    m_alertTitle->setObjectName(QStringLiteral("alertTitle"));
-    m_alertText = new QLabel(QStringLiteral("等待磁盘采样数据…"));
-    m_alertText->setObjectName(QStringLiteral("alertText"));
-    m_alertText->setWordWrap(true);
-    alertLayout->addWidget(m_alertTitle);
-    alertLayout->addWidget(m_alertText);
-    layout->addWidget(alert);
-
-    m_cpuTrend = new TrendChart(QStringLiteral("CPU 使用率"), TrendMetric::Cpu, QColor(QStringLiteral("#006EFF")));
-    m_memoryTrend = new TrendChart(QStringLiteral("内存使用率"), TrendMetric::Memory, QColor(QStringLiteral("#8B5CF6")));
-    m_loadTrend = new TrendChart(QStringLiteral("系统负载 / CPU 容量"), TrendMetric::Load, QColor(QStringLiteral("#00A870")));
-    m_diskTrend = new TrendChart(QStringLiteral("根磁盘使用率"), TrendMetric::Disk, QColor(QStringLiteral("#ED7B2F")));
-    m_cpuTrend->setObjectName(QStringLiteral("cpuTrendChart"));
-    m_memoryTrend->setObjectName(QStringLiteral("memoryTrendChart"));
-    m_loadTrend->setObjectName(QStringLiteral("loadTrendChart"));
-    m_diskTrend->setObjectName(QStringLiteral("diskTrendChart"));
-    for (auto *chart : {m_cpuTrend, m_memoryTrend, m_loadTrend, m_diskTrend}) {
-        chart->setMinimumHeight(145);
-        chart->setMaximumHeight(175);
-        layout->addWidget(chart);
-    }
-
-    auto *alerts = new QWidget;
-    alerts->setObjectName(QStringLiteral("monitorAlerts"));
-    auto *alertsLayout = new QVBoxLayout(alerts);
-    alertsLayout->setContentsMargins(9, 6, 9, 7);
-    alertsLayout->setSpacing(4);
-    auto *alertsTitle = new QLabel(QStringLiteral("最近告警事件"));
-    alertsTitle->setStyleSheet(QStringLiteral("font-weight:650;"));
-    m_alertList = new QListWidget;
-    m_alertList->setObjectName(QStringLiteral("monitorAlertList"));
-    m_alertList->setMaximumHeight(74);
-    alertsLayout->addWidget(alertsTitle);
-    alertsLayout->addWidget(m_alertList);
-    layout->addWidget(alerts);
-
-    connect(m_historyRange, &QComboBox::currentIndexChanged, this, [this](int index) {
-        m_historyWindowSeconds = m_historyRange->itemData(index).toInt();
-        refreshTrendCharts();
-    });
-    connect(thresholdButton, &QPushButton::clicked, this, &MainWindow::configureMonitoringThresholds);
+    layout->setSpacing(0);
+    m_systemDetailPanel = new SystemDetailPanel;
+    layout->addWidget(m_systemDetailPanel);
     return widget;
 }
 
@@ -733,14 +668,6 @@ void MainWindow::selectServer(const ServerProfile &profile)
     m_currentServer = profile;
     m_serverDeletionInFlight = false;
     m_hasMetricSample = false;
-    m_metricHistory.clear();
-    for (const auto &point : m_repository->loadMetricHistory(profile.id, QDateTime::currentDateTime().addSecs(-3600))) {
-        m_metricHistory.appendPoint(point);
-    }
-    m_thresholds = m_repository->loadMonitoringThresholds(profile.id);
-    m_activeAlerts.clear();
-    refreshAlertList();
-    refreshTrendCharts();
     resetMetrics(QStringLiteral("等待连接 · 双击主机或右键连接"));
     m_serverMeta->setText(profile.host);
     const bool connectedNow = m_terminalWorkspace && m_terminalWorkspace->hasConnectedSession(profile.id);
@@ -991,10 +918,9 @@ void MainWindow::requestMetrics()
 void MainWindow::displayMetrics(const MetricSample &sample)
 {
     m_hasMetricSample = true;
-    m_metricHistory.append(sample);
-    m_repository->saveMetricSample(m_currentServer.id, sample);
-    evaluateMonitoringAlerts(sample);
-    refreshTrendCharts();
+    if (m_systemDetailPanel) m_systemDetailPanel->setSample(sample);
+    if (m_uptimeValue)
+        m_uptimeValue->setText(sample.uptimeSeconds > 0 ? formatUptime(sample.uptimeSeconds) : QStringLiteral("--"));
     const int cpuProgress = qBound(0, qRound(sample.cpuPercent), 100);
     if (sample.cpuReady) {
         m_cpuCard->setValue(QStringLiteral("%1%").arg(sample.cpuPercent, 0, 'f', 1),
@@ -1011,23 +937,6 @@ void MainWindow::displayMetrics(const MetricSample &sample)
     m_loadCard->setValue(QString::number(sample.load1, 'f', 2),
         QStringLiteral("1m / %1 核 · 5m %2").arg(sample.cpuCoreCount).arg(sample.load5, 0, 'f', 2), loadProgress);
 
-    const auto &disk = sample.primaryDisk;
-    if (disk.totalBytes > 0) {
-        m_diskCard->setValue(QStringLiteral("%1%").arg(disk.usagePercent),
-            QStringLiteral("%1 · %2 GiB").arg(disk.fileSystem, formatGib(disk.usedBytes)), disk.usagePercent);
-        const bool warning = disk.usagePercent >= m_thresholds.diskPercent;
-        m_alertTitle->setText(warning ? QStringLiteral("⚠  磁盘空间预警") : QStringLiteral("✓  磁盘空间正常"));
-        m_alertText->setText(warning
-            ? QStringLiteral("%1 已使用 %2%，可用 %3 GiB\n建议检查日志和临时文件。")
-                  .arg(disk.mountPoint).arg(disk.usagePercent).arg(formatGib(disk.availableBytes))
-            : QStringLiteral("%1 已使用 %2%，可用 %3 GiB\n磁盘空间处于正常范围。")
-                  .arg(disk.mountPoint).arg(disk.usagePercent).arg(formatGib(disk.availableBytes)));
-    } else {
-        m_diskCard->setValue(QStringLiteral("--"), QStringLiteral("未发现持久化磁盘"), 0);
-        m_alertTitle->setText(QStringLiteral("磁盘空间状态"));
-        m_alertText->setText(QStringLiteral("未发现可展示的持久化磁盘。"));
-    }
-
     if (m_sampleStatus) {
         m_sampleStatus->setText(QStringLiteral("采样 %1    周期 1.0 s")
                                     .arg(sample.capturedAt.toString(QStringLiteral("HH:mm:ss"))));
@@ -1037,82 +946,12 @@ void MainWindow::displayMetrics(const MetricSample &sample)
 void MainWindow::resetMetrics(const QString &detail)
 {
     if (!m_cpuCard) return;
-    for (auto *card : {m_cpuCard, m_memoryCard, m_loadCard, m_diskCard}) {
+    for (auto *card : {m_cpuCard, m_memoryCard, m_loadCard}) {
         card->setValue(QStringLiteral("--"), detail, 0);
     }
-    if (m_alertTitle) m_alertTitle->setText(QStringLiteral("磁盘空间状态"));
-    if (m_alertText) m_alertText->setText(QStringLiteral("等待磁盘采样数据…"));
+    if (m_uptimeValue) m_uptimeValue->setText(QStringLiteral("--"));
+    if (m_systemDetailPanel) m_systemDetailPanel->reset(detail);
     if (m_sampleStatus) m_sampleStatus->setText(detail + QStringLiteral("    周期 1.0 s"));
-}
-
-void MainWindow::refreshTrendCharts()
-{
-    if (!m_cpuTrend) return;
-    const auto points = m_metricHistory.points(m_historyWindowSeconds);
-    for (auto *chart : {m_cpuTrend, m_memoryTrend, m_loadTrend, m_diskTrend}) {
-        chart->setSeries(points, m_historyWindowSeconds);
-    }
-}
-
-void MainWindow::configureMonitoringThresholds()
-{
-    if (m_currentServer.id.isEmpty()) return;
-    MonitoringThresholdDialog dialog(m_thresholds, this);
-    if (dialog.exec() != QDialog::Accepted) return;
-    const auto thresholds = dialog.thresholds();
-    if (!m_repository->saveMonitoringThresholds(m_currentServer.id, thresholds)) {
-        QMessageBox::critical(this, QStringLiteral("保存阈值失败"), m_repository->lastError());
-        return;
-    }
-    m_thresholds = thresholds;
-    m_activeAlerts.clear();
-}
-
-void MainWindow::evaluateMonitoringAlerts(const MetricSample &sample)
-{
-    if (m_currentServer.id.isEmpty()) return;
-    struct Check { QString key; QString label; double value; double threshold; bool valid; };
-    const QVector<Check> checks{
-        {QStringLiteral("cpu"), QStringLiteral("CPU"), sample.cpuPercent, m_thresholds.cpuPercent, sample.cpuReady},
-        {QStringLiteral("memory"), QStringLiteral("内存"), sample.memoryPercent, m_thresholds.memoryPercent, true},
-        {QStringLiteral("load"), QStringLiteral("负载"), sample.load1 * 100.0 / qMax(1, sample.cpuCoreCount), m_thresholds.loadPercent, true},
-        {QStringLiteral("disk"), QStringLiteral("磁盘"), static_cast<double>(sample.primaryDisk.usagePercent),
-            m_thresholds.diskPercent, sample.primaryDisk.totalBytes > 0},
-    };
-    bool recorded = false;
-    for (const auto &check : checks) {
-        if (!check.valid) continue;
-        if (check.value >= check.threshold && !m_activeAlerts.contains(check.key)) {
-            MonitoringAlert alert;
-            alert.serverId = m_currentServer.id;
-            alert.metric = check.label;
-            alert.value = check.value;
-            alert.threshold = check.threshold;
-            alert.createdAt = sample.capturedAt;
-            recorded = m_repository->recordMonitoringAlert(alert) || recorded;
-            m_activeAlerts.insert(check.key);
-        } else if (check.value <= check.threshold - 3.0) {
-            m_activeAlerts.remove(check.key);
-        }
-    }
-    if (recorded) refreshAlertList();
-}
-
-void MainWindow::refreshAlertList()
-{
-    if (!m_alertList) return;
-    m_alertList->clear();
-    if (m_currentServer.id.isEmpty()) return;
-    const auto alerts = m_repository->loadMonitoringAlerts(m_currentServer.id, 20);
-    if (alerts.isEmpty()) {
-        m_alertList->addItem(QStringLiteral("暂无告警，当前指标均在阈值范围内。"));
-        return;
-    }
-    for (const auto &alert : alerts) {
-        m_alertList->addItem(QStringLiteral("%1   %2达到 %3%（阈值 %4%）")
-            .arg(alert.createdAt.toString(QStringLiteral("MM-dd HH:mm:ss")), alert.metric)
-            .arg(alert.value, 0, 'f', 1).arg(alert.threshold, 0, 'f', 1));
-    }
 }
 
 } // namespace noxshell::ui

@@ -32,10 +32,10 @@ MonitoringThresholdDialog::MonitoringThresholdDialog(const MonitoringThresholds 
     m_memory = createSpin(thresholds.memoryPercent);
     m_load = createSpin(thresholds.loadPercent);
     m_disk = createSpin(thresholds.diskPercent);
-    form->addRow(QStringLiteral("CPU 使用率"), m_cpu);
-    form->addRow(QStringLiteral("内存使用率"), m_memory);
-    form->addRow(QStringLiteral("系统负载 / CPU 容量"), m_load);
-    form->addRow(QStringLiteral("根磁盘使用率"), m_disk);
+    form->addRow(QStringLiteral("CPU"), m_cpu);
+    form->addRow(QStringLiteral("内存"), m_memory);
+    form->addRow(QStringLiteral("负载"), m_load);
+    form->addRow(QStringLiteral("磁盘"), m_disk);
     layout->addLayout(form);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
     buttons->button(QDialogButtonBox::Save)->setText(QStringLiteral("保存"));

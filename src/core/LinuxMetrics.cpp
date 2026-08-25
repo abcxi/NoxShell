@@ -14,6 +14,9 @@ enum class Section {
     Load,
     Cores,
     Disk,
+    Uptime,
+    Network,
+    Process,
 };
 
 QList<QByteArray> fields(const QByteArray &line)
@@ -46,6 +49,7 @@ quint64 LinuxCpuTimes::idleTotal() const
 bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &snapshot, QString *error)
 {
     snapshot = {};
+    snapshot.capturedAt = QDateTime::currentDateTime();
     Section section = Section::None;
     bool hasCpu = false;
     bool hasMemoryTotal = false;
@@ -80,6 +84,18 @@ bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &
         }
         if (line == "__DISK__") {
             section = Section::Disk;
+            continue;
+        }
+        if (line == "__UPTIME__") {
+            section = Section::Uptime;
+            continue;
+        }
+        if (line == "__NET__") {
+            section = Section::Network;
+            continue;
+        }
+        if (line == "__PROC__") {
+            section = Section::Process;
             continue;
         }
         if (line.isEmpty()) continue;
@@ -175,6 +191,47 @@ bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &
             snapshot.disks.append(std::move(disk));
             break;
         }
+        case Section::Uptime: {
+            bool ok = false;
+            const double seconds = parts.first().toDouble(&ok);
+            if (ok && seconds >= 0.0) snapshot.uptimeSeconds = static_cast<quint64>(seconds);
+            break;
+        }
+        case Section::Network: {
+            const auto separator = line.indexOf(':');
+            if (separator <= 0) break;
+            const auto interfaceName = line.left(separator).trimmed();
+            if (interfaceName.isEmpty() || interfaceName == "Inter-|") break;
+            const auto values = fields(line.mid(separator + 1));
+            if (values.size() < 9) break;
+            bool receivedOk = false;
+            bool transmittedOk = false;
+            const auto received = values.at(0).toULongLong(&receivedOk);
+            const auto transmitted = values.at(8).toULongLong(&transmittedOk);
+            if (!receivedOk || !transmittedOk) break;
+            snapshot.networks.append({QString::fromUtf8(interfaceName), received, transmitted});
+            break;
+        }
+        case Section::Process: {
+            if (parts.size() < 6) break;
+            bool pidOk = false;
+            bool cpuOk = false;
+            bool memoryOk = false;
+            bool residentOk = false;
+            LinuxProcessUsage process;
+            process.pid = parts.at(0).toInt(&pidOk);
+            process.user = QString::fromUtf8(parts.at(1));
+            process.cpuPercent = parts.at(2).toDouble(&cpuOk);
+            process.memoryPercent = parts.at(3).toDouble(&memoryOk);
+            process.residentBytes = kilobytesToBytes(parts.at(4).toULongLong(&residentOk));
+            process.command = QString::fromUtf8(parts.mid(5).join(' '));
+            if (pidOk && cpuOk && memoryOk && residentOk && process.pid > 0 && !process.command.isEmpty()) {
+                const auto existing = std::find_if(snapshot.processes.cbegin(), snapshot.processes.cend(),
+                    [&process](const LinuxProcessUsage &candidate) { return candidate.pid == process.pid; });
+                if (existing == snapshot.processes.cend()) snapshot.processes.append(std::move(process));
+            }
+            break;
+        }
         case Section::None:
             break;
         }
@@ -216,7 +273,10 @@ MetricSample LinuxMetricsParser::calculate(const LinuxMetricsSnapshot &current, 
     sample.load1 = current.load1;
     sample.load5 = current.load5;
     sample.load15 = current.load15;
+    sample.uptimeSeconds = current.uptimeSeconds;
     sample.cpuCoreCount = qMax(1, current.cpuCoreCount);
+    sample.disks = current.disks;
+    sample.processes = current.processes;
 
     const auto rootDisk = std::find_if(current.disks.cbegin(), current.disks.cend(), [](const LinuxDiskUsage &disk) {
         return disk.mountPoint == QStringLiteral("/");
@@ -242,6 +302,34 @@ MetricSample LinuxMetricsParser::calculate(const LinuxMetricsSnapshot &current, 
                 sample.kernelPercent = 100.0 * static_cast<double>(qMin(totalDelta, kernelNow - kernelBefore)) / static_cast<double>(totalDelta);
             }
             sample.cpuReady = true;
+        }
+
+        const auto elapsedMilliseconds = previous->capturedAt.msecsTo(current.capturedAt);
+        if (elapsedMilliseconds > 0) {
+            const double elapsedSeconds = static_cast<double>(elapsedMilliseconds) / 1000.0;
+            for (const auto &network : current.networks) {
+                const auto before = std::find_if(previous->networks.cbegin(), previous->networks.cend(),
+                    [&network](const LinuxNetworkUsage &candidate) {
+                        return candidate.interfaceName == network.interfaceName;
+                    });
+                LinuxNetworkRate rate;
+                rate.interfaceName = network.interfaceName;
+                if (before != previous->networks.cend()) {
+                    if (network.receivedBytes >= before->receivedBytes) {
+                        rate.receivedBytesPerSecond = static_cast<double>(network.receivedBytes - before->receivedBytes)
+                            / elapsedSeconds;
+                    }
+                    if (network.transmittedBytes >= before->transmittedBytes) {
+                        rate.transmittedBytesPerSecond = static_cast<double>(network.transmittedBytes - before->transmittedBytes)
+                            / elapsedSeconds;
+                    }
+                }
+                sample.networkRates.append(std::move(rate));
+            }
+        }
+    } else {
+        for (const auto &network : current.networks) {
+            sample.networkRates.append({network.interfaceName, 0.0, 0.0});
         }
     }
     return sample;

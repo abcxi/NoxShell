@@ -79,7 +79,12 @@ constexpr auto kMetricsCommand =
     "printf '__MEM__\\n'; cat /proc/meminfo; "
     "printf '__LOAD__\\n'; cat /proc/loadavg; "
     "printf '__CORES__\\n'; (getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf '1\\n'); "
-    "printf '__DISK__\\n'; (df -Pk -x tmpfs -x devtmpfs 2>/dev/null || df -Pk 2>/dev/null)";
+    "printf '__DISK__\\n'; (df -Pk 2>/dev/null); "
+    "printf '__UPTIME__\\n'; cat /proc/uptime 2>/dev/null; "
+    "printf '__NET__\\n'; cat /proc/net/dev 2>/dev/null; "
+    "printf '__PROC__\\n'; "
+    "(ps -eo pid=,user=,pcpu=,pmem=,rss=,comm= --sort=-pcpu 2>/dev/null | head -n 12; "
+    "ps -eo pid=,user=,pcpu=,pmem=,rss=,comm= --sort=-pmem 2>/dev/null | head -n 12; true)";
 
 QString nativePath(const QString &path)
 {

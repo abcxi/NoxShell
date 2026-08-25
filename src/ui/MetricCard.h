@@ -2,7 +2,6 @@
 
 #include <QFrame>
 
-class QLabel;
 class QProgressBar;
 
 namespace noxshell::ui {
@@ -16,10 +15,7 @@ public:
     void setValue(const QString &value, const QString &detail, int progress);
 
 private:
-    QLabel *m_valueLabel{};
-    QLabel *m_detailLabel{};
     QProgressBar *m_progress{};
 };
 
 } // namespace noxshell::ui
-

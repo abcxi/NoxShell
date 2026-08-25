@@ -1,8 +1,6 @@
 #pragma once
 
 #include "../core/LinuxMetrics.h"
-#include "../core/MetricHistory.h"
-#include "../core/MonitoringData.h"
 #include "../core/ServerProfile.h"
 
 #include <QMainWindow>
@@ -12,8 +10,6 @@
 class QLabel;
 class QTimer;
 class QPushButton;
-class QComboBox;
-class QListWidget;
 class QToolButton;
 class QToolBar;
 class QStackedWidget;
@@ -30,8 +26,8 @@ namespace noxshell::ui {
 class FilePanel;
 class HostSidebar;
 class MetricCard;
+class SystemDetailPanel;
 class TerminalWorkspace;
-class TrendChart;
 
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -69,10 +65,6 @@ private:
     void requestMetrics();
     void displayMetrics(const MetricSample &sample);
     void resetMetrics(const QString &detail);
-    void refreshTrendCharts();
-    void configureMonitoringThresholds();
-    void evaluateMonitoringAlerts(const MetricSample &sample);
-    void refreshAlertList();
     void addServer();
     void addServerInGroup(const QString &group);
     void editServer(const ServerProfile &profile);
@@ -82,8 +74,6 @@ private:
     HostSidebar *m_sidebar{};
     QLabel *m_serverMeta{};
     QLabel *m_onlineBadge{};
-    QLabel *m_alertTitle{};
-    QLabel *m_alertText{};
     QLabel *m_sampleStatus{};
     QToolButton *m_sidebarToggleButton{};
     QToolButton *m_monitorToggleButton{};
@@ -93,19 +83,14 @@ private:
     MetricCard *m_cpuCard{};
     MetricCard *m_memoryCard{};
     MetricCard *m_loadCard{};
-    MetricCard *m_diskCard{};
+    QLabel *m_uptimeValue{};
+    SystemDetailPanel *m_systemDetailPanel{};
     TerminalWorkspace *m_terminalWorkspace{};
     QSplitter *m_terminalFileSplitter{};
     FilePanel *m_filePanel{};
     QStackedWidget *m_fileWorkspaceStack{};
     QWidget *m_filePlaceholder{};
     QWidget *m_fileWorkspacePane{};
-    TrendChart *m_cpuTrend{};
-    TrendChart *m_memoryTrend{};
-    TrendChart *m_loadTrend{};
-    TrendChart *m_diskTrend{};
-    QComboBox *m_historyRange{};
-    QListWidget *m_alertList{};
     SshSession *m_session{};
     QHash<SshSession *, FilePanel *> m_filePanels;
     QSet<SshSession *> m_boundSessions;
@@ -113,10 +98,6 @@ private:
     ServerProfile m_currentServer;
     ServerRepository *m_repository{};
     CredentialStore *m_credentialStore{};
-    MetricHistory m_metricHistory{3600};
-    MonitoringThresholds m_thresholds;
-    QSet<QString> m_activeAlerts;
-    int m_historyWindowSeconds{900};
     bool m_hasMetricSample{false};
     bool m_serverDeletionInFlight{false};
     bool m_nativeTitleBarControls{false};

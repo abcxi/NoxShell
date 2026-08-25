@@ -31,15 +31,40 @@ struct LinuxDiskUsage {
     int usagePercent{};
 };
 
+struct LinuxNetworkUsage {
+    QString interfaceName;
+    quint64 receivedBytes{};
+    quint64 transmittedBytes{};
+};
+
+struct LinuxNetworkRate {
+    QString interfaceName;
+    double receivedBytesPerSecond{};
+    double transmittedBytesPerSecond{};
+};
+
+struct LinuxProcessUsage {
+    int pid{};
+    QString user;
+    double cpuPercent{};
+    double memoryPercent{};
+    quint64 residentBytes{};
+    QString command;
+};
+
 struct LinuxMetricsSnapshot {
+    QDateTime capturedAt;
     LinuxCpuTimes cpu;
     quint64 memoryTotalBytes{};
     quint64 memoryAvailableBytes{};
     double load1{};
     double load5{};
     double load15{};
+    quint64 uptimeSeconds{};
     int cpuCoreCount{1};
     QVector<LinuxDiskUsage> disks;
+    QVector<LinuxNetworkUsage> networks;
+    QVector<LinuxProcessUsage> processes;
 };
 
 struct MetricSample {
@@ -53,8 +78,12 @@ struct MetricSample {
     double load1{};
     double load5{};
     double load15{};
+    quint64 uptimeSeconds{};
     int cpuCoreCount{1};
     LinuxDiskUsage primaryDisk;
+    QVector<LinuxDiskUsage> disks;
+    QVector<LinuxNetworkRate> networkRates;
+    QVector<LinuxProcessUsage> processes;
 };
 
 class LinuxMetricsParser final {

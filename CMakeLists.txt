@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.52 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.53 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -87,12 +87,12 @@ qt_add_executable(NoxShell
     ${NOXSHELL_MAC_SOURCES}
     src/ui/MetricCard.cpp
     src/ui/MetricCard.h
-    src/ui/MonitoringThresholdDialog.cpp
-    src/ui/MonitoringThresholdDialog.h
     src/ui/RemoteFileEditor.cpp
     src/ui/RemoteFileEditor.h
     src/ui/ServerDialog.cpp
     src/ui/ServerDialog.h
+    src/ui/SystemDetailPanel.cpp
+    src/ui/SystemDetailPanel.h
     src/ui/TerminalPanel.cpp
     src/ui/TerminalPanel.h
     src/ui/TerminalSettingsDialog.cpp
@@ -101,8 +101,6 @@ qt_add_executable(NoxShell
     src/ui/TerminalWorkspace.h
     src/ui/TerminalView.cpp
     src/ui/TerminalView.h
-    src/ui/TrendChart.cpp
-    src/ui/TrendChart.h
     src/ui/TransferQueuePanel.cpp
     src/ui/TransferQueuePanel.h
     src/ui/VtTerminalModel.cpp
@@ -140,12 +138,12 @@ if(BUILD_TESTING)
         ${NOXSHELL_MAC_SOURCES}
         src/ui/MetricCard.cpp
         src/ui/MetricCard.h
-        src/ui/MonitoringThresholdDialog.cpp
-        src/ui/MonitoringThresholdDialog.h
         src/ui/RemoteFileEditor.cpp
         src/ui/RemoteFileEditor.h
         src/ui/ServerDialog.cpp
         src/ui/ServerDialog.h
+        src/ui/SystemDetailPanel.cpp
+        src/ui/SystemDetailPanel.h
         src/ui/TerminalPanel.cpp
         src/ui/TerminalPanel.h
         src/ui/TerminalSettingsDialog.cpp
@@ -154,8 +152,6 @@ if(BUILD_TESTING)
         src/ui/TerminalWorkspace.h
         src/ui/TerminalView.cpp
         src/ui/TerminalView.h
-        src/ui/TrendChart.cpp
-        src/ui/TrendChart.h
         src/ui/TransferQueuePanel.cpp
         src/ui/TransferQueuePanel.h
         src/ui/VtTerminalModel.cpp

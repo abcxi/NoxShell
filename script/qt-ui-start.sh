@@ -157,6 +157,16 @@ fi
 if [[ "$(uname -s)" == "Darwin" ]]; then
     APP_PATH="${BUILD_DIR}/NoxShell.app"
     [[ -d "${APP_PATH}" ]] || fail "未找到应用包: ${APP_PATH}"
+    # 测试脚本的目标是查看本次增量构建。先关闭仍在运行的旧实例，
+    # 否则 macOS 可能把旧窗口置前，让源码文字已经更新却看起来没有变化。
+    if pgrep -x NoxShell >/dev/null 2>&1; then
+        printf '关闭旧的玄壳测试实例…\n'
+        pkill -x NoxShell || true
+        for _ in 1 2 3 4 5; do
+            pgrep -x NoxShell >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+    fi
     printf '启动: %s\n' "${APP_PATH}"
     if ((${#APP_ARGS[@]} > 0)); then
         # `open` 默认会激活已经运行的旧进程，导致刚编译的界面看起来没有更新。

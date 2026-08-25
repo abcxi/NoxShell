@@ -59,14 +59,8 @@ QString applicationStyleSheet()
         QFrame#monitorIdentity { border-bottom: 1px solid #E4EAF1; }
         QFrame#statusBar { border-top: 1px solid #DFE6EF; }
         QWidget#monitorRail { background: white; border-right: 1px solid #DDE5EE; }
-        QWidget#monitorHeading { background: #F7F9FC; border-bottom: 1px solid #E4EAF1; }
         QWidget#operationsWorkspace, QWidget#terminalWorkspacePane, QWidget#fileWorkspacePane { background: #F3F6FA; }
         QScrollArea#monitorScrollArea, QScrollArea#monitorScrollArea QWidget { background: white; }
-        QToolButton#monitorTrendToggle {
-            min-height: 24px; border: 0; border-radius: 3px;
-            background: transparent; color: #53657B; padding: 0 3px;
-        }
-        QToolButton#monitorTrendToggle:hover { background: #E8F3FF; color: #0052D9; }
         QListWidget { background: white; border: 0; outline: 0; padding: 5px; }
         QListWidget::item { border-radius: 4px; padding: 8px 7px; margin: 1px 0; }
         QListWidget::item:selected { color: #0052D9; background: #E8F3FF; border: 1px solid #CCE3FF; }
@@ -75,14 +69,6 @@ QString applicationStyleSheet()
         QTabBar::tab { min-width: 95px; min-height: 40px; color: #53657B; padding: 0 10px; }
         QTabBar::tab:selected { color: #0052D9; font-weight: 650; border-bottom: 3px solid #006EFF; }
         QTabBar::tab:hover:!selected { background: #F7F9FC; }
-        QWidget#monitorToolbar {
-            background: white; border: 1px solid #E1E7EF; border-radius: 5px;
-        }
-        QWidget#monitorAlerts {
-            background: white; border: 1px solid #E1E7EF; border-radius: 5px;
-        }
-        QListWidget#monitorAlertList { border-top: 1px solid #EEF1F5; padding: 0; }
-        QListWidget#monitorAlertList::item { min-height: 22px; padding: 1px 6px; color: #6A3F27; }
         QComboBox {
             min-height: 28px; border: 1px solid #D8E0EA; border-radius: 4px;
             background: white; color: #3C4D63; padding: 0 9px;
@@ -96,12 +82,15 @@ QString applicationStyleSheet()
         QFrame#monitorMetricSummary {
             background: white; border: 1px solid #E1E7EF; border-radius: 5px;
         }
+        QFrame#monitorSystemSummary { background: transparent; border: 0; border-bottom: 1px solid #EEF2F6; }
+        QLabel#monitorSystemTitle { color: #173553; font-size: 12px; font-weight: 650; }
+        QLabel#monitorSystemCaption { color: #8794A5; font-size: 10px; }
+        QLabel#monitorUptimeValue { color: #173553; font-size: 12px; font-weight: 650; }
         QFrame#metricRow { background: transparent; border: 0; border-bottom: 1px solid #EEF2F6; }
         QFrame#metricRow[lastRow="true"] { border-bottom: 0; }
         QLabel#metricTitle { color: #5F6F82; font-size: 12px; }
         QLabel#metricValue { color: #1C324B; font-size: 17px; font-weight: 650; }
         QLabel#metricDetail { color: #8794A5; font-size: 10px; }
-        QFrame#alertCard { background: #FFFAF6; border: 1px solid #F3D9C7; border-radius: 5px; }
         QFrame#transferQueuePanel { background: #F7F9FC; border-top: 1px solid #D9E2EC; }
         QFrame#transferQueuePanel[popup="true"] { border: 0; background: #F7F9FC; }
         QLabel#transferQueueTitle { color:#1C324B; font-size:14px; font-weight:650; }

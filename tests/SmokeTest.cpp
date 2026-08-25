@@ -13,9 +13,9 @@
 #include "../src/ui/MainWindow.h"
 #include "../src/ui/RemoteFileEditor.h"
 #include "../src/ui/ServerDialog.h"
+#include "../src/ui/SystemDetailPanel.h"
 #include "../src/ui/TerminalSettingsDialog.h"
 #include "../src/ui/TerminalWorkspace.h"
-#include "../src/ui/TrendChart.h"
 #include "../src/ui/TransferQueuePanel.h"
 #include "../src/ui/TerminalView.h"
 #include "../src/ui/VtTerminalModel.h"
@@ -731,7 +731,15 @@ private slots:
             "4\n"
             "__DISK__\n"
             "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
-            "/dev/vda1 104857600 76546048 28311552 73% /\n";
+            "/dev/vda1 104857600 76546048 28311552 73% /\n"
+            "tmpfs 2048000 1024 2046976 1% /run\n"
+            "__UPTIME__\n86461.23 0.0\n"
+            "__NET__\n"
+            "eth0: 100000 1 0 0 0 0 0 0 50000 1 0 0 0 0 0 0\n"
+            "lo: 1000 1 0 0 0 0 0 0 1000 1 0 0 0 0 0 0\n"
+            "__PROC__\n"
+            "101 root 12.5 4.0 2048 nginx\n"
+            "202 mysql 3.0 18.0 4096 mysqld\n";
         const QByteArray secondPayload =
             "__CPU__\n"
             "cpu 150 0 70 850 10 0 0 0\n"
@@ -744,13 +752,22 @@ private slots:
             "4\n"
             "__DISK__\n"
             "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
-            "/dev/vda1 104857600 76546048 28311552 73% /\n";
+            "/dev/vda1 104857600 76546048 28311552 73% /\n"
+            "tmpfs 2048000 2048 2045952 1% /run\n"
+            "__UPTIME__\n86462.23 0.0\n"
+            "__NET__\n"
+            "eth0: 112288 1 0 0 0 0 0 0 56144 1 0 0 0 0 0 0\n"
+            "lo: 2000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0\n"
+            "__PROC__\n"
+            "101 root 14.5 4.2 2200 nginx\n";
 
         noxshell::LinuxMetricsSnapshot first;
         noxshell::LinuxMetricsSnapshot second;
         QString error;
         QVERIFY2(noxshell::LinuxMetricsParser::parse(firstPayload, first, &error), qPrintable(error));
         QVERIFY2(noxshell::LinuxMetricsParser::parse(secondPayload, second, &error), qPrintable(error));
+        first.capturedAt = QDateTime::fromMSecsSinceEpoch(1000);
+        second.capturedAt = QDateTime::fromMSecsSinceEpoch(2000);
 
         const auto baseline = noxshell::LinuxMetricsParser::calculate(first);
         QVERIFY(!baseline.cpuReady);
@@ -763,6 +780,78 @@ private slots:
         QCOMPARE(sample.primaryDisk.fileSystem, QStringLiteral("/dev/vda1"));
         QCOMPARE(sample.primaryDisk.usagePercent, 73);
         QCOMPARE(sample.primaryDisk.totalBytes, quint64{104857600} * 1024);
+        QCOMPARE(sample.uptimeSeconds, quint64{86462});
+        QCOMPARE(sample.disks.size(), 2);
+        QCOMPARE(sample.networkRates.size(), 2);
+        QCOMPARE(sample.networkRates.first().interfaceName, QStringLiteral("eth0"));
+        QCOMPARE(sample.networkRates.first().receivedBytesPerSecond, 12288.0);
+        QCOMPARE(sample.networkRates.first().transmittedBytesPerSecond, 6144.0);
+        QCOMPARE(sample.processes.size(), 1);
+        QCOMPARE(sample.processes.first().command, QStringLiteral("nginx"));
+        QCOMPARE(sample.processes.first().residentBytes, quint64{2200} * 1024);
+    }
+
+    void systemDetailPanelShowsRealtimeSystemData()
+    {
+        noxshell::ui::SystemDetailPanel panel;
+        noxshell::MetricSample sample;
+        sample.cpuReady = true;
+        sample.cpuPercent = 27.5;
+        sample.cpuCoreCount = 8;
+        sample.memoryUsedBytes = 6ULL * 1024 * 1024 * 1024;
+        sample.memoryTotalBytes = 16ULL * 1024 * 1024 * 1024;
+        sample.memoryPercent = 37.5;
+        sample.uptimeSeconds = 90061;
+        sample.networkRates = {
+            {QStringLiteral("lo"), 1024.0, 1024.0},
+            {QStringLiteral("eth0"), 64.0 * 1024.0, 32.0 * 1024.0},
+        };
+        sample.processes = {
+            {17, QStringLiteral("root"), 24.0, 2.0, 64ULL * 1024 * 1024, QStringLiteral("agent")},
+            {33, QStringLiteral("www"), 4.0, 8.0, 256ULL * 1024 * 1024, QStringLiteral("worker")},
+            {41, QStringLiteral("root"), 3.0, 4.0, 128ULL * 1024 * 1024, QStringLiteral("cache")},
+            {52, QStringLiteral("ops"), 2.0, 3.0, 96ULL * 1024 * 1024, QStringLiteral("logger")},
+            {63, QStringLiteral("ops"), 1.0, 1.0, 48ULL * 1024 * 1024, QStringLiteral("watcher")},
+            {74, QStringLiteral("root"), 0.5, 0.5, 32ULL * 1024 * 1024, QStringLiteral("helper")},
+        };
+        sample.disks = {
+            {QStringLiteral("/dev/vda1"), QStringLiteral("/"), 100ULL * 1024 * 1024 * 1024,
+                40ULL * 1024 * 1024 * 1024, 60ULL * 1024 * 1024 * 1024, 40},
+            {QStringLiteral("tmpfs"), QStringLiteral("/dev"), 2ULL * 1024 * 1024 * 1024,
+                1ULL * 1024 * 1024 * 1024, 1ULL * 1024 * 1024 * 1024, 50},
+            {QStringLiteral("tmpfs"), QStringLiteral("/run"), 2ULL * 1024 * 1024 * 1024,
+                1ULL * 1024 * 1024 * 1024, 1ULL * 1024 * 1024 * 1024, 50},
+            {QStringLiteral("/dev/vdb1"), QStringLiteral("/data"), 200ULL * 1024 * 1024 * 1024,
+                20ULL * 1024 * 1024 * 1024, 180ULL * 1024 * 1024 * 1024, 10},
+            {QStringLiteral("tmpfs"), QStringLiteral("/run/user/0"), 512ULL * 1024 * 1024,
+                256ULL * 1024 * 1024, 256ULL * 1024 * 1024, 50},
+        };
+        panel.setSample(sample);
+        auto *interfaces = panel.findChild<QComboBox *>(QStringLiteral("networkInterfaceCombo"));
+        auto *upload = panel.findChild<QLabel *>(QStringLiteral("networkUploadRate"));
+        auto *processes = panel.findChild<QTreeWidget *>(QStringLiteral("realtimeProcessList"));
+        auto *fileSystems = panel.findChild<QTreeWidget *>(QStringLiteral("fileSystemUsageList"));
+        QVERIFY(interfaces);
+        QVERIFY(upload);
+        QVERIFY(processes);
+        QVERIFY(fileSystems);
+        QVERIFY(panel.findChild<QFrame *>(QStringLiteral("networkSectionCard")));
+        QVERIFY(panel.findChild<QFrame *>(QStringLiteral("processSectionCard")));
+        QVERIFY(panel.findChild<QFrame *>(QStringLiteral("fileSystemSectionCard")));
+        QCOMPARE(interfaces->count(), 3);
+        QCOMPARE(interfaces->currentText(), QStringLiteral("全部网卡"));
+        QVERIFY(interfaces->width() >= 112);
+        QVERIFY(upload->text().contains(QStringLiteral("33.0 KB/s")));
+        QVERIFY(panel.findChild<QWidget *>(QStringLiteral("networkRateChart")));
+        interfaces->setCurrentIndex(interfaces->findData(QStringLiteral("eth0")));
+        QVERIFY(upload->text().contains(QStringLiteral("32.0 KB/s")));
+        QCOMPARE(processes->topLevelItemCount(), 4);
+        QCOMPARE(processes->topLevelItem(0)->text(0), QStringLiteral("agent"));
+        QCOMPARE(processes->verticalScrollBarPolicy(), Qt::ScrollBarAlwaysOff);
+        QCOMPARE(fileSystems->topLevelItemCount(), 5);
+        QCOMPARE(fileSystems->topLevelItem(0)->text(0), QStringLiteral("/"));
+        QCOMPARE(fileSystems->verticalScrollBarPolicy(), Qt::ScrollBarAlwaysOff);
+        QVERIFY(fileSystems->height() >= 24 + fileSystems->topLevelItemCount() * 21);
     }
 
     void parsesLegacyMemoryAvailabilityFallback()
@@ -1926,38 +2015,34 @@ private slots:
         QCOMPARE(hostSearch->geometry().y(), hostAdd->geometry().y());
         QVERIFY(hostAdd->geometry().x() > hostSearch->geometry().x());
 
-        auto *range = window.findChild<QComboBox *>(QStringLiteral("historyRange"));
-        auto *cpuTrend = window.findChild<noxshell::ui::TrendChart *>(QStringLiteral("cpuTrendChart"));
+        auto *systemDetails = window.findChild<noxshell::ui::SystemDetailPanel *>(QStringLiteral("systemDetailPanel"));
+        auto *detailProcesses = window.findChild<QTreeWidget *>(QStringLiteral("realtimeProcessList"));
         auto *metricSummary = window.findChild<QFrame *>(QStringLiteral("monitorMetricSummary"));
         auto *monitorDetails = window.findChild<QWidget *>(QStringLiteral("monitorDetails"));
-        auto *monitorDetailToggle = window.findChild<QToolButton *>(QStringLiteral("monitorTrendToggle"));
-        QVERIFY(range);
-        QVERIFY(cpuTrend);
+        QVERIFY(systemDetails);
+        QVERIFY(detailProcesses);
         QVERIFY(metricSummary);
         QVERIFY(monitorDetails);
-        QVERIFY(monitorDetailToggle);
-        QCOMPARE(metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow")).size(), 4);
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("monitorHeading")));
+        QVERIFY(!window.findChild<QToolButton *>(QStringLiteral("monitorTrendToggle")));
+        QCOMPARE(metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow")).size(), 3);
         for (auto *metricRow : metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow"))) {
-            QCOMPARE(metricRow->height(), 46);
+            QCOMPARE(metricRow->height(), 38);
             auto *progress = metricRow->findChild<QProgressBar *>();
             QVERIFY(progress);
             QCOMPARE(progress->orientation(), Qt::Horizontal);
-            QCOMPARE(progress->height(), 3);
+            QCOMPARE(progress->height(), 24);
+            QVERIFY(progress->isTextVisible());
         }
-        QVERIFY(!monitorDetails->isVisible());
-        QCOMPARE(monitorDetailToggle->text(), QStringLiteral("详细"));
-        QTest::mouseClick(monitorDetailToggle, Qt::LeftButton);
         QVERIFY(monitorDetails->isVisible());
-        QCOMPARE(monitorDetailToggle->text(), QStringLiteral("收起"));
-        QTest::mouseClick(monitorDetailToggle, Qt::LeftButton);
-        QVERIFY(!monitorDetails->isVisible());
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 0);
-        QCOMPARE(range->count(), 3);
+        QVERIFY(!window.findChild<QComboBox *>(QStringLiteral("historyRange")));
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("monitorAlerts")));
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("cpuTrendChart")));
 
         QTest::qWait(350);
         QVERIFY(!window.findChild<QLineEdit *>(QStringLiteral("terminalInput")));
         QVERIFY(!window.findChild<noxshell::ui::TerminalView *>(QStringLiteral("terminalOutput")));
-        QCOMPARE(cpuTrend->pointCount(), 0);
 
         auto *address = window.findChild<QLabel *>(QStringLiteral("serverAddress"));
         auto *onlineBadge = window.findChild<QLabel *>(QStringLiteral("onlineBadge"));
@@ -2009,7 +2094,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(input->isEnabled(), 1000);
         QTRY_VERIFY_WITH_TIMEOUT(!loadingOverlay->isVisible(), 1000);
         QVERIFY(onlineBadge->text().contains(QStringLiteral("在线")));
-        QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 1);
 
         auto *newTabButton = window.findChild<QToolButton *>(QStringLiteral("terminalNewTabButton"));
@@ -2128,7 +2213,7 @@ private slots:
         tabs->setCurrentIndex(0);
         QTRY_COMPARE_WITH_TIMEOUT(currentHostName(), QStringLiteral("prod-web-01"), 1000);
         QCOMPARE(address->text(), QStringLiteral("10.0.0.11"));
-        QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
         QVERIFY(activeFileServer());
         QVERIFY(activeFileServer()->text().contains(QStringLiteral("prod-web-01")));
         auto *firstPath = fileStack->currentWidget()->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
@@ -2140,7 +2225,7 @@ private slots:
         tabs->setCurrentIndex(1);
         QTRY_COMPARE_WITH_TIMEOUT(currentHostName(), QStringLiteral("db-master-01"), 1000);
         QCOMPARE(address->text(), QStringLiteral("10.0.0.21"));
-        QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
         QVERIFY(activeFileServer()->text().contains(QStringLiteral("db-master-01")));
 
         // 左侧主机列表不再兼任标签导航，单击只保留列表选中项。
@@ -2155,7 +2240,7 @@ private slots:
         QVERIFY(secondSession->isConnected());
         QCOMPARE(firstReconnectSpy.count(), 0);
         QCOMPARE(secondReconnectSpy.count(), 0);
-        QTRY_VERIFY_WITH_TIMEOUT(cpuTrend->pointCount() > 0, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
         QVERIFY(activeFileServer()->text().contains(QStringLiteral("prod-web-01")));
         QCOMPARE(fileStack->currentWidget()->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"))->text(),
             QStringLiteral("/var/www/app"));

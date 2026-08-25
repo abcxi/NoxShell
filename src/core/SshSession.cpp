@@ -299,6 +299,7 @@ void SshSession::requestMetrics()
         sample.load1 = 1.02 + static_cast<double>(tick * 9 % 35) / 100.0;
         sample.load5 = 1.08;
         sample.load15 = 0.94;
+        sample.uptimeSeconds = 12ULL * 86400 + 7ULL * 3600 + 23ULL * 60;
         sample.cpuCoreCount = 4;
         sample.primaryDisk.fileSystem = QStringLiteral("/dev/vda1");
         sample.primaryDisk.mountPoint = QStringLiteral("/");
@@ -306,6 +307,23 @@ void SshSession::requestMetrics()
         sample.primaryDisk.usedBytes = 146ULL * 1024 * 1024 * 1024;
         sample.primaryDisk.availableBytes = 54ULL * 1024 * 1024 * 1024;
         sample.primaryDisk.usagePercent = m_profile.state == ServerState::Warning ? 88 : 73;
+        sample.disks = {
+            sample.primaryDisk,
+            {QStringLiteral("tmpfs"), QStringLiteral("/run"), 2ULL * 1024 * 1024 * 1024,
+                72ULL * 1024 * 1024, 1976ULL * 1024 * 1024, 4},
+            {QStringLiteral("tmpfs"), QStringLiteral("/dev/shm"), 8ULL * 1024 * 1024 * 1024,
+                0, 8ULL * 1024 * 1024 * 1024, 0},
+        };
+        sample.networkRates = {
+            {QStringLiteral("lo"), 2048.0, 2048.0},
+            {QStringLiteral("eth0"), 118.0 * 1024.0 + tick * 120.0, 26.0 * 1024.0 + tick * 80.0},
+        };
+        sample.processes = {
+            {1432, QStringLiteral("root"), 23.8, 4.1, 680ULL * 1024 * 1024, QStringLiteral("noxshell-agent")},
+            {986, QStringLiteral("mysql"), 12.4, 18.6, 3ULL * 1024 * 1024 * 1024, QStringLiteral("mysqld")},
+            {2014, QStringLiteral("www"), 5.7, 2.3, 376ULL * 1024 * 1024, QStringLiteral("nginx")},
+            {770, QStringLiteral("root"), 1.2, 0.8, 128ULL * 1024 * 1024, QStringLiteral("sshd")},
+        };
         emit metricSampleReceived(sample);
     });
 }
