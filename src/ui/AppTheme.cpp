@@ -110,6 +110,24 @@ QString applicationStyleSheet()
         QLabel#alertTitle { color: #9A4E1D; font-weight: 650; }
         QLabel#alertText { color: #8A6A54; font-size: 11px; }
         QWidget#terminalOutput { background: #0C1825; border: 0; }
+        QFrame#terminalSearchBar {
+            background: #102A40; border: 1px solid #31506B; border-radius: 5px;
+        }
+        QLineEdit#terminalSearchInput {
+            color: #E8F1F8; background: #0C1825; border: 1px solid #3B5B76;
+            border-radius: 4px; min-height: 25px; padding: 0 7px;
+            selection-color: #17233D; selection-background-color: #FFF36A;
+        }
+        QLineEdit#terminalSearchInput:focus { border-color: #69A8D8; }
+        QLabel#terminalSearchCounter { color: #A9BDCF; font-size: 11px; }
+        QToolButton#terminalSearchPrevious, QToolButton#terminalSearchNext,
+        QToolButton#terminalSearchClose {
+            color: #B8C9D8; background: transparent; border: 0; border-radius: 3px;
+            padding: 0; font-size: 15px;
+        }
+        QToolButton#terminalSearchPrevious:hover, QToolButton#terminalSearchNext:hover,
+        QToolButton#terminalSearchClose:hover { color: white; background: #294159; }
+        QToolButton#terminalSearchPrevious:disabled, QToolButton#terminalSearchNext:disabled { color: #536B80; }
         QWidget#terminalRecentPage { background: #0C1825; }
         QLabel#recentLoginTitle { color: #F2F6FA; font-size: 18px; font-weight: 650; }
         QLabel#recentLoginHint, QLabel#recentLoginEmpty { color: #7F95AA; }

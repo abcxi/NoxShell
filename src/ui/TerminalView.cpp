@@ -5,16 +5,22 @@
 #include <QContextMenuEvent>
 #include <QFontDatabase>
 #include <QFontMetricsF>
+#include <QFrame>
+#include <QHBoxLayout>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QResizeEvent>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QShortcut>
 #include <QStringList>
 #include <QTimer>
+#include <QToolButton>
 #include <QWheelEvent>
 
 #include <utility>
@@ -76,6 +82,12 @@ TerminalView::TerminalView(QWidget *parent)
     m_selectAllAction->setObjectName(QStringLiteral("terminalSelectAllAction"));
     m_selectAllAction->setShortcut(QKeySequence::SelectAll);
     m_selectAllAction->setShortcutVisibleInContextMenu(true);
+    m_contextMenu->addSeparator();
+    m_findAction = m_contextMenu->addAction(QStringLiteral("查找"));
+    m_findAction->setObjectName(QStringLiteral("terminalFindAction"));
+    m_findAction->setText(QStringLiteral("查找\t%1")
+                              .arg(QKeySequence(QKeySequence::Find)
+                                       .toString(QKeySequence::NativeText)));
     connect(m_copyAction, &QAction::triggered, this, [this] {
         copySelection();
         QTimer::singleShot(0, this, [this] { setFocus(); });
@@ -85,6 +97,57 @@ TerminalView::TerminalView(QWidget *parent)
         QTimer::singleShot(0, this, [this] { setFocus(); });
     });
     connect(m_selectAllAction, &QAction::triggered, this, &TerminalView::selectAllText);
+    connect(m_findAction, &QAction::triggered, this, &TerminalView::showSearch);
+
+    m_searchBar = new QFrame(this);
+    m_searchBar->setObjectName(QStringLiteral("terminalSearchBar"));
+    m_searchBar->setCursor(Qt::ArrowCursor);
+    auto *searchLayout = new QHBoxLayout(m_searchBar);
+    searchLayout->setContentsMargins(7, 4, 4, 4);
+    searchLayout->setSpacing(2);
+    m_searchInput = new QLineEdit(m_searchBar);
+    m_searchInput->setObjectName(QStringLiteral("terminalSearchInput"));
+    m_searchInput->setPlaceholderText(QStringLiteral("查找终端内容"));
+    m_searchInput->setClearButtonEnabled(true);
+    m_searchInput->installEventFilter(this);
+    m_searchCounter = new QLabel(QStringLiteral("0 / 0"), m_searchBar);
+    m_searchCounter->setObjectName(QStringLiteral("terminalSearchCounter"));
+    m_searchCounter->setAlignment(Qt::AlignCenter);
+    m_searchCounter->setMinimumWidth(48);
+    m_searchPrevious = new QToolButton(m_searchBar);
+    m_searchPrevious->setObjectName(QStringLiteral("terminalSearchPrevious"));
+    m_searchPrevious->setText(QStringLiteral("↑"));
+    m_searchPrevious->setToolTip(QStringLiteral("上一个匹配（Shift+Enter）"));
+    m_searchNext = new QToolButton(m_searchBar);
+    m_searchNext->setObjectName(QStringLiteral("terminalSearchNext"));
+    m_searchNext->setText(QStringLiteral("↓"));
+    m_searchNext->setToolTip(QStringLiteral("下一个匹配（Enter）"));
+    m_searchClose = new QToolButton(m_searchBar);
+    m_searchClose->setObjectName(QStringLiteral("terminalSearchClose"));
+    m_searchClose->setText(QStringLiteral("×"));
+    m_searchClose->setToolTip(QStringLiteral("关闭查找（Esc）"));
+    for (auto *button : {m_searchPrevious, m_searchNext, m_searchClose}) button->setFixedSize(25, 25);
+    searchLayout->addWidget(m_searchInput, 1);
+    searchLayout->addWidget(m_searchCounter);
+    searchLayout->addWidget(m_searchPrevious);
+    searchLayout->addWidget(m_searchNext);
+    searchLayout->addWidget(m_searchClose);
+    m_searchBar->setFixedHeight(35);
+    m_searchBar->hide();
+
+    connect(m_searchInput, &QLineEdit::textChanged, this, [this] {
+        rebuildSearchMatches(false, true);
+    });
+    connect(m_searchPrevious, &QToolButton::clicked, this, &TerminalView::findPrevious);
+    connect(m_searchNext, &QToolButton::clicked, this, &TerminalView::findNext);
+    connect(m_searchClose, &QToolButton::clicked, this, &TerminalView::hideSearch);
+
+    auto *findNextShortcut = new QShortcut(QKeySequence::FindNext, this);
+    findNextShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(findNextShortcut, &QShortcut::activated, this, &TerminalView::findNext);
+    auto *findPreviousShortcut = new QShortcut(QKeySequence::FindPrevious, this);
+    findPreviousShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(findPreviousShortcut, &QShortcut::activated, this, &TerminalView::findPrevious);
 }
 
 TerminalAppearance TerminalView::defaultAppearance()
@@ -131,6 +194,9 @@ void TerminalView::feedText(const QString &text)
     const bool followBottom = m_scrollBar->value() == m_scrollBar->maximum();
     m_model.feed(text);
     updateScrollBar(followBottom);
+    if (m_searchBar->isVisible() && !m_searchInput->text().isEmpty()) {
+        rebuildSearchMatches(true, false);
+    }
     update();
 }
 
@@ -139,6 +205,7 @@ void TerminalView::clear()
     m_decoder.resetState();
     m_model.clear();
     clearSelection();
+    rebuildSearchMatches(false, false);
     updateScrollBar(true);
     update();
 }
@@ -149,7 +216,9 @@ bool TerminalView::event(QEvent *event)
         auto *keyEvent = static_cast<QKeyEvent *>(event);
         const bool commandModifier = keyEvent->modifiers().testFlag(Qt::MetaModifier)
             || keyEvent->modifiers().testFlag(Qt::ControlModifier);
-        if (commandModifier && (keyEvent->key() == Qt::Key_C || keyEvent->key() == Qt::Key_V)) {
+        if (commandModifier
+            && (keyEvent->key() == Qt::Key_C || keyEvent->key() == Qt::Key_V
+                || keyEvent->key() == Qt::Key_F)) {
             keyEvent->accept();
             return true;
         }
@@ -180,6 +249,29 @@ bool TerminalView::event(QEvent *event)
     return QWidget::event(event);
 }
 
+bool TerminalView::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_searchInput && event->type() == QEvent::KeyPress) {
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        if (keyEvent->key() == Qt::Key_F
+            && (keyEvent->modifiers().testFlag(Qt::MetaModifier)
+                || keyEvent->modifiers().testFlag(Qt::ControlModifier))) {
+            m_searchInput->selectAll();
+            return true;
+        }
+        if (keyEvent->key() == Qt::Key_Escape) {
+            hideSearch();
+            return true;
+        }
+        if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) {
+            if (keyEvent->modifiers().testFlag(Qt::ShiftModifier)) findPrevious();
+            else findNext();
+            return true;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
 void TerminalView::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
@@ -195,8 +287,14 @@ void TerminalView::paintEvent(QPaintEvent *event)
     painter.setRenderHint(QPainter::TextAntialiasing);
 
     const int firstLine = m_scrollBar->value();
+    int visibleMatchIndex = 0;
+    while (visibleMatchIndex < m_searchMatches.size()
+        && m_searchMatches.at(visibleMatchIndex).line < firstLine) {
+        ++visibleMatchIndex;
+    }
     for (int row = 0; row < m_model.rows(); ++row) {
         const int documentLine = firstLine + row;
+        int rowMatchIndex = visibleMatchIndex;
         for (int column = 0; column < m_model.columns(); ++column) {
             const auto &cell = m_model.documentCell(documentLine, column);
             if (cell.wideContinuation) continue;
@@ -208,6 +306,20 @@ void TerminalView::paintEvent(QPaintEvent *event)
                 wide ? m_cellWidth * 2 : m_cellWidth, m_cellHeight);
             if (background != (reverseVideo ? defaultForeground : defaultBackground)) painter.fillRect(cellRect, background);
             if (isSelected(documentLine, column)) painter.fillRect(cellRect, QColor(49, 84, 119, 180));
+            while (rowMatchIndex < m_searchMatches.size()
+                && m_searchMatches.at(rowMatchIndex).line == documentLine
+                && m_searchMatches.at(rowMatchIndex).endColumn <= column) {
+                ++rowMatchIndex;
+            }
+            if (rowMatchIndex < m_searchMatches.size()) {
+                const auto &match = m_searchMatches.at(rowMatchIndex);
+                if (match.line == documentLine && column >= match.startColumn && column < match.endColumn) {
+                    const bool current = rowMatchIndex == m_currentSearchMatch;
+                    painter.fillRect(cellRect, current ? QColor(QStringLiteral("#FFB938"))
+                                                       : QColor(QStringLiteral("#FFF36A")));
+                    foreground = QColor(QStringLiteral("#17233D"));
+                }
+            }
             auto font = m_font;
             font.setBold(cell.bold);
             font.setUnderline(cell.underline);
@@ -215,6 +327,10 @@ void TerminalView::paintEvent(QPaintEvent *event)
             painter.setPen(foreground);
             painter.drawText(QPointF(kContentLeft + column * m_cellWidth,
                 kContentTop + row * m_cellHeight + m_ascent), cell.text);
+        }
+        while (visibleMatchIndex < m_searchMatches.size()
+            && m_searchMatches.at(visibleMatchIndex).line <= documentLine) {
+            ++visibleMatchIndex;
         }
     }
 
@@ -231,7 +347,152 @@ void TerminalView::resizeEvent(QResizeEvent *event)
     QWidget::resizeEvent(event);
     m_scrollBar->setGeometry(width() - kScrollBarWidth, 0, kScrollBarWidth, height());
     m_scrollBar->raise();
+    positionSearchBar();
     updateGridSize();
+}
+
+void TerminalView::positionSearchBar()
+{
+    if (!m_searchBar) return;
+    const int barWidth = qBound(250, width() - 36, 390);
+    m_searchBar->setGeometry(qMax(kContentLeft, width() - kScrollBarWidth - barWidth - 8),
+        kContentTop, barWidth, m_searchBar->height());
+    m_searchBar->raise();
+}
+
+void TerminalView::showSearch()
+{
+    if (!m_searchBar) return;
+    m_searchBar->show();
+    positionSearchBar();
+    rebuildSearchMatches(true, false);
+    m_searchInput->setFocus(Qt::ShortcutFocusReason);
+    m_searchInput->selectAll();
+}
+
+void TerminalView::hideSearch()
+{
+    if (!m_searchBar) return;
+    m_searchBar->hide();
+    m_searchMatches.clear();
+    m_currentSearchMatch = -1;
+    updateSearchCounter();
+    setFocus(Qt::ShortcutFocusReason);
+    update();
+}
+
+int TerminalView::columnForTextOffset(int line, int offset) const
+{
+    if (offset <= 0) return 0;
+    int consumed = 0;
+    for (int column = 0; column < m_model.columns(); ++column) {
+        const auto &cell = m_model.documentCell(line, column);
+        if (cell.wideContinuation) continue;
+        if (consumed >= offset) return column;
+        consumed += cell.text.size();
+        const bool wide = column + 1 < m_model.columns()
+            && m_model.documentCell(line, column + 1).wideContinuation;
+        if (consumed >= offset) return qMin(m_model.columns(), column + (wide ? 2 : 1));
+    }
+    return m_model.columns();
+}
+
+void TerminalView::rebuildSearchMatches(bool preserveCurrent, bool revealCurrent)
+{
+    SearchMatch previous;
+    const bool hadPrevious = preserveCurrent && m_currentSearchMatch >= 0
+        && m_currentSearchMatch < m_searchMatches.size();
+    if (hadPrevious) previous = m_searchMatches.at(m_currentSearchMatch);
+
+    m_searchMatches.clear();
+    const auto query = m_searchInput ? m_searchInput->text() : QString{};
+    if (!query.isEmpty()) {
+        for (int line = 0; line < m_model.documentLineCount(); ++line) {
+            const auto text = m_model.documentLineText(line, false);
+            int offset = 0;
+            while ((offset = text.indexOf(query, offset, Qt::CaseInsensitive)) >= 0) {
+                const int startColumn = columnForTextOffset(line, offset);
+                const int endColumn = columnForTextOffset(line, offset + query.size());
+                if (endColumn > startColumn) m_searchMatches.append({line, startColumn, endColumn});
+                offset += qMax(1, query.size());
+            }
+        }
+    }
+
+    m_currentSearchMatch = -1;
+    if (!m_searchMatches.isEmpty()) {
+        if (hadPrevious) {
+            for (int index = 0; index < m_searchMatches.size(); ++index) {
+                const auto &match = m_searchMatches.at(index);
+                if (match.line == previous.line && match.startColumn == previous.startColumn) {
+                    m_currentSearchMatch = index;
+                    break;
+                }
+            }
+        }
+        if (m_currentSearchMatch < 0) {
+            const int firstVisibleLine = m_scrollBar ? m_scrollBar->value() : 0;
+            for (int index = 0; index < m_searchMatches.size(); ++index) {
+                if (m_searchMatches.at(index).line >= firstVisibleLine) {
+                    m_currentSearchMatch = index;
+                    break;
+                }
+            }
+            if (m_currentSearchMatch < 0) m_currentSearchMatch = 0;
+        }
+    }
+    updateSearchCounter();
+    if (revealCurrent) scrollToCurrentSearchMatch();
+    update();
+}
+
+void TerminalView::updateSearchCounter()
+{
+    if (!m_searchCounter) return;
+    const bool hasMatches = !m_searchMatches.isEmpty() && m_currentSearchMatch >= 0;
+    m_searchCounter->setText(hasMatches
+        ? QStringLiteral("%1 / %2").arg(m_currentSearchMatch + 1).arg(m_searchMatches.size())
+        : QStringLiteral("0 / 0"));
+    if (m_searchPrevious) m_searchPrevious->setEnabled(hasMatches);
+    if (m_searchNext) m_searchNext->setEnabled(hasMatches);
+}
+
+void TerminalView::scrollToCurrentSearchMatch()
+{
+    if (!m_scrollBar || m_currentSearchMatch < 0 || m_currentSearchMatch >= m_searchMatches.size()) return;
+    const int line = m_searchMatches.at(m_currentSearchMatch).line;
+    const int first = m_scrollBar->value();
+    const int last = first + m_model.rows() - 1;
+    if (line < first) m_scrollBar->setValue(line);
+    else if (line > last) m_scrollBar->setValue(line - m_model.rows() + 1);
+}
+
+void TerminalView::findNext()
+{
+    if (!m_searchBar->isVisible()) {
+        showSearch();
+        return;
+    }
+    if (m_searchMatches.isEmpty()) rebuildSearchMatches(false, false);
+    if (m_searchMatches.isEmpty()) return;
+    m_currentSearchMatch = (m_currentSearchMatch + 1) % m_searchMatches.size();
+    updateSearchCounter();
+    scrollToCurrentSearchMatch();
+    update();
+}
+
+void TerminalView::findPrevious()
+{
+    if (!m_searchBar->isVisible()) {
+        showSearch();
+        return;
+    }
+    if (m_searchMatches.isEmpty()) rebuildSearchMatches(false, false);
+    if (m_searchMatches.isEmpty()) return;
+    m_currentSearchMatch = (m_currentSearchMatch - 1 + m_searchMatches.size()) % m_searchMatches.size();
+    updateSearchCounter();
+    scrollToCurrentSearchMatch();
+    update();
 }
 
 void TerminalView::updateGridSize()
@@ -296,6 +557,11 @@ void TerminalView::keyPressEvent(QKeyEvent *event)
     const bool controlModifier = event->modifiers().testFlag(Qt::ControlModifier);
     const bool terminalShortcutModifier = metaModifier
         || (controlModifier && event->modifiers().testFlag(Qt::ShiftModifier));
+    if (event->key() == Qt::Key_F && (metaModifier || controlModifier)) {
+        showSearch();
+        event->accept();
+        return;
+    }
     if (event->key() == Qt::Key_C && (metaModifier || controlModifier)) {
         if (hasSelection()) copySelection();
         else sendInterrupt();

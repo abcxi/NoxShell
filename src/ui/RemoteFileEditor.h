@@ -43,6 +43,7 @@ private:
     void setBusy(Document *document, bool busy, const QString &message);
     void setDirty(Document *document, bool dirty);
     void updateTab(Document *document);
+    void installCloseButton(int index);
     bool requestCloseDocument(int index);
     void removeDocument(int index);
     void maybeFinishWindowClose();

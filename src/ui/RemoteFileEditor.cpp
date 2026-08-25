@@ -11,6 +11,7 @@
 #include <QKeyEvent>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPalette>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -27,6 +28,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 namespace noxshell::ui {
 
@@ -56,16 +58,31 @@ public:
         setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
         setLineWrapMode(QPlainTextEdit::NoWrap);
         setTabStopDistance(fontMetrics().horizontalAdvance(QLatin1Char(' ')) * 4);
+        auto editorPalette = palette();
+        editorPalette.setColor(QPalette::Highlight, QColor(QStringLiteral("#FFB938")));
+        editorPalette.setColor(QPalette::HighlightedText, QColor(QStringLiteral("#17233D")));
+        setPalette(editorPalette);
         connect(this, &QPlainTextEdit::blockCountChanged, this, &CodeEditor::updateLineNumberAreaWidth);
         connect(this, &QPlainTextEdit::updateRequest, this, &CodeEditor::updateLineNumberArea);
-        connect(this, &QPlainTextEdit::cursorPositionChanged, this, &CodeEditor::highlightCurrentLine);
+        connect(this, &QPlainTextEdit::cursorPositionChanged, this, &CodeEditor::updateExtraSelections);
         updateLineNumberAreaWidth();
-        highlightCurrentLine();
+        updateExtraSelections();
     }
 
     void setSaveHandler(std::function<void()> handler) { m_saveHandler = std::move(handler); }
     void setCloseHandler(std::function<void()> handler) { m_closeHandler = std::move(handler); }
     void setFindHandler(std::function<void(bool)> handler) { m_findHandler = std::move(handler); }
+    void setSearchSelections(QList<QTextEdit::ExtraSelection> selections)
+    {
+        m_searchSelections = std::move(selections);
+        updateExtraSelections();
+    }
+    void clearSearchSelections()
+    {
+        if (m_searchSelections.isEmpty()) return;
+        m_searchSelections.clear();
+        updateExtraSelections();
+    }
 
     int lineNumberAreaWidth() const
     {
@@ -198,20 +215,23 @@ private:
         if (rect.contains(viewport()->rect())) updateLineNumberAreaWidth();
     }
 
-    void highlightCurrentLine()
+    void updateExtraSelections()
     {
-        QTextEdit::ExtraSelection selection;
-        selection.format.setBackground(QColor(QStringLiteral("#F3F8FF")));
-        selection.format.setProperty(QTextFormat::FullWidthSelection, true);
-        selection.cursor = textCursor();
-        selection.cursor.clearSelection();
-        setExtraSelections({selection});
+        QTextEdit::ExtraSelection currentLine;
+        currentLine.format.setBackground(QColor(QStringLiteral("#F3F8FF")));
+        currentLine.format.setProperty(QTextFormat::FullWidthSelection, true);
+        currentLine.cursor = textCursor();
+        currentLine.cursor.clearSelection();
+        auto selections = QList<QTextEdit::ExtraSelection>{currentLine};
+        selections.append(m_searchSelections);
+        setExtraSelections(selections);
     }
 
     LineNumberArea *m_lineNumberArea{};
     std::function<void()> m_saveHandler;
     std::function<void()> m_closeHandler;
     std::function<void(bool)> m_findHandler;
+    QList<QTextEdit::ExtraSelection> m_searchSelections;
 };
 
 LineNumberArea::LineNumberArea(CodeEditor *editor)
@@ -275,6 +295,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     layout->setSpacing(0);
     m_tabs = new QTabBar;
     m_tabs->setObjectName(QStringLiteral("remoteFileEditorTabs"));
+    m_tabs->setFixedHeight(30);
     m_tabs->setExpanding(false);
     m_tabs->setMovable(true);
     m_tabs->setTabsClosable(true);
@@ -282,9 +303,12 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     m_tabs->setElideMode(Qt::ElideMiddle);
     m_tabs->setStyleSheet(QStringLiteral(
         "QTabBar{background:#F4F6F8;border-bottom:1px solid #DCE3EA;}"
-        "QTabBar::tab{min-width:150px;max-width:260px;height:37px;padding:0 9px;color:#44566C;background:#F4F6F8;}"
+        "QTabBar::tab{min-width:150px;max-width:260px;min-height:28px;max-height:28px;padding:0 6px;color:#44566C;background:#F4F6F8;}"
         "QTabBar::tab:selected{background:#FFFFFF;color:#172B43;font-weight:650;border-bottom:2px solid #1684FF;}"
-        "QTabBar::tab:hover:!selected{background:#EAF0F6;}"));
+        "QTabBar::tab:hover:!selected{background:#EAF0F6;}"
+        "QWidget#remoteFileTabCloseContainer{background:transparent;}"
+        "QToolButton#remoteFileTabCloseButton{color:#718398;background:transparent;border:0;border-radius:3px;font-size:15px;padding:0;}"
+        "QToolButton#remoteFileTabCloseButton:hover{color:#172B43;background:#DCE7F2;}"));
 
     m_findPanel = new QFrame;
     m_findPanel->setObjectName(QStringLiteral("remoteFileFindPanel"));
@@ -524,12 +548,14 @@ void RemoteFileEditor::openFile(const QString &remotePath)
     m_documents.append(document);
     m_tabs->setTabToolTip(index, remotePath);
     updateTab(document);
+    installCloseButton(index);
     m_tabs->setCurrentIndex(index);
 
     connect(document->editor, &QPlainTextEdit::textChanged, document->page, [this, document] {
         if (!document->loaded || document->busy) return;
         setDirty(document, true);
         document->status->setText(QStringLiteral("%1 · 有未保存的修改 · Cmd/Ctrl+S 保存").arg(document->path));
+        if (document == activeDocument() && m_findPanel->isVisible()) updateFindStatus();
     });
     document->editor->setSaveHandler([this, document] { saveDocument(document); });
     document->editor->setCloseHandler([this, document] {
@@ -601,6 +627,9 @@ void RemoteFileEditor::hideFindPanel()
 {
     if (!m_findPanel) return;
     m_findPanel->hide();
+    for (auto *document : std::as_const(m_documents)) {
+        if (document && document->editor) document->editor->clearSearchSelections();
+    }
     if (auto *document = activeDocument(); document && document->editor) document->editor->setFocus();
 }
 
@@ -632,7 +661,11 @@ void RemoteFileEditor::updateFindStatus()
     if (!m_findStatus || !m_findEdit) return;
     auto *document = activeDocument();
     const auto needle = m_findEdit->text();
+    for (auto *candidate : std::as_const(m_documents)) {
+        if (candidate != document && candidate && candidate->editor) candidate->editor->clearSearchSelections();
+    }
     if (!document || !document->editor || needle.isEmpty()) {
+        if (document && document->editor) document->editor->clearSearchSelections();
         m_findStatus->setText(QStringLiteral("0 / 0"));
         m_findStatus->setStyleSheet(QStringLiteral("color:#738297;"));
         return;
@@ -645,16 +678,25 @@ void RemoteFileEditor::updateFindStatus()
     scan.movePosition(QTextCursor::Start);
     int total = 0;
     int current = 0;
+    QList<QTextEdit::ExtraSelection> highlights;
     while (true) {
         const auto match = document->editor->document()->find(needle, scan, flags);
         if (match.isNull()) break;
         ++total;
-        if (match.selectionStart() == selectedCursor.selectionStart()
-            && match.selectionEnd() == selectedCursor.selectionEnd()) {
+        const bool isCurrent = match.selectionStart() == selectedCursor.selectionStart()
+            && match.selectionEnd() == selectedCursor.selectionEnd();
+        if (isCurrent) {
             current = total;
         }
+        QTextEdit::ExtraSelection highlight;
+        highlight.cursor = match;
+        highlight.format.setBackground(QColor(isCurrent ? QStringLiteral("#FFB938")
+                                                        : QStringLiteral("#FFF36A")));
+        highlight.format.setForeground(QColor(QStringLiteral("#17233D")));
+        highlights.append(highlight);
         scan.setPosition(match.selectionEnd());
     }
+    document->editor->setSearchSelections(std::move(highlights));
     if (total == 0) {
         m_findStatus->setText(QStringLiteral("无匹配"));
         m_findStatus->setStyleSheet(QStringLiteral("color:#D54941;"));
@@ -699,6 +741,7 @@ void RemoteFileEditor::replaceAll()
         ++replacements;
     }
     edit.endEditBlock();
+    updateFindStatus();
     m_findStatus->setText(QStringLiteral("已替换 %1 处").arg(replacements));
     m_findStatus->setStyleSheet(QStringLiteral("color:#008858;"));
 }
@@ -769,6 +812,38 @@ void RemoteFileEditor::updateTab(Document *document)
     m_tabs->setTabText(index, QStringLiteral("%1 · %2").arg(m_serverName, QFileInfo(document->path).fileName()));
     m_tabs->setTabIcon(index, document->dirty ? dirtyIcon() : QIcon{});
     m_tabs->setTabToolTip(index, document->path);
+}
+
+void RemoteFileEditor::installCloseButton(int index)
+{
+    if (index < 0 || index >= m_tabs->count()) return;
+
+    auto *nativeLeftButton = m_tabs->tabButton(index, QTabBar::LeftSide);
+    auto *nativeRightButton = m_tabs->tabButton(index, QTabBar::RightSide);
+    auto *container = new QWidget(m_tabs);
+    container->setObjectName(QStringLiteral("remoteFileTabCloseContainer"));
+    container->setFixedSize(25, 22);
+    auto *containerLayout = new QHBoxLayout(container);
+    containerLayout->setContentsMargins(1, 0, 5, 0);
+    containerLayout->setSpacing(0);
+    auto *closeButton = new QToolButton(container);
+    closeButton->setObjectName(QStringLiteral("remoteFileTabCloseButton"));
+    closeButton->setText(QString::fromUtf8("×"));
+    closeButton->setToolTip(QStringLiteral("关闭标签"));
+    closeButton->setFixedSize(19, 19);
+    containerLayout->addWidget(closeButton);
+    m_tabs->setTabButton(index, QTabBar::LeftSide, nullptr);
+    m_tabs->setTabButton(index, QTabBar::RightSide, container);
+    if (nativeLeftButton && nativeLeftButton != container) nativeLeftButton->deleteLater();
+    if (nativeRightButton && nativeRightButton != container) nativeRightButton->deleteLater();
+
+    connect(closeButton, &QToolButton::clicked, this, [this, container] {
+        for (int candidate = 0; candidate < m_tabs->count(); ++candidate) {
+            if (m_tabs->tabButton(candidate, QTabBar::RightSide) != container) continue;
+            requestCloseDocument(candidate);
+            return;
+        }
+    });
 }
 
 bool RemoteFileEditor::requestCloseDocument(int index)

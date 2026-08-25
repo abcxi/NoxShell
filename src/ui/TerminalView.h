@@ -9,7 +9,11 @@
 class QScrollBar;
 class QAction;
 class QContextMenuEvent;
+class QFrame;
+class QLabel;
+class QLineEdit;
 class QMenu;
+class QToolButton;
 
 namespace noxshell::ui {
 
@@ -43,6 +47,14 @@ public:
     [[nodiscard]] int rows() const { return m_model.rows(); }
     [[nodiscard]] QSizeF cellSize() const { return {m_cellWidth, m_cellHeight}; }
     [[nodiscard]] QPointF contentOrigin() const;
+    [[nodiscard]] int searchMatchCount() const { return m_searchMatches.size(); }
+    [[nodiscard]] int currentSearchMatch() const { return m_currentSearchMatch; }
+
+public slots:
+    void showSearch();
+    void hideSearch();
+    void findNext();
+    void findPrevious();
 
 signals:
     void inputGenerated(const QByteArray &data);
@@ -51,6 +63,7 @@ signals:
 
 protected:
     bool event(QEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
@@ -66,7 +79,18 @@ protected:
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
 
 private:
+    struct SearchMatch {
+        int line{};
+        int startColumn{};
+        int endColumn{};
+    };
+
     void updateGridSize();
+    void positionSearchBar();
+    void rebuildSearchMatches(bool preserveCurrent, bool revealCurrent);
+    void updateSearchCounter();
+    void scrollToCurrentSearchMatch();
+    [[nodiscard]] int columnForTextOffset(int line, int offset) const;
     void sendPaste(const QString &text);
     void sendInterrupt();
     void copySelection();
@@ -94,9 +118,18 @@ private:
     bool m_tabKeyDown{false};
     QScrollBar *m_scrollBar{};
     QMenu *m_contextMenu{};
+    QAction *m_findAction{};
     QAction *m_copyAction{};
     QAction *m_pasteAction{};
     QAction *m_selectAllAction{};
+    QFrame *m_searchBar{};
+    QLineEdit *m_searchInput{};
+    QLabel *m_searchCounter{};
+    QToolButton *m_searchPrevious{};
+    QToolButton *m_searchNext{};
+    QToolButton *m_searchClose{};
+    QVector<SearchMatch> m_searchMatches;
+    int m_currentSearchMatch{-1};
     QPoint m_selectionAnchor{-1, -1};
     QPoint m_selectionCursor{-1, -1};
     bool m_selecting{false};

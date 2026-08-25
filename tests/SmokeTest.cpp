@@ -151,6 +151,68 @@ private slots:
         QVERIFY(!sizeSpy.isEmpty());
     }
 
+    void terminalViewSearchesHighlightsAndNavigatesOutput()
+    {
+        noxshell::ui::TerminalView view;
+        view.resize(640, 220);
+        view.show();
+        view.feedText(QStringLiteral("first needle result\r\nsecond line\r\nthird NEEDLE result"));
+        QTest::qWait(20);
+
+#ifdef Q_OS_MAC
+        QTest::keyClick(&view, Qt::Key_F, Qt::MetaModifier);
+#else
+        QTest::keyClick(&view, Qt::Key_F, Qt::ControlModifier);
+#endif
+        QCoreApplication::processEvents();
+        auto *searchInput = view.findChild<QLineEdit *>(QStringLiteral("terminalSearchInput"));
+        auto *counter = view.findChild<QLabel *>(QStringLiteral("terminalSearchCounter"));
+        auto *previous = view.findChild<QToolButton *>(QStringLiteral("terminalSearchPrevious"));
+        auto *next = view.findChild<QToolButton *>(QStringLiteral("terminalSearchNext"));
+        auto *close = view.findChild<QToolButton *>(QStringLiteral("terminalSearchClose"));
+        QVERIFY(searchInput);
+        QVERIFY(counter);
+        QVERIFY(previous);
+        QVERIFY(next);
+        QVERIFY(close);
+        QVERIFY(searchInput->isVisible());
+
+        searchInput->setText(QStringLiteral("needle"));
+        QCOMPARE(view.searchMatchCount(), 2);
+        QCOMPARE(view.currentSearchMatch(), 0);
+        QCOMPARE(counter->text(), QStringLiteral("1 / 2"));
+
+        QImage rendered(view.size(), QImage::Format_ARGB32);
+        view.render(&rendered);
+        bool foundHighlight = false;
+        for (int y = 0; y < rendered.height() && !foundHighlight; ++y) {
+            for (int x = 0; x < rendered.width(); ++x) {
+                const auto color = rendered.pixelColor(x, y);
+                if (color == QColor(QStringLiteral("#FFB938"))
+                    || color == QColor(QStringLiteral("#FFF36A"))) {
+                    foundHighlight = true;
+                    break;
+                }
+            }
+        }
+        QVERIFY(foundHighlight);
+
+        QTest::mouseClick(next, Qt::LeftButton);
+        QCOMPARE(view.currentSearchMatch(), 1);
+        QCOMPARE(counter->text(), QStringLiteral("2 / 2"));
+        QTest::mouseClick(previous, Qt::LeftButton);
+        QCOMPARE(view.currentSearchMatch(), 0);
+
+        searchInput->setText(QStringLiteral("not present"));
+        QCOMPARE(view.searchMatchCount(), 0);
+        QCOMPARE(counter->text(), QStringLiteral("0 / 0"));
+        QVERIFY(!previous->isEnabled());
+        QVERIFY(!next->isEnabled());
+
+        QTest::mouseClick(close, Qt::LeftButton);
+        QVERIFY(!searchInput->isVisible());
+    }
+
     void terminalViewSendsTabOncePerPhysicalKeyPress()
     {
         noxshell::ui::TerminalView view;
@@ -1358,6 +1420,15 @@ private slots:
         QCOMPARE(editorTabs->count(), 1);
         QVERIFY(editorTabs->tabText(0).contains(QStringLiteral("demo-sftp")));
         QVERIFY(editorTabs->tabText(0).contains(firstFileName));
+        QCOMPARE(editorTabs->height(), 30);
+        QVERIFY(!editorTabs->tabButton(0, QTabBar::LeftSide));
+        auto *firstEditorCloseContainer = editorTabs->tabButton(0, QTabBar::RightSide);
+        QVERIFY(firstEditorCloseContainer);
+        auto *firstEditorCloseButton = firstEditorCloseContainer->findChild<QToolButton *>(
+            QStringLiteral("remoteFileTabCloseButton"));
+        QVERIFY(firstEditorCloseButton);
+        QVERIFY(firstEditorCloseButton->mapTo(editorTabs, firstEditorCloseButton->rect().center()).x()
+            > editorTabs->tabRect(0).center().x());
         QTRY_VERIFY_WITH_TIMEOUT(editorText->isEnabled(), 1000);
         QVERIFY(!editorText->toPlainText().isEmpty());
         QVERIFY(!findPanel->isVisible());
@@ -1377,6 +1448,16 @@ private slots:
         QVERIFY(!replaceRow->isVisible());
         findEdit->setText(QStringLiteral("alpha"));
         QTRY_COMPARE_WITH_TIMEOUT(findStatus->text(), QStringLiteral("1 / 2"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(editorText->extraSelections().size(), 3, 1000);
+        int allMatchHighlights = 0;
+        int currentMatchHighlights = 0;
+        for (const auto &selection : editorText->extraSelections()) {
+            const auto background = selection.format.background().color();
+            if (background == QColor(QStringLiteral("#FFF36A"))) ++allMatchHighlights;
+            if (background == QColor(QStringLiteral("#FFB938"))) ++currentMatchHighlights;
+        }
+        QCOMPARE(allMatchHighlights, 1);
+        QCOMPARE(currentMatchHighlights, 1);
         QTest::mouseClick(findNext, Qt::LeftButton);
         QCOMPARE(findStatus->text(), QStringLiteral("2 / 2"));
         QTest::keyClick(findEdit, Qt::Key_F, Qt::MetaModifier | Qt::AltModifier);
@@ -1393,6 +1474,7 @@ private slots:
         QVERIFY(!editorTabs->tabIcon(0).isNull());
         QTest::mouseClick(findClose, Qt::LeftButton);
         QVERIFY(!findPanel->isVisible());
+        QCOMPARE(editorText->extraSelections().size(), 1);
 
         editorText->setPlainText(QStringLiteral("edited from standalone editor\n"));
         QVERIFY(!editorTabs->tabIcon(0).isNull());
@@ -1425,6 +1507,8 @@ private slots:
         QCOMPARE(panel.findChildren<noxshell::ui::RemoteFileEditor *>().size(), 1);
         QVERIFY(editorTabs->tabText(1).contains(QStringLiteral("demo-sftp")));
         QVERIFY(editorTabs->tabText(1).contains(secondFileName));
+        QVERIFY(!editorTabs->tabButton(1, QTabBar::LeftSide));
+        QVERIFY(editorTabs->tabButton(1, QTabBar::RightSide));
         fileEditor->close();
 
         QTreeWidgetItem *varDirectory = nullptr;
