@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.56 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.57 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -59,6 +59,8 @@ set(NOXSHELL_CORE_SOURCES
     src/core/MetricHistory.h
     src/core/MonitoringData.h
     src/core/RemoteFileEntry.h
+    src/core/RdpLauncher.cpp
+    src/core/RdpLauncher.h
     src/core/ServerProfile.h
     src/core/ServerRepository.cpp
     src/core/ServerRepository.h
@@ -89,6 +91,10 @@ qt_add_executable(NoxShell
     src/ui/MetricCard.h
     src/ui/RemoteFileEditor.cpp
     src/ui/RemoteFileEditor.h
+    src/ui/RdpDialog.cpp
+    src/ui/RdpDialog.h
+    src/ui/SearchMarkerScrollBar.cpp
+    src/ui/SearchMarkerScrollBar.h
     src/ui/ServerDialog.cpp
     src/ui/ServerDialog.h
     src/ui/SystemDetailPanel.cpp
@@ -140,6 +146,10 @@ if(BUILD_TESTING)
         src/ui/MetricCard.h
         src/ui/RemoteFileEditor.cpp
         src/ui/RemoteFileEditor.h
+        src/ui/RdpDialog.cpp
+        src/ui/RdpDialog.h
+        src/ui/SearchMarkerScrollBar.cpp
+        src/ui/SearchMarkerScrollBar.h
         src/ui/ServerDialog.cpp
         src/ui/ServerDialog.h
         src/ui/SystemDetailPanel.cpp
@@ -206,7 +216,7 @@ endif()
 set(CPACK_PACKAGE_NAME "NoxShell")
 set(CPACK_PACKAGE_VENDOR "NoxShell")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "玄壳 SSH 远程服务器管理桌面应用")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "玄壳 SSH 与 Windows 远程桌面管理应用")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "NoxShell")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 set(CPACK_MONOLITHIC_INSTALL ON)

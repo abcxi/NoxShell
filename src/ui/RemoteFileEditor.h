@@ -7,6 +7,7 @@ class QCloseEvent;
 class QEvent;
 class QLabel;
 class QLineEdit;
+class QShortcut;
 class QStackedWidget;
 class QTabBar;
 class QToolButton;
@@ -65,6 +66,7 @@ private:
     QLabel *m_findStatus{};
     QToolButton *m_caseSensitive{};
     QToolButton *m_replaceToggle{};
+    QShortcut *m_hideFindShortcut{};
     QVector<Document *> m_documents;
     bool m_closeAfterAllSaved{false};
 };

@@ -44,6 +44,8 @@ signals:
     void groupDeleteRequested(const QString &name);
     void addServerRequested();
     void addServerInGroupRequested(const QString &group);
+    void addRdpServerRequested();
+    void addRdpServerInGroupRequested(const QString &group);
     void collapseRequested();
 
 private:
@@ -59,6 +61,8 @@ private:
     QTreeWidget *m_list{};
     QMenu *m_contextMenu{};
     QMenu *m_moveMenu{};
+    QMenu *m_addConnectionMenu{};
+    QMenu *m_newConnectionMenu{};
     QAction *m_connectAction{};
     QAction *m_editAction{};
     QAction *m_duplicateAction{};
@@ -66,6 +70,10 @@ private:
     QAction *m_deleteAction{};
     QAction *m_newGroupAction{};
     QAction *m_newConnectionAction{};
+    QAction *m_addSshAction{};
+    QAction *m_addRdpAction{};
+    QAction *m_newSshConnectionAction{};
+    QAction *m_newRdpConnectionAction{};
     QAction *m_renameGroupAction{};
     QAction *m_deleteGroupAction{};
     QVector<ServerProfile> m_servers;

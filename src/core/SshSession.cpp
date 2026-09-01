@@ -293,6 +293,7 @@ void SshSession::requestMetrics()
         sample.cpuReady = true;
         sample.cpuPercent = 38.0 + (tick * 7 % 13);
         sample.kernelPercent = 7.2 + (tick * 3 % 4);
+        sample.cpuCorePercents = {31.0 + tick, 46.0 + tick, 24.0 + tick, 39.0 + tick};
         sample.memoryTotalBytes = 16ULL * 1024 * 1024 * 1024;
         sample.memoryPercent = 66.0 + (tick * 3 % 5);
         sample.memoryUsedBytes = static_cast<quint64>(sample.memoryTotalBytes * sample.memoryPercent / 100.0);

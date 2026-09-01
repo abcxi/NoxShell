@@ -55,6 +55,7 @@ struct LinuxProcessUsage {
 struct LinuxMetricsSnapshot {
     QDateTime capturedAt;
     LinuxCpuTimes cpu;
+    QVector<LinuxCpuTimes> cpuCores;
     quint64 memoryTotalBytes{};
     quint64 memoryAvailableBytes{};
     double load1{};
@@ -72,6 +73,7 @@ struct MetricSample {
     bool cpuReady{false};
     double cpuPercent{};
     double kernelPercent{};
+    QVector<double> cpuCorePercents;
     quint64 memoryTotalBytes{};
     quint64 memoryUsedBytes{};
     double memoryPercent{};

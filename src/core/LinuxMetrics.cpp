@@ -34,6 +34,41 @@ void setError(QString *error, const QString &message)
 {
     if (error) *error = message;
 }
+
+bool parseCpuTimes(const QList<QByteArray> &parts, LinuxCpuTimes &times)
+{
+    if (parts.size() < 5) return false;
+    bool ok = true;
+    auto value = [&parts, &ok](qsizetype index) {
+        if (index >= parts.size()) return quint64{0};
+        bool fieldOk = false;
+        const auto parsed = parts.at(index).toULongLong(&fieldOk);
+        ok = ok && fieldOk;
+        return parsed;
+    };
+    times.user = value(1);
+    times.nice = value(2);
+    times.system = value(3);
+    times.idle = value(4);
+    times.ioWait = value(5);
+    times.irq = value(6);
+    times.softIrq = value(7);
+    times.steal = value(8);
+    return ok;
+}
+
+bool cpuUsage(const LinuxCpuTimes &current, const LinuxCpuTimes &previous, double &usage)
+{
+    const auto totalNow = current.total();
+    const auto totalBefore = previous.total();
+    const auto idleNow = current.idleTotal();
+    const auto idleBefore = previous.idleTotal();
+    if (totalNow <= totalBefore || idleNow < idleBefore) return false;
+    const auto totalDelta = totalNow - totalBefore;
+    const auto idleDelta = qMin(totalDelta, idleNow - idleBefore);
+    usage = 100.0 * static_cast<double>(totalDelta - idleDelta) / static_cast<double>(totalDelta);
+    return true;
+}
 } // namespace
 
 quint64 LinuxCpuTimes::total() const
@@ -103,24 +138,13 @@ bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &
         const auto parts = fields(line);
         switch (section) {
         case Section::Cpu: {
-            if (parts.size() < 5 || parts.first() != "cpu") break;
-            bool ok = true;
-            auto value = [&parts, &ok](qsizetype index) {
-                if (index >= parts.size()) return quint64{0};
-                bool fieldOk = false;
-                const auto parsed = parts.at(index).toULongLong(&fieldOk);
-                ok = ok && fieldOk;
-                return parsed;
-            };
-            snapshot.cpu.user = value(1);
-            snapshot.cpu.nice = value(2);
-            snapshot.cpu.system = value(3);
-            snapshot.cpu.idle = value(4);
-            snapshot.cpu.ioWait = value(5);
-            snapshot.cpu.irq = value(6);
-            snapshot.cpu.softIrq = value(7);
-            snapshot.cpu.steal = value(8);
-            hasCpu = ok;
+            if (parts.isEmpty()) break;
+            if (parts.first() == "cpu") {
+                hasCpu = parseCpuTimes(parts, snapshot.cpu);
+            } else if (parts.first().startsWith("cpu")) {
+                LinuxCpuTimes core;
+                if (parseCpuTimes(parts, core)) snapshot.cpuCores.append(core);
+            }
             break;
         }
         case Section::Memory: {
@@ -302,6 +326,15 @@ MetricSample LinuxMetricsParser::calculate(const LinuxMetricsSnapshot &current, 
                 sample.kernelPercent = 100.0 * static_cast<double>(qMin(totalDelta, kernelNow - kernelBefore)) / static_cast<double>(totalDelta);
             }
             sample.cpuReady = true;
+        }
+
+        const int coreCount = qMin(current.cpuCores.size(), previous->cpuCores.size());
+        sample.cpuCorePercents.reserve(coreCount);
+        for (int index = 0; index < coreCount; ++index) {
+            double usage = 0.0;
+            if (cpuUsage(current.cpuCores.at(index), previous->cpuCores.at(index), usage)) {
+                sample.cpuCorePercents.append(qBound(0.0, usage, 100.0));
+            }
         }
 
         const auto elapsedMilliseconds = previous->capturedAt.msecsTo(current.capturedAt);

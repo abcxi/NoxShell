@@ -65,7 +65,7 @@ signals:
     void remoteFileWriteFailed(quint64 requestId, const QString &path, const QString &message);
 
 private slots:
-    void drainChannel();
+    bool drainChannel();
 
 private:
     void fail(const QString &stage, const QString &detail);

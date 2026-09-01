@@ -3,19 +3,22 @@
 #include "VtTerminalModel.h"
 
 #include <QPointF>
+#include <QRectF>
 #include <QStringDecoder>
 #include <QWidget>
 
-class QScrollBar;
 class QAction;
 class QContextMenuEvent;
 class QFrame;
+class QImage;
 class QLabel;
 class QLineEdit;
 class QMenu;
 class QToolButton;
 
 namespace noxshell::ui {
+
+class SearchMarkerScrollBar;
 
 struct TerminalAppearance {
     QString fontFamily;
@@ -72,6 +75,7 @@ protected:
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void focusInEvent(QFocusEvent *event) override;
     void focusOutEvent(QFocusEvent *event) override;
@@ -85,11 +89,28 @@ private:
         int endColumn{};
     };
 
+    struct CommandBlock {
+        int startLine{-1};
+        int endLine{-1};
+        QRectF visibleRect;
+
+        [[nodiscard]] bool isValid() const { return startLine >= 0 && endLine >= startLine; }
+    };
+
     void updateGridSize();
     void positionSearchBar();
     void rebuildSearchMatches(bool preserveCurrent, bool revealCurrent);
     void updateSearchCounter();
+    void updateSearchMarkers();
     void scrollToCurrentSearchMatch();
+    void updateHoveredCommandBlock(const QPointF &position);
+    void clearHoveredCommandBlock();
+    void positionCommandBlockTools();
+    void copyHoveredCommandBlockText();
+    void copyHoveredCommandBlockImage();
+    [[nodiscard]] CommandBlock commandBlockAt(const QPointF &position) const;
+    [[nodiscard]] QString commandBlockText(const CommandBlock &block) const;
+    [[nodiscard]] QImage commandBlockImage(const CommandBlock &block) const;
     [[nodiscard]] int columnForTextOffset(int line, int offset) const;
     void sendPaste(const QString &text);
     void sendInterrupt();
@@ -116,7 +137,7 @@ private:
     qreal m_ascent{};
     bool m_hasFocus{false};
     bool m_tabKeyDown{false};
-    QScrollBar *m_scrollBar{};
+    SearchMarkerScrollBar *m_scrollBar{};
     QMenu *m_contextMenu{};
     QAction *m_findAction{};
     QAction *m_copyAction{};
@@ -128,6 +149,9 @@ private:
     QToolButton *m_searchPrevious{};
     QToolButton *m_searchNext{};
     QToolButton *m_searchClose{};
+    QFrame *m_commandBlockTools{};
+    QToolButton *m_copyCommandBlockText{};
+    QToolButton *m_copyCommandBlockImage{};
     QVector<SearchMatch> m_searchMatches;
     int m_currentSearchMatch{-1};
     QPoint m_selectionAnchor{-1, -1};
@@ -137,6 +161,8 @@ private:
     QString m_pendingCommand;
     int m_pendingCommandCursor{};
     bool m_commandTrackingReliable{true};
+    CommandBlock m_hoveredCommandBlock;
+    QPointF m_lastMousePosition{-1, -1};
 };
 
 } // namespace noxshell::ui

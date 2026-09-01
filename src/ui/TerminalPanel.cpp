@@ -11,6 +11,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QProgressBar>
+#include <QShortcut>
 #include <QStackedLayout>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -83,6 +84,10 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
 
     m_commandHistory = new CommandHistoryPanel(repository);
     m_commandHistory->hide();
+    auto *closeTransientShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    closeTransientShortcut->setObjectName(QStringLiteral("terminalCloseTransientShortcut"));
+    closeTransientShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    closeTransientShortcut->setEnabled(false);
 
     auto *inputRow = new QWidget;
     inputRow->setObjectName(QStringLiteral("terminalInputRow"));
@@ -138,13 +143,22 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
         m_historyButton->setToolTip(visible ? QStringLiteral("收起命令历史")
                                             : QStringLiteral("命令历史与收藏"));
     });
+    connect(m_historyButton, &QToolButton::toggled,
+        closeTransientShortcut, &QShortcut::setEnabled);
+    connect(closeTransientShortcut, &QShortcut::activated, this, [this] {
+        if (m_commandHistory && m_commandHistory->isVisible()) m_historyButton->setChecked(false);
+    });
     connect(m_commandHistory, &CommandHistoryPanel::closeRequested, this, [this] {
         m_historyButton->setChecked(false);
     });
     connect(m_commandHistory, &CommandHistoryPanel::commandSelected, this, [this](const QString &command) {
+        // Selecting from history is an editing action, not execution. Replace
+        // any draft already in the input, then close the history drawer so the
+        // user can review or modify the selected command before pressing Enter.
         m_input->setText(command);
         m_input->setFocus();
         m_input->setCursorPosition(m_input->text().size());
+        m_historyButton->setChecked(false);
     });
     connect(m_commandHistory, &CommandHistoryPanel::commandExecutionRequested, this, [this](const QString &command) {
         if (!m_session || !m_session->isConnected()) return;

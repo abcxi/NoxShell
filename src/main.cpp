@@ -5,7 +5,10 @@
 #include <QApplication>
 #include <QFont>
 #include <QIcon>
+#include <QTemporaryDir>
 #include <QTimer>
+
+#include <memory>
 
 #ifndef NOXSHELL_APP_VERSION
 #define NOXSHELL_APP_VERSION "0.0.0"
@@ -21,11 +24,17 @@ int main(int argc, char *argv[])
     noxshell::AppLogger::install();
     qInfo().noquote() << QStringLiteral("玄壳 %1 启动，日志：%2")
         .arg(QApplication::applicationVersion(), noxshell::AppLogger::logFilePath());
-    app.setStyleSheet(noxshell::ui::applicationStyleSheet());
+    noxshell::ui::applyApplicationTheme(noxshell::ui::storedThemeMode());
 
-    noxshell::ui::MainWindow window;
-    window.show();
     const auto screenshotPath = qEnvironmentVariable("NOXSHELL_SCREENSHOT_PATH");
+    std::unique_ptr<QTemporaryDir> screenshotData;
+    QString screenshotDatabase;
+    if (!screenshotPath.isEmpty()) {
+        screenshotData = std::make_unique<QTemporaryDir>();
+        if (screenshotData->isValid()) screenshotDatabase = screenshotData->filePath(QStringLiteral("screenshot.sqlite3"));
+    }
+    noxshell::ui::MainWindow window(screenshotDatabase);
+    window.show();
     if (!screenshotPath.isEmpty()) {
         QTimer::singleShot(1000, &app, [&app, &window, screenshotPath] {
             const auto saved = window.grab().save(screenshotPath);

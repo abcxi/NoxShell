@@ -66,6 +66,8 @@ private:
     void finishRemovalBatch();
     void changeSelectedPermissions();
     void updateActionState();
+    void showFileLoading(const QString &detail);
+    void hideFileLoading();
     [[nodiscard]] QTreeWidgetItem *selectedEntry() const;
     [[nodiscard]] QList<QTreeWidgetItem *> selectedEntries() const;
     static QString normalizePath(const QString &path);
@@ -76,6 +78,8 @@ private:
     QLineEdit *m_pathEdit{};
     QTreeWidget *m_directoryTree{};
     QTreeWidget *m_tree{};
+    QWidget *m_fileLoadingOverlay{};
+    QLabel *m_fileLoadingDetail{};
     QToolButton *m_backButton{};
     QToolButton *m_upButton{};
     QToolButton *m_refreshButton{};

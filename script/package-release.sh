@@ -83,9 +83,12 @@ case "$(uname -s)" in
 
         readonly DMG_ROOT="${STAGE_DIR}/dmg-root"
         readonly DMG_PATH="${OUTPUT_DIR}/玄壳-v${VERSION}-macOS-${ARCH}.dmg"
+        readonly REPAIR_TOOL="${PROJECT_DIR}/packaging/macos/一键修复玄壳.command"
+        [[ -f "${REPAIR_TOOL}" ]] || { printf '缺少 macOS 一键修复工具：%s\n' "${REPAIR_TOOL}" >&2; exit 1; }
         mkdir -p "${DMG_ROOT}"
         ditto "${APP_PATH}" "${DMG_ROOT}/玄壳.app"
         ln -s /Applications "${DMG_ROOT}/Applications"
+        install -m 0755 "${REPAIR_TOOL}" "${DMG_ROOT}/一键修复玄壳.command"
         hdiutil create -quiet -ov -volname "玄壳" -fs HFS+ -format ULMO \
             -srcfolder "${DMG_ROOT}" "${DMG_PATH}"
 

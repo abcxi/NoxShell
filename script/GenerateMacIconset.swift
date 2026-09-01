@@ -26,6 +26,14 @@ let variants: [(Int, String)] = [
     (1024, "icon_512x512@2x.png"),
 ]
 
+// Legacy .icns files are rendered as precomposed artwork. Keep the visible
+// rounded rectangle inside the macOS icon grid instead of stretching it to
+// the full bitmap like a Windows icon. The source already contains a small
+// transparent edge. Because this dark, high-contrast artwork has more visual
+// weight than light system icons, use an 11% canvas inset on every side; its
+// visible footprint is then roughly 71% of the 1024px canvas.
+let macOSCanvasInsetRatio = 0.11
+
 try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 for (pixels, filename) in variants {
     guard let bitmap = NSBitmapImageRep(
@@ -52,8 +60,11 @@ for (pixels, filename) in variants {
     }
     NSGraphicsContext.current = context
     context.imageInterpolation = .high
+    let inset = CGFloat(pixels) * macOSCanvasInsetRatio
     sourceImage.draw(
-        in: NSRect(x: 0, y: 0, width: pixels, height: pixels),
+        in: NSRect(x: inset, y: inset,
+                   width: CGFloat(pixels) - inset * 2,
+                   height: CGFloat(pixels) - inset * 2),
         from: NSRect(origin: .zero, size: sourceImage.size),
         operation: .copy,
         fraction: 1.0

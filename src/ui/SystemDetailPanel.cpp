@@ -1,4 +1,5 @@
 #include "SystemDetailPanel.h"
+#include "AppTheme.h"
 
 #include <QComboBox>
 #include <QHeaderView>
@@ -41,7 +42,8 @@ protected:
     {
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing);
-        painter.fillRect(rect(), QColor(QStringLiteral("#F8FAFC")));
+        const bool dark = isApplicationDarkTheme();
+        painter.fillRect(rect(), QColor(dark ? QStringLiteral("#151D25") : QStringLiteral("#F8FAFC")));
 
         double maximum = 1.0;
         for (const auto &rate : m_rates) maximum = std::max({maximum, rate.x(), rate.y()});
@@ -51,9 +53,9 @@ protected:
         painter.setFont(QFont(painter.font().family(), 8));
         for (int line = 0; line <= 2; ++line) {
             const qreal y = plot.top() + plot.height() * line / 2.0;
-            painter.setPen(QPen(QColor(QStringLiteral("#E6ECF2")), 1));
+            painter.setPen(QPen(QColor(dark ? QStringLiteral("#2B3744") : QStringLiteral("#E6ECF2")), 1));
             painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
-            painter.setPen(QColor(QStringLiteral("#91A0B3")));
+            painter.setPen(QColor(dark ? QStringLiteral("#8293A6") : QStringLiteral("#91A0B3")));
             const double value = maximum * (2 - line) / 2.0;
             painter.drawText(QRectF(2, y - 7, 40, 14), Qt::AlignRight | Qt::AlignVCenter,
                 line == 2 ? QStringLiteral("0") : formatBytes(value));
@@ -75,7 +77,7 @@ protected:
         drawSeries(true, QColor(QStringLiteral("#E5534B")));
         drawSeries(false, QColor(QStringLiteral("#00A870")));
 
-        painter.setPen(QColor(QStringLiteral("#91A0B3")));
+        painter.setPen(QColor(dark ? QStringLiteral("#8293A6") : QStringLiteral("#91A0B3")));
         painter.drawText(QRectF(plot.left(), height() - 16, plot.width(), 13),
             Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("最近 60 秒"));
     }
@@ -115,13 +117,6 @@ void configureTree(QTreeWidget *tree)
     tree->header()->setStretchLastSection(false);
     tree->header()->setFixedHeight(22);
     tree->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    tree->setStyleSheet(QStringLiteral(
-        "QTreeWidget{border:1px solid #E2E8F0;background:#FFFFFF;alternate-background-color:#F8FAFC;"
-        "font-size:10px;}"
-        "QTreeWidget#realtimeProcessList::item,QTreeWidget#fileSystemUsageList::item{"
-        "min-height:21px;max-height:21px;padding:0 3px;}"
-        "QHeaderView::section{height:22px;background:#F5F8FB;border:0;border-bottom:1px solid #E2E8F0;"
-        "padding:0 4px;color:#738297;font-size:9px;}"));
 }
 } // namespace
 
@@ -129,23 +124,6 @@ SystemDetailPanel::SystemDetailPanel(QWidget *parent)
     : QFrame(parent)
 {
     setObjectName(QStringLiteral("systemDetailPanel"));
-    setStyleSheet(QStringLiteral(
-        "QFrame#systemDetailPanel{border:0;background:transparent;}"
-        "QFrame#networkSectionCard,QFrame#processSectionCard,QFrame#fileSystemSectionCard{"
-        "border:1px solid #D7E1EB;border-radius:5px;background:#FFFFFF;}"
-        "QLabel#detailSectionTitle{font-weight:650;color:#173553;}"
-        "QLabel#detailMuted{color:#8B9AAF;font-size:10px;}"
-        "QComboBox#networkInterfaceCombo{min-height:27px;border:1px solid #D6E0EA;border-radius:4px;"
-        "padding:0 2px 0 8px;background:#FFFFFF;color:#314A62;}"
-        "QComboBox#networkInterfaceCombo:hover{border-color:#8BBFFF;}"
-        "QComboBox#networkInterfaceCombo::drop-down{width:26px;border:0;border-left:1px solid #E1E7EF;}"
-        "QComboBox#networkInterfaceCombo::down-arrow{image:url(:/assets/chevron-down.svg);width:12px;height:12px;}"
-        "QComboBox#networkInterfaceCombo QAbstractItemView{border:1px solid #CBD7E4;border-radius:4px;"
-        "background:#FFFFFF;color:#314A62;outline:0;padding:3px;}"
-        "QComboBox#networkInterfaceCombo QAbstractItemView::item{min-height:26px;padding:0 7px;border-radius:3px;}"
-        "QComboBox#networkInterfaceCombo QAbstractItemView::item:selected{background:#E8F3FF;color:#0052D9;}"
-        "QTabBar::tab{min-width:44px;height:25px;padding:0 5px;color:#60758B;background:#F5F8FB;font-size:10px;}"
-        "QTabBar::tab:selected{color:#006EFF;background:#FFFFFF;border-bottom:2px solid #006EFF;}"));
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(5, 5, 5, 6);
@@ -176,15 +154,13 @@ SystemDetailPanel::SystemDetailPanel(QWidget *parent)
     networkLayout->addLayout(networkHeader);
 
     auto *rateRow = new QWidget;
-    rateRow->setStyleSheet(QStringLiteral("background:#F7FAFC;border-radius:3px;"));
+    rateRow->setObjectName(QStringLiteral("networkRateRow"));
     auto *rateLayout = new QHBoxLayout(rateRow);
     rateLayout->setContentsMargins(7, 5, 7, 5);
     m_uploadRate = new QLabel(QStringLiteral("↑ --"));
     m_uploadRate->setObjectName(QStringLiteral("networkUploadRate"));
-    m_uploadRate->setStyleSheet(QStringLiteral("color:#D94841;font-weight:650;"));
     m_downloadRate = new QLabel(QStringLiteral("↓ --"));
     m_downloadRate->setObjectName(QStringLiteral("networkDownloadRate"));
-    m_downloadRate->setStyleSheet(QStringLiteral("color:#008858;font-weight:650;"));
     rateLayout->addWidget(m_uploadRate);
     rateLayout->addStretch();
     rateLayout->addWidget(m_downloadRate);

@@ -78,12 +78,16 @@ QWidget *createHostItem(const ServerProfile &server)
     layout->setSpacing(7);
     auto *name = new QLabel;
     name->setObjectName(QStringLiteral("hostItemName"));
-    name->setStyleSheet(QStringLiteral("color:#20344B;font-weight:650;"));
     auto *address = new QLabel;
     address->setObjectName(QStringLiteral("hostItemAddress"));
-    address->setStyleSheet(QStringLiteral("color:#60748A;font-size:12px;"));
     layout->addWidget(name);
     layout->addWidget(address);
+    if (server.connectionMode == ConnectionMode::Rdp) {
+        auto *protocol = new QLabel(QStringLiteral("RDP"));
+        protocol->setObjectName(QStringLiteral("hostItemProtocol"));
+        protocol->setToolTip(QStringLiteral("Windows 远程桌面"));
+        layout->addWidget(protocol);
+    }
     layout->addStretch();
     updateHostItem(widget, server);
     return widget;
@@ -115,7 +119,14 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_search->setClearButtonEnabled(true);
     auto *addButton = new QPushButton(QStringLiteral("+"));
     addButton->setObjectName(QStringLiteral("hostAddButton"));
-    addButton->setToolTip(QStringLiteral("新增 SSH 主机"));
+    addButton->setToolTip(QStringLiteral("新增远程连接"));
+    m_addConnectionMenu = new QMenu(addButton);
+    m_addConnectionMenu->setObjectName(QStringLiteral("hostAddConnectionMenu"));
+    m_addSshAction = m_addConnectionMenu->addAction(QStringLiteral("SSH 终端"));
+    m_addRdpAction = m_addConnectionMenu->addAction(QStringLiteral("Windows 远程桌面（RDP）"));
+    m_addSshAction->setObjectName(QStringLiteral("hostAddSshAction"));
+    m_addRdpAction->setObjectName(QStringLiteral("hostAddRdpAction"));
+    addButton->setMenu(m_addConnectionMenu);
     filterRow->addWidget(m_search, 1);
     filterRow->addWidget(addButton);
 
@@ -133,11 +144,6 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_list->setDropIndicatorShown(true);
     m_list->setDragDropMode(QAbstractItemView::InternalMove);
     m_list->setDefaultDropAction(Qt::MoveAction);
-    m_list->setStyleSheet(QStringLiteral(
-        "QTreeWidget{border:0;background:white;outline:0;}"
-        "QTreeWidget::item{border-radius:3px;}"
-        "QTreeWidget::item:selected{background:#E8F3FF;color:#0052D9;}"
-        "QTreeWidget::branch{background:transparent;}"));
     tree->hostDropRequested = [this](const QString &serverId, const QString &group) {
         moveServerToGroup(serverId, group);
     };
@@ -149,7 +155,10 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_copyAddressAction = m_contextMenu->addAction(QStringLiteral("复制连接地址"));
     m_moveMenu = m_contextMenu->addMenu(QStringLiteral("移动到分组"));
     m_contextMenu->addSeparator();
-    m_newConnectionAction = m_contextMenu->addAction(QStringLiteral("新建连接"));
+    m_newConnectionMenu = m_contextMenu->addMenu(QStringLiteral("新建连接"));
+    m_newConnectionAction = m_newConnectionMenu->menuAction();
+    m_newSshConnectionAction = m_newConnectionMenu->addAction(QStringLiteral("SSH 终端"));
+    m_newRdpConnectionAction = m_newConnectionMenu->addAction(QStringLiteral("Windows 远程桌面（RDP）"));
     m_newGroupAction = m_contextMenu->addAction(QStringLiteral("新建分组"));
     m_renameGroupAction = m_contextMenu->addAction(QStringLiteral("重命名分组"));
     m_deleteGroupAction = m_contextMenu->addAction(QStringLiteral("删除分组"));
@@ -161,20 +170,24 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_copyAddressAction->setObjectName(QStringLiteral("hostCopyAddressAction"));
     m_moveMenu->setObjectName(QStringLiteral("hostMoveGroupMenu"));
     m_newConnectionAction->setObjectName(QStringLiteral("hostNewConnectionAction"));
+    m_newConnectionMenu->setObjectName(QStringLiteral("hostNewConnectionMenu"));
+    m_newSshConnectionAction->setObjectName(QStringLiteral("hostNewSshConnectionAction"));
+    m_newRdpConnectionAction->setObjectName(QStringLiteral("hostNewRdpConnectionAction"));
     m_newGroupAction->setObjectName(QStringLiteral("hostNewGroupAction"));
     m_renameGroupAction->setObjectName(QStringLiteral("hostRenameGroupAction"));
     m_deleteGroupAction->setObjectName(QStringLiteral("hostDeleteGroupAction"));
     m_deleteAction->setObjectName(QStringLiteral("hostDeleteAction"));
 
     auto *credentialButton = new QPushButton(QStringLiteral("⚙  连接与凭据"));
+    credentialButton->setObjectName(QStringLiteral("credentialSettingsButton"));
     credentialButton->setFlat(true);
-    credentialButton->setStyleSheet(QStringLiteral("text-align:left;color:#66768A;border-top:1px solid #DFE6EF;"));
     layout->addLayout(filterRow);
     layout->addWidget(m_list, 1);
     layout->addWidget(credentialButton);
     populate();
 
-    connect(addButton, &QPushButton::clicked, this, &HostSidebar::addServerRequested);
+    connect(m_addSshAction, &QAction::triggered, this, &HostSidebar::addServerRequested);
+    connect(m_addRdpAction, &QAction::triggered, this, &HostSidebar::addRdpServerRequested);
     connect(m_search, &QLineEdit::textChanged, this, &HostSidebar::applyFilter);
     connect(m_list, &QTreeWidget::currentItemChanged, this,
         [this](QTreeWidgetItem *current, QTreeWidgetItem *) {
@@ -200,12 +213,17 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
         [this, contextProfile] { emit serverDuplicateRequested(contextProfile()); });
     connect(m_copyAddressAction, &QAction::triggered, this, [contextProfile] {
         const auto profile = contextProfile();
-        QApplication::clipboard()->setText(QStringLiteral("%1@%2:%3").arg(profile.user, profile.host).arg(profile.port));
+        QApplication::clipboard()->setText(profile.connectionMode == ConnectionMode::Rdp
+                ? QStringLiteral("%1:%2").arg(profile.host).arg(profile.port)
+                : QStringLiteral("%1@%2:%3").arg(profile.user, profile.host).arg(profile.port));
     });
     connect(m_deleteAction, &QAction::triggered, this,
         [this, contextProfile] { emit serverDeleteRequested(contextProfile()); });
-    connect(m_newConnectionAction, &QAction::triggered, this, [this] {
+    connect(m_newSshConnectionAction, &QAction::triggered, this, [this] {
         emit addServerInGroupRequested(m_contextMenu->property("groupName").toString());
+    });
+    connect(m_newRdpConnectionAction, &QAction::triggered, this, [this] {
+        emit addRdpServerInGroupRequested(m_contextMenu->property("groupName").toString());
     });
     connect(m_newGroupAction, &QAction::triggered, this, [this] {
         bool accepted = false;
@@ -379,7 +397,7 @@ void HostSidebar::populate()
     const auto selected = profileForItem(m_list->currentItem()).id;
     m_list->clear();
     if (m_servers.isEmpty() && m_groups.isEmpty()) {
-        auto *item = new QTreeWidgetItem(m_list, {QStringLiteral("暂无 SSH 主机 · 右键可新建分组")});
+        auto *item = new QTreeWidgetItem(m_list, {QStringLiteral("暂无远程连接 · 点击 + 新建连接或右键新建分组")});
         item->setFlags(Qt::NoItemFlags);
         item->setForeground(0, QColor(QStringLiteral("#8794A5")));
         item->setTextAlignment(0, Qt::AlignCenter);
@@ -393,9 +411,10 @@ void HostSidebar::populate()
         item->setData(0, kServerIndexRole, static_cast<int>(index));
         item->setData(0, kServerIdRole, server.id);
         const auto groupName = server.group.trimmed();
-        item->setToolTip(0, groupName.isEmpty()
-                ? QStringLiteral("%1@%2:%3").arg(server.user, server.host).arg(server.port)
-                : QStringLiteral("%1@%2:%3 · %4").arg(server.user, server.host).arg(server.port).arg(groupName));
+        const auto target = server.connectionMode == ConnectionMode::Rdp
+            ? QStringLiteral("RDP · %1:%2").arg(server.host).arg(server.port)
+            : QStringLiteral("SSH · %1@%2:%3").arg(server.user, server.host).arg(server.port);
+        item->setToolTip(0, groupName.isEmpty() ? target : QStringLiteral("%1 · %2").arg(target, groupName));
         item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled);
         item->setSizeHint(0, QSize(198, 38));
         m_list->setItemWidget(item, 0, createHostItem(server));
@@ -489,6 +508,10 @@ void HostSidebar::showContextMenu(const QPoint &position)
     if (item) m_list->setCurrentItem(item);
     m_contextMenu->setProperty("serverProfile", QVariant::fromValue(profile));
     m_contextMenu->setProperty("groupName", group);
+    m_connectAction->setText(profile.connectionMode == ConnectionMode::Rdp
+            ? QStringLiteral("打开远程桌面") : QStringLiteral("连接"));
+    m_copyAddressAction->setText(profile.connectionMode == ConnectionMode::Rdp
+            ? QStringLiteral("复制远程桌面地址") : QStringLiteral("复制连接地址"));
     for (auto *action : {m_connectAction, m_editAction, m_duplicateAction, m_copyAddressAction,
              m_deleteAction, m_moveMenu->menuAction()}) action->setVisible(isHost);
     m_newGroupAction->setVisible(!isHost);

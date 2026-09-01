@@ -35,6 +35,9 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
     header->setSpacing(6);
     auto *title = new QLabel(QStringLiteral("命令记录"));
     title->setObjectName(QStringLiteral("commandHistoryTitle"));
+    auto *scope = new QLabel(QStringLiteral("本机共享"));
+    scope->setObjectName(QStringLiteral("commandHistoryScope"));
+    scope->setToolTip(QStringLiteral("历史和收藏保存在当前设备，可在所有 SSH 主机中使用"));
     m_tabs = new QTabBar;
     m_tabs->setObjectName(QStringLiteral("commandHistoryTabs"));
     m_tabs->setExpanding(false);
@@ -49,6 +52,7 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
     closeButton->setText(QString::fromUtf8("×"));
     closeButton->setToolTip(QStringLiteral("收起命令记录"));
     header->addWidget(title);
+    header->addWidget(scope);
     header->addWidget(m_tabs);
     header->addStretch();
     header->addWidget(m_clearButton);
@@ -57,9 +61,9 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
 
     m_tree = new QTreeWidget;
     m_tree->setObjectName(QStringLiteral("commandHistoryList"));
-    m_tree->setColumnCount(4);
+    m_tree->setColumnCount(5);
     m_tree->setHeaderLabels({QStringLiteral(""), QStringLiteral("命令"),
-        QStringLiteral("备注"), QStringLiteral("最近执行")});
+        QStringLiteral("备注"), QStringLiteral("来源主机"), QStringLiteral("最近执行")});
     m_tree->setRootIsDecorated(false);
     m_tree->setAlternatingRowColors(true);
     m_tree->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -69,6 +73,7 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
     m_tree->header()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_tree->header()->setSectionResizeMode(2, QHeaderView::Stretch);
     m_tree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    m_tree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
     layout->addWidget(m_tree, 1);
 
     m_menu = new QMenu(this);
@@ -133,20 +138,22 @@ void CommandHistoryPanel::recordCommand(const QString &command)
 void CommandHistoryPanel::refresh()
 {
     m_tree->clear();
-    if (!m_repository || m_serverId.isEmpty()) return;
+    if (!m_repository) return;
     const bool favoritesOnly = m_tabs->currentIndex() == 1;
-    const auto entries = m_repository->loadCommandHistory(m_serverId, favoritesOnly, 300);
+    const auto entries = m_repository->loadCommandHistory(favoritesOnly, 300);
     for (const auto &entry : entries) {
         auto *item = new QTreeWidgetItem(m_tree, {
             entry.favorite ? QStringLiteral("★") : QStringLiteral("☆"),
             entry.command,
             entry.note,
+            entry.serverName.isEmpty() ? QStringLiteral("已删除主机") : entry.serverName,
             entry.executedAt.toString(QStringLiteral("MM-dd HH:mm:ss")),
         });
         item->setData(0, Qt::UserRole, entry.id);
         item->setData(0, Qt::UserRole + 1, entry.favorite);
         item->setToolTip(1, QStringLiteral("双击填入命令；右键可执行或管理"));
         item->setToolTip(2, QStringLiteral("双击修改备注"));
+        item->setToolTip(3, QStringLiteral("最近一次执行该命令的主机"));
     }
     m_clearButton->setText(favoritesOnly ? QStringLiteral("清空收藏") : QStringLiteral("清空历史"));
     m_clearButton->setToolTip(favoritesOnly
@@ -175,15 +182,15 @@ void CommandHistoryPanel::editCurrentNote()
 
 void CommandHistoryPanel::clearCurrentView()
 {
-    if (!m_repository || m_serverId.isEmpty() || m_tree->topLevelItemCount() == 0) return;
+    if (!m_repository || m_tree->topLevelItemCount() == 0) return;
     const bool favoritesOnly = m_tabs->currentIndex() == 1;
     const auto question = favoritesOnly
-        ? QStringLiteral("取消本主机的全部收藏标记？命令仍会保留在历史中。")
-        : QStringLiteral("清空本主机的全部未收藏历史？已收藏命令及其备注会保留。");
+        ? QStringLiteral("取消当前设备的全部命令收藏？命令仍会保留在历史中。")
+        : QStringLiteral("清空当前设备的全部未收藏历史？已收藏命令及其备注会保留。");
     if (QMessageBox::question(this, QStringLiteral("确认清空"), question,
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-    const bool saved = favoritesOnly ? m_repository->clearCommandFavorites(m_serverId)
-                                     : m_repository->clearCommandHistory(m_serverId);
+    const bool saved = favoritesOnly ? m_repository->clearCommandFavorites()
+                                     : m_repository->clearCommandHistory();
     if (saved) refresh();
 }
 

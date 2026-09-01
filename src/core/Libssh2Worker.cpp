@@ -75,7 +75,7 @@ LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(keyboardInteractiveResponse)
 
 constexpr auto kMetricsCommand =
     "export LC_ALL=C; "
-    "printf '__CPU__\\n'; head -n 1 /proc/stat; "
+    "printf '__CPU__\\n'; grep -E '^cpu([0-9]+)? ' /proc/stat; "
     "printf '__MEM__\\n'; cat /proc/meminfo; "
     "printf '__LOAD__\\n'; cat /proc/loadavg; "
     "printf '__CORES__\\n'; (getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf '1\\n'); "
@@ -162,6 +162,9 @@ Libssh2Worker::Libssh2Worker(QObject *parent)
 {
     static const bool initialized = [] { return libssh2_init(0) == 0; }();
     Q_UNUSED(initialized);
+    // Keep interactive output cadence predictable while background SSH
+    // channels are active. Startup gets an additional eager drain below.
+    m_readTimer->setTimerType(Qt::PreciseTimer);
     m_readTimer->setInterval(16);
     connect(m_readTimer, &QTimer::timeout, this, &Libssh2Worker::drainChannel);
 }
@@ -292,6 +295,14 @@ void Libssh2Worker::continueAuthentication()
     }
     m_connected = true;
     m_readTimer->start();
+    // The server usually sends its login banner and first prompt immediately
+    // after the shell opens. Read that small burst before announcing the
+    // connection so UI-triggered metrics/SFTP jobs cannot overtake it.
+    for (int attempt = 0; attempt < 4 && m_connected; ++attempt) {
+        if (drainChannel()) break;
+        waitForSocket(15);
+    }
+    if (!m_connected) return;
     emit connectionChanged(true, QStringLiteral("SSH 已连接 · %1 · %2").arg(hostKeyAlgorithm(), m_fingerprint));
     emit promptChanged(QStringLiteral("%1@%2:~$ ").arg(m_profile.user, m_profile.name));
 }
@@ -427,6 +438,13 @@ void Libssh2Worker::collectMetrics(quint64 requestId)
         return;
     }
 
+    // Flush already-arrived interactive output before temporarily borrowing
+    // the SSH session for a blocking background channel.
+    drainChannel();
+    if (!m_connected || !m_session) {
+        emit metricsCollectionFailed(requestId, QStringLiteral("SSH 会话已断开"));
+        return;
+    }
     m_readTimer->stop();
     libssh2_session_set_blocking(m_session, 1);
     libssh2_session_set_timeout(m_session, kMetricsTimeoutMs);
@@ -466,7 +484,10 @@ void Libssh2Worker::collectMetrics(quint64 requestId)
     }
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
     libssh2_session_set_blocking(m_session, 0);
-    if (m_connected) m_readTimer->start();
+    if (m_connected) {
+        drainChannel();
+        if (m_connected) m_readTimer->start();
+    }
 
     if (!failure.isEmpty()) {
         emit metricsCollectionFailed(requestId, failure);
@@ -487,6 +508,11 @@ void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
         return;
     }
 
+    drainChannel();
+    if (!m_connected || !m_session) {
+        emit directoryListingFailed(requestId, path, QStringLiteral("SSH 会话已断开"));
+        return;
+    }
     m_readTimer->stop();
     libssh2_session_set_blocking(m_session, 1);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
@@ -557,7 +583,10 @@ void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
     if (sftp) libssh2_sftp_shutdown(sftp);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
     libssh2_session_set_blocking(m_session, 0);
-    if (m_connected) m_readTimer->start();
+    if (m_connected) {
+        drainChannel();
+        if (m_connected) m_readTimer->start();
+    }
 
     if (!failure.isEmpty()) {
         emit directoryListingFailed(requestId, path, failure);
@@ -574,6 +603,11 @@ void Libssh2Worker::resolveHomeDirectory(quint64 requestId)
 {
     if (!m_connected || !m_session) {
         emit homeDirectoryResolutionFailed(requestId, QStringLiteral("SSH 会话未连接"));
+        return;
+    }
+    drainChannel();
+    if (!m_connected || !m_session) {
+        emit homeDirectoryResolutionFailed(requestId, QStringLiteral("SSH 会话已断开"));
         return;
     }
     m_readTimer->stop();
@@ -594,7 +628,10 @@ void Libssh2Worker::resolveHomeDirectory(quint64 requestId)
     if (sftp) libssh2_sftp_shutdown(sftp);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
     libssh2_session_set_blocking(m_session, 0);
-    if (m_connected) m_readTimer->start();
+    if (m_connected) {
+        drainChannel();
+        if (m_connected) m_readTimer->start();
+    }
 
     if (failure.isEmpty() && path.startsWith(QLatin1Char('/'))) emit homeDirectoryResolved(requestId, QDir::cleanPath(path));
     else emit homeDirectoryResolutionFailed(requestId,
@@ -1074,14 +1111,16 @@ void Libssh2Worker::changePermissions(quint64 requestId, const QString &path, qu
     }
 }
 
-void Libssh2Worker::drainChannel()
+bool Libssh2Worker::drainChannel()
 {
-    if (!m_channel) return;
+    if (!m_channel) return false;
+    bool receivedAny = false;
     std::array<char, 8192> buffer{};
     for (int stream = 0; stream < 2; ++stream) {
         for (;;) {
             const auto received = libssh2_channel_read_ex(m_channel, stream, buffer.data(), buffer.size());
             if (received > 0) {
+                receivedAny = true;
                 const QByteArray chunk(buffer.data(), static_cast<qsizetype>(received));
                 emit rawOutputReceived(chunk);
                 continue;
@@ -1093,6 +1132,7 @@ void Libssh2Worker::drainChannel()
         emit connectionChanged(false, QStringLiteral("远端已关闭 SSH 会话"));
         cleanup();
     }
+    return receivedAny;
 }
 
 void Libssh2Worker::disconnectFromHost()

@@ -28,7 +28,6 @@ FilePermissionDialog::FilePermissionDialog(const RemoteFileEntry &entry, QWidget
 
     auto *name = new QLabel(entry.name.isEmpty() ? QFileInfo(entry.path).fileName() : entry.name);
     name->setObjectName(QStringLiteral("permissionFileName"));
-    name->setStyleSheet(QStringLiteral("font-weight:650;color:#18324F;"));
     name->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(name);
 

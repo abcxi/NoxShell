@@ -32,6 +32,7 @@ struct LoginHistoryEntry {
 struct CommandHistoryEntry {
     qint64 id{};
     QString serverId;
+    QString serverName;
     QString command;
     QString note;
     bool favorite{false};
@@ -62,12 +63,12 @@ public:
     bool recordCommand(const QString &serverId, const QString &command,
         const QDateTime &executedAt = QDateTime::currentDateTime());
     [[nodiscard]] QVector<CommandHistoryEntry> loadCommandHistory(
-        const QString &serverId, bool favoritesOnly = false, int limit = 200);
+        bool favoritesOnly = false, int limit = 200);
     bool setCommandFavorite(qint64 id, bool favorite);
     bool setCommandNote(qint64 id, const QString &note);
     bool deleteCommandHistory(qint64 id);
-    bool clearCommandHistory(const QString &serverId);
-    bool clearCommandFavorites(const QString &serverId);
+    bool clearCommandHistory();
+    bool clearCommandFavorites();
     bool saveMetricSample(const QString &serverId, const MetricSample &sample);
     [[nodiscard]] QVector<MetricHistoryPoint> loadMetricHistory(const QString &serverId, const QDateTime &since);
     [[nodiscard]] MonitoringThresholds loadMonitoringThresholds(const QString &serverId);

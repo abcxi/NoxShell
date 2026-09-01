@@ -182,17 +182,79 @@ bool ServerRepository::migrate()
         setError(QStringLiteral("创建登录历史主机索引"), query.lastError().text());
         return false;
     }
-    if (!query.exec(QStringLiteral(
-            "CREATE TABLE IF NOT EXISTS command_history ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT NOT NULL, command TEXT NOT NULL,"
-            "note TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, executed_at TEXT NOT NULL,"
-            "UNIQUE(server_id,command), FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE)"))) {
-        setError(QStringLiteral("迁移命令历史"), query.lastError().text());
+    // Commands and favorites belong to this NoxShell installation, not to one
+    // remote host. Migrate the original per-server table without discarding
+    // favorites or notes, and retain the latest source host only as context.
+    QSqlQuery commandColumns(m_database);
+    if (!commandColumns.exec(QStringLiteral("PRAGMA table_info(command_history)"))) {
+        setError(QStringLiteral("检查命令历史结构"), commandColumns.lastError().text());
         return false;
     }
+    bool commandTableExists = false;
+    bool commandHistoryIsDeviceGlobal = false;
+    while (commandColumns.next()) {
+        commandTableExists = true;
+        if (commandColumns.value(1).toString() == QStringLiteral("server_name")) {
+            commandHistoryIsDeviceGlobal = true;
+        }
+    }
+    if (!commandTableExists) {
+        if (!query.exec(QStringLiteral(
+                "CREATE TABLE command_history ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT NOT NULL DEFAULT '',"
+                "server_name TEXT NOT NULL DEFAULT '', command TEXT NOT NULL UNIQUE,"
+                "note TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, executed_at TEXT NOT NULL)"))) {
+            setError(QStringLiteral("创建本机命令历史"), query.lastError().text());
+            return false;
+        }
+    } else if (!commandHistoryIsDeviceGlobal) {
+        if (!m_database.transaction()) {
+            setError(QStringLiteral("开始迁移命令历史"), m_database.lastError().text());
+            return false;
+        }
+        const auto rollbackMigration = [this](const QString &context, const QSqlError &error) {
+            m_database.rollback();
+            setError(context, error.text());
+            return false;
+        };
+        if (!query.exec(QStringLiteral(
+                "ALTER TABLE command_history RENAME TO command_history_server_scoped"))) {
+            return rollbackMigration(QStringLiteral("备份旧命令历史"), query.lastError());
+        }
+        if (!query.exec(QStringLiteral(
+                "CREATE TABLE command_history ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT NOT NULL DEFAULT '',"
+                "server_name TEXT NOT NULL DEFAULT '', command TEXT NOT NULL UNIQUE,"
+                "note TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, executed_at TEXT NOT NULL)"))) {
+            return rollbackMigration(QStringLiteral("创建本机命令历史"), query.lastError());
+        }
+        if (!query.exec(QStringLiteral(
+                "INSERT INTO command_history(server_id,server_name,command,note,favorite,executed_at) "
+                "SELECT "
+                "COALESCE((SELECT latest.server_id FROM command_history_server_scoped latest "
+                "WHERE latest.command=grouped.command ORDER BY latest.executed_at DESC,latest.id DESC LIMIT 1),''),"
+                "COALESCE((SELECT source.name FROM command_history_server_scoped latest "
+                "LEFT JOIN servers source ON source.id=latest.server_id WHERE latest.command=grouped.command "
+                "ORDER BY latest.executed_at DESC,latest.id DESC LIMIT 1),''),"
+                "grouped.command,"
+                "COALESCE((SELECT noted.note FROM command_history_server_scoped noted "
+                "WHERE noted.command=grouped.command AND noted.note<>'' "
+                "ORDER BY noted.favorite DESC,noted.executed_at DESC,noted.id DESC LIMIT 1),''),"
+                "MAX(grouped.favorite),MAX(grouped.executed_at) "
+                "FROM command_history_server_scoped grouped GROUP BY grouped.command"))) {
+            return rollbackMigration(QStringLiteral("合并旧命令历史"), query.lastError());
+        }
+        if (!query.exec(QStringLiteral("DROP TABLE command_history_server_scoped"))) {
+            return rollbackMigration(QStringLiteral("完成命令历史迁移"), query.lastError());
+        }
+        if (!m_database.commit()) {
+            setError(QStringLiteral("提交命令历史迁移"), m_database.lastError().text());
+            return false;
+        }
+    }
     if (!query.exec(QStringLiteral(
-            "CREATE INDEX IF NOT EXISTS idx_command_history_server_time "
-            "ON command_history(server_id,executed_at DESC,id DESC)"))) {
+            "CREATE INDEX IF NOT EXISTS idx_command_history_time "
+            "ON command_history(executed_at DESC,id DESC)"))) {
         setError(QStringLiteral("创建命令历史索引"), query.lastError().text());
         return false;
     }
@@ -525,8 +587,11 @@ bool ServerRepository::recordCommand(const QString &serverId, const QString &com
     if (serverId.isEmpty() || normalized.isEmpty()) return false;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "INSERT INTO command_history(server_id,command,note,favorite,executed_at) VALUES(?,?,'',0,?) "
-        "ON CONFLICT(server_id,command) DO UPDATE SET executed_at=excluded.executed_at"));
+        "INSERT INTO command_history(server_id,server_name,command,note,favorite,executed_at) "
+        "VALUES(?,COALESCE((SELECT name FROM servers WHERE id=?),''),?,'',0,?) "
+        "ON CONFLICT(command) DO UPDATE SET server_id=excluded.server_id,"
+        "server_name=excluded.server_name,executed_at=excluded.executed_at"));
+    query.addBindValue(serverId);
     query.addBindValue(serverId);
     query.addBindValue(normalized.left(4096));
     query.addBindValue((executedAt.isValid() ? executedAt : QDateTime::currentDateTime())
@@ -536,25 +601,19 @@ bool ServerRepository::recordCommand(const QString &serverId, const QString &com
         return false;
     }
     QSqlQuery prune(m_database);
-    prune.prepare(QStringLiteral(
-        "DELETE FROM command_history WHERE server_id=? AND favorite=0 AND id NOT IN ("
-        "SELECT id FROM command_history WHERE server_id=? ORDER BY executed_at DESC,id DESC LIMIT 500)"));
-    prune.addBindValue(serverId);
-    prune.addBindValue(serverId);
-    prune.exec();
+    prune.exec(QStringLiteral(
+        "DELETE FROM command_history WHERE favorite=0 AND id NOT IN ("
+        "SELECT id FROM command_history WHERE favorite=0 ORDER BY executed_at DESC,id DESC LIMIT 500)"));
     return true;
 }
 
-QVector<CommandHistoryEntry> ServerRepository::loadCommandHistory(
-    const QString &serverId, bool favoritesOnly, int limit)
+QVector<CommandHistoryEntry> ServerRepository::loadCommandHistory(bool favoritesOnly, int limit)
 {
     QVector<CommandHistoryEntry> result;
-    if (serverId.isEmpty()) return result;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "SELECT id,server_id,command,note,favorite,executed_at FROM command_history "
-        "WHERE server_id=? AND (?=0 OR favorite=1) ORDER BY executed_at DESC,id DESC LIMIT ?"));
-    query.addBindValue(serverId);
+        "SELECT id,server_id,server_name,command,note,favorite,executed_at FROM command_history "
+        "WHERE (?=0 OR favorite=1) ORDER BY executed_at DESC,id DESC LIMIT ?"));
     query.addBindValue(favoritesOnly ? 1 : 0);
     query.addBindValue(qBound(1, limit, 500));
     if (!query.exec()) {
@@ -565,10 +624,11 @@ QVector<CommandHistoryEntry> ServerRepository::loadCommandHistory(
         CommandHistoryEntry entry;
         entry.id = query.value(0).toLongLong();
         entry.serverId = query.value(1).toString();
-        entry.command = query.value(2).toString();
-        entry.note = query.value(3).toString();
-        entry.favorite = query.value(4).toBool();
-        entry.executedAt = QDateTime::fromString(query.value(5).toString(), Qt::ISODateWithMs).toLocalTime();
+        entry.serverName = query.value(2).toString();
+        entry.command = query.value(3).toString();
+        entry.note = query.value(4).toString();
+        entry.favorite = query.value(5).toBool();
+        entry.executedAt = QDateTime::fromString(query.value(6).toString(), Qt::ISODateWithMs).toLocalTime();
         result.append(entry);
     }
     return result;
@@ -612,25 +672,21 @@ bool ServerRepository::deleteCommandHistory(qint64 id)
     return true;
 }
 
-bool ServerRepository::clearCommandHistory(const QString &serverId)
+bool ServerRepository::clearCommandHistory()
 {
     QSqlQuery query(m_database);
     // 收藏记录是独立资产；清空普通历史时必须保留收藏及其备注。
-    query.prepare(QStringLiteral("DELETE FROM command_history WHERE server_id=? AND favorite=0"));
-    query.addBindValue(serverId);
-    if (!query.exec()) {
+    if (!query.exec(QStringLiteral("DELETE FROM command_history WHERE favorite=0"))) {
         setError(QStringLiteral("清空命令历史"), query.lastError().text());
         return false;
     }
     return true;
 }
 
-bool ServerRepository::clearCommandFavorites(const QString &serverId)
+bool ServerRepository::clearCommandFavorites()
 {
     QSqlQuery query(m_database);
-    query.prepare(QStringLiteral("UPDATE command_history SET favorite=0 WHERE server_id=? AND favorite=1"));
-    query.addBindValue(serverId);
-    if (!query.exec()) {
+    if (!query.exec(QStringLiteral("UPDATE command_history SET favorite=0 WHERE favorite=1"))) {
         setError(QStringLiteral("清空命令收藏"), query.lastError().text());
         return false;
     }

@@ -38,6 +38,7 @@ public:
     [[nodiscard]] int cursorRow() const { return m_cursorRow; }
     [[nodiscard]] bool cursorVisible() const { return m_cursorVisible; }
     [[nodiscard]] bool reverseVideo() const { return m_reverseVideo; }
+    [[nodiscard]] bool applicationCursorKeys() const { return m_applicationCursorKeys; }
     [[nodiscard]] bool bracketedPaste() const { return m_bracketedPaste; }
     [[nodiscard]] bool alternateScreen() const { return m_alternateScreen; }
     [[nodiscard]] MouseTracking mouseTracking() const { return m_mouseTracking; }
@@ -91,6 +92,7 @@ private:
     bool m_wrapPending{false};
     bool m_cursorVisible{true};
     bool m_reverseVideo{false};
+    bool m_applicationCursorKeys{false};
     bool m_bracketedPaste{false};
     bool m_alternateScreen{false};
     MouseTracking m_mouseTracking{MouseTracking::None};

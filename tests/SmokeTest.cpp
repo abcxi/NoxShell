@@ -3,6 +3,7 @@
 #include "../src/core/CredentialStore.h"
 #include "../src/core/FileTransferTask.h"
 #include "../src/core/MetricHistory.h"
+#include "../src/core/RdpLauncher.h"
 #include "../src/core/SshSession.h"
 #include "../src/core/ServerRepository.h"
 #include "../src/ui/AppTheme.h"
@@ -11,7 +12,10 @@
 #include "../src/ui/FilePermissionDialog.h"
 #include "../src/ui/HostSidebar.h"
 #include "../src/ui/MainWindow.h"
+#include "../src/ui/MetricCard.h"
 #include "../src/ui/RemoteFileEditor.h"
+#include "../src/ui/RdpDialog.h"
+#include "../src/ui/SearchMarkerScrollBar.h"
 #include "../src/ui/ServerDialog.h"
 #include "../src/ui/SystemDetailPanel.h"
 #include "../src/ui/TerminalSettingsDialog.h"
@@ -45,6 +49,7 @@
 #include <QProgressDialog>
 #include <QRadioButton>
 #include <QScrollBar>
+#include <QSettings>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSplitter>
@@ -85,6 +90,25 @@ private slots:
         const auto pixmap = icon.pixmap(QSize(128, 128));
         QVERIFY(!pixmap.isNull());
         QCOMPARE(pixmap.size(), QSize(128, 128));
+    }
+
+    void applicationThemeModesResolveAndProduceDistinctPalettes()
+    {
+        using noxshell::ui::ThemeMode;
+        QCOMPARE(noxshell::ui::themeModeFromSetting(QStringLiteral("system")), ThemeMode::System);
+        QCOMPARE(noxshell::ui::themeModeFromSetting(QStringLiteral("LIGHT")), ThemeMode::Light);
+        QCOMPARE(noxshell::ui::themeModeFromSetting(QStringLiteral("dark")), ThemeMode::Dark);
+        QCOMPARE(noxshell::ui::themeModeFromSetting(QStringLiteral("invalid")), ThemeMode::System);
+        QCOMPARE(noxshell::ui::themeModeSettingValue(ThemeMode::System), QStringLiteral("system"));
+        QCOMPARE(noxshell::ui::themeModeSettingValue(ThemeMode::Light), QStringLiteral("light"));
+        QCOMPARE(noxshell::ui::themeModeSettingValue(ThemeMode::Dark), QStringLiteral("dark"));
+        QVERIFY(noxshell::ui::applicationStyleSheet(false).contains(QStringLiteral("#F3F6FA")));
+        const auto darkStyle = noxshell::ui::applicationStyleSheet(true);
+        QVERIFY(darkStyle.contains(QStringLiteral("#111820")));
+        QVERIFY(darkStyle.contains(QStringLiteral(
+            "QTreeWidget#remoteDirectoryTree {\n            color:#D5E0EB; background:#151D25;")));
+        QVERIFY(darkStyle.contains(QStringLiteral(
+            "QTreeWidget#remoteDirectoryTree::item:selected {\n            color:#FFFFFF; background:#174E78;")));
     }
 
     void loggerRedactsCommonSecrets()
@@ -151,6 +175,31 @@ private slots:
         QVERIFY(!sizeSpy.isEmpty());
     }
 
+    void terminalViewFollowsApplicationCursorModeForVi()
+    {
+        noxshell::ui::TerminalView view;
+        QSignalSpy inputSpy(&view, &noxshell::ui::TerminalView::inputGenerated);
+        view.resize(640, 240);
+        view.show();
+        view.setFocus();
+
+        // vi/vim enables DECCKM while its full-screen editor is active. In
+        // that mode xterm cursor keys use SS3 (ESC O), not CSI (ESC [).
+        view.feedText(QStringLiteral("\x1b[?1h"));
+        QTest::keyClick(&view, Qt::Key_Up);
+        QTest::keyClick(&view, Qt::Key_Down);
+        QTest::keyClick(&view, Qt::Key_Right);
+        QTest::keyClick(&view, Qt::Key_Left);
+        QCOMPARE(inputSpy.at(0).at(0).toByteArray(), QByteArray("\x1bOA"));
+        QCOMPARE(inputSpy.at(1).at(0).toByteArray(), QByteArray("\x1bOB"));
+        QCOMPARE(inputSpy.at(2).at(0).toByteArray(), QByteArray("\x1bOC"));
+        QCOMPARE(inputSpy.at(3).at(0).toByteArray(), QByteArray("\x1bOD"));
+
+        view.feedText(QStringLiteral("\x1b[?1l"));
+        QTest::keyClick(&view, Qt::Key_Up);
+        QCOMPARE(inputSpy.at(4).at(0).toByteArray(), QByteArray("\x1b[A"));
+    }
+
     void terminalViewSearchesHighlightsAndNavigatesOutput()
     {
         noxshell::ui::TerminalView view;
@@ -170,21 +219,27 @@ private slots:
         auto *previous = view.findChild<QToolButton *>(QStringLiteral("terminalSearchPrevious"));
         auto *next = view.findChild<QToolButton *>(QStringLiteral("terminalSearchNext"));
         auto *close = view.findChild<QToolButton *>(QStringLiteral("terminalSearchClose"));
+        auto *searchMarkers = view.findChild<noxshell::ui::SearchMarkerScrollBar *>(
+            QStringLiteral("terminalScrollBar"));
         QVERIFY(searchInput);
         QVERIFY(counter);
         QVERIFY(previous);
         QVERIFY(next);
         QVERIFY(close);
+        QVERIFY(searchMarkers);
         QVERIFY(searchInput->isVisible());
 
         searchInput->setText(QStringLiteral("needle"));
         QCOMPARE(view.searchMatchCount(), 2);
         QCOMPARE(view.currentSearchMatch(), 0);
         QCOMPARE(counter->text(), QStringLiteral("1 / 2"));
+        QCOMPARE(searchMarkers->searchMarkerCount(), 2);
+        QCOMPARE(searchMarkers->currentSearchMarker(), 0);
 
         QImage rendered(view.size(), QImage::Format_ARGB32);
         view.render(&rendered);
         bool foundHighlight = false;
+        bool foundScrollMarker = false;
         for (int y = 0; y < rendered.height() && !foundHighlight; ++y) {
             for (int x = 0; x < rendered.width(); ++x) {
                 const auto color = rendered.pixelColor(x, y);
@@ -195,22 +250,83 @@ private slots:
                 }
             }
         }
+        for (int y = 0; y < rendered.height() && !foundScrollMarker; ++y) {
+            for (int x = qMax(0, rendered.width() - searchMarkers->width()); x < rendered.width(); ++x) {
+                const auto color = rendered.pixelColor(x, y);
+                if (color == QColor(QStringLiteral("#FFD84D"))
+                    || color == QColor(QStringLiteral("#FF8A00"))) {
+                    foundScrollMarker = true;
+                    break;
+                }
+            }
+        }
         QVERIFY(foundHighlight);
+        QVERIFY(foundScrollMarker);
 
-        QTest::mouseClick(next, Qt::LeftButton);
+        QTest::mouseClick(searchMarkers, Qt::LeftButton, Qt::NoModifier,
+            searchMarkers->searchMarkerRect(1).center());
         QCOMPARE(view.currentSearchMatch(), 1);
         QCOMPARE(counter->text(), QStringLiteral("2 / 2"));
-        QTest::mouseClick(previous, Qt::LeftButton);
+        QCOMPARE(searchMarkers->currentSearchMarker(), 1);
+
+        QTest::mouseClick(next, Qt::LeftButton);
         QCOMPARE(view.currentSearchMatch(), 0);
+        QCOMPARE(counter->text(), QStringLiteral("1 / 2"));
+        QTest::mouseClick(previous, Qt::LeftButton);
+        QCOMPARE(view.currentSearchMatch(), 1);
 
         searchInput->setText(QStringLiteral("not present"));
         QCOMPARE(view.searchMatchCount(), 0);
+        QCOMPARE(searchMarkers->searchMarkerCount(), 0);
         QCOMPARE(counter->text(), QStringLiteral("0 / 0"));
         QVERIFY(!previous->isEnabled());
         QVERIFY(!next->isEnabled());
 
         QTest::mouseClick(close, Qt::LeftButton);
         QVERIFY(!searchInput->isVisible());
+    }
+
+    void terminalCommandBlockHoverCopiesTextAndImageWithoutRelayout()
+    {
+        noxshell::ui::TerminalView view;
+        view.resize(720, 260);
+        view.show();
+        QTest::qWait(20);
+        view.feedText(QStringLiteral(
+            "[root@test-host ~]# ls\r\none\r\ntwo\r\n[root@test-host ~]# "));
+        QCoreApplication::processEvents();
+
+        auto *tools = view.findChild<QFrame *>(QStringLiteral("terminalCommandBlockTools"));
+        auto *copyText = view.findChild<QToolButton *>(QStringLiteral("terminalCommandBlockCopyText"));
+        auto *copyImage = view.findChild<QToolButton *>(QStringLiteral("terminalCommandBlockCopyImage"));
+        QVERIFY(tools);
+        QVERIFY(copyText);
+        QVERIFY(copyImage);
+        QVERIFY(!tools->isVisible());
+
+        const auto originalSize = view.size();
+        const auto originalRows = view.rows();
+        QSignalSpy resizeSpy(&view, &noxshell::ui::TerminalView::terminalSizeChanged);
+        const auto hoverPoint = view.contentOrigin().toPoint()
+            + QPoint(80, qRound(view.cellSize().height() * 1.5));
+        QTest::mouseMove(&view, hoverPoint);
+        QTRY_VERIFY_WITH_TIMEOUT(tools->isVisible(), 1000);
+        QCOMPARE(view.size(), originalSize);
+        QCOMPARE(view.rows(), originalRows);
+        QCOMPARE(resizeSpy.count(), 0);
+
+        QApplication::clipboard()->clear();
+        QTest::mouseClick(copyText, Qt::LeftButton);
+        QCOMPARE(QApplication::clipboard()->text(),
+            QStringLiteral("[root@test-host ~]# ls\none\ntwo"));
+        QTest::mouseClick(copyImage, Qt::LeftButton);
+        const auto copiedImage = QApplication::clipboard()->image();
+        QVERIFY(!copiedImage.isNull());
+        QVERIFY(copiedImage.width() > 300);
+        QVERIFY(copiedImage.height() >= qCeil(view.cellSize().height() * 3));
+
+        QTest::mouseMove(&view, QPoint(2, 2));
+        QTRY_VERIFY_WITH_TIMEOUT(!tools->isVisible(), 1000);
     }
 
     void terminalViewSendsTabOncePerPhysicalKeyPress()
@@ -358,6 +474,7 @@ private slots:
         QSignalSpy collapseSpy(&sidebar, &noxshell::ui::HostSidebar::collapseRequested);
         QSignalSpy groupChangedSpy(&sidebar, &noxshell::ui::HostSidebar::serverGroupChanged);
         QSignalSpy addInGroupSpy(&sidebar, &noxshell::ui::HostSidebar::addServerInGroupRequested);
+        QSignalSpy addRdpInGroupSpy(&sidebar, &noxshell::ui::HostSidebar::addRdpServerInGroupRequested);
         sidebar.show();
         sidebar.selectFirstServer();
         QCOMPARE(selectedSpy.count(), 1);
@@ -375,6 +492,9 @@ private slots:
         auto *addButton = sidebar.findChild<QPushButton *>(QStringLiteral("hostAddButton"));
         QVERIFY(search);
         QVERIFY(addButton);
+        QVERIFY(addButton->menu());
+        QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostAddSshAction")));
+        QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostAddRdpAction")));
         QCOMPARE(search->geometry().y(), addButton->geometry().y());
         QVERIFY(addButton->geometry().x() > search->geometry().x());
         auto *hostItem = tree->topLevelItem(0)->child(0);
@@ -408,9 +528,16 @@ private slots:
         QCOMPARE(newConnection->text(), QStringLiteral("新建连接"));
         tree->customContextMenuRequested(tree->visualItemRect(tree->topLevelItem(1)).center());
         QVERIFY(newConnection->isVisible());
-        newConnection->trigger();
+        auto *newSshConnection = sidebar.findChild<QAction *>(QStringLiteral("hostNewSshConnectionAction"));
+        auto *newRdpConnection = sidebar.findChild<QAction *>(QStringLiteral("hostNewRdpConnectionAction"));
+        QVERIFY(newSshConnection);
+        QVERIFY(newRdpConnection);
+        newSshConnection->trigger();
         QCOMPARE(addInGroupSpy.count(), 1);
         QCOMPARE(addInGroupSpy.first().at(0).toString(), QStringLiteral("测试环境"));
+        newRdpConnection->trigger();
+        QCOMPARE(addRdpInGroupSpy.count(), 1);
+        QCOMPARE(addRdpInGroupSpy.first().at(0).toString(), QStringLiteral("测试环境"));
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostRenameGroupAction")));
         QVERIFY(sidebar.findChild<QAction *>(QStringLiteral("hostDeleteGroupAction")));
         QVERIFY(sidebar.findChild<QMenu *>(QStringLiteral("hostMoveGroupMenu")));
@@ -442,6 +569,93 @@ private slots:
 
         sidebar.selectFirstServer();
         QCOMPARE(tree->currentItem(), hostItem);
+    }
+
+    void rdpProfilesBuildSafeNativeClientLaunches()
+    {
+        noxshell::ServerProfile profile;
+        profile.name = QStringLiteral("Windows 办公电脑");
+        profile.host = QStringLiteral("192.0.2.80");
+        profile.port = 3390;
+        profile.user = QStringLiteral("DOMAIN\\operator");
+        profile.connectionMode = noxshell::ConnectionMode::Rdp;
+
+        QCOMPARE(noxshell::RdpLauncher::endpoint(profile), QStringLiteral("192.0.2.80:3390"));
+        const auto windows = noxshell::RdpLauncher::launchSpec(
+            profile, noxshell::RdpClientPlatform::Windows);
+        QCOMPARE(windows.program, QStringLiteral("mstsc.exe"));
+        QVERIFY(windows.arguments.contains(QStringLiteral("/v:192.0.2.80:3390")));
+        QVERIFY(windows.arguments.contains(QStringLiteral("/prompt")));
+        QVERIFY(!windows.arguments.join(QLatin1Char(' ')).contains(QStringLiteral("password"), Qt::CaseInsensitive));
+
+        const auto mac = noxshell::RdpLauncher::launchSpec(profile, noxshell::RdpClientPlatform::MacOS);
+        QCOMPARE(mac.program, QStringLiteral("/usr/bin/open"));
+        QCOMPARE(mac.arguments.size(), 3);
+        QCOMPARE(mac.arguments.at(0), QStringLiteral("-b"));
+        QCOMPARE(mac.arguments.at(1), QStringLiteral("com.microsoft.rdc.macos"));
+        QVERIFY(mac.arguments.at(2).startsWith(QStringLiteral("rdp://")));
+        QVERIFY(mac.arguments.at(2).contains(QStringLiteral("192.0.2.80:3390")));
+        QVERIFY(mac.arguments.at(2).contains(QStringLiteral("DOMAIN")));
+
+        profile.password = QStringLiteral("must-not-appear-in-rdp-file");
+        const auto fileContents = noxshell::RdpLauncher::connectionFileContents(profile);
+        QVERIFY(fileContents.contains(QStringLiteral("full address:s:192.0.2.80:3390")));
+        QVERIFY(fileContents.contains(QStringLiteral("username:s:DOMAIN\\operator")));
+        QVERIFY(fileContents.contains(QStringLiteral("prompt for credentials:i:0")));
+        QVERIFY(!fileContents.contains(profile.password));
+
+        profile.host = QStringLiteral("2001:db8::10");
+        QCOMPARE(noxshell::RdpLauncher::endpoint(profile), QStringLiteral("[2001:db8::10]:3390"));
+    }
+
+    void rdpDialogCreatesWindowsDesktopProfileWithoutSecrets()
+    {
+        noxshell::ui::RdpDialog dialog;
+        dialog.setAvailableGroups({QStringLiteral("办公电脑"), QStringLiteral("生产环境")});
+        dialog.setInitialGroup(QStringLiteral("办公电脑"));
+        auto *name = dialog.findChild<QLineEdit *>(QStringLiteral("rdpNameEditor"));
+        auto *host = dialog.findChild<QLineEdit *>(QStringLiteral("rdpHostEditor"));
+        auto *port = dialog.findChild<QSpinBox *>(QStringLiteral("rdpPortEditor"));
+        auto *user = dialog.findChild<QLineEdit *>(QStringLiteral("rdpUserEditor"));
+        auto *password = dialog.findChild<QLineEdit *>(QStringLiteral("rdpPasswordEditor"));
+        auto *passwordReveal = dialog.findChild<QAction *>(QStringLiteral("rdpPasswordRevealAction"));
+        auto *group = dialog.findChild<QComboBox *>(QStringLiteral("rdpGroupEditor"));
+        QVERIFY(name);
+        QVERIFY(host);
+        QVERIFY(port);
+        QVERIFY(user);
+        QVERIFY(password);
+        QVERIFY(passwordReveal);
+        QVERIFY(group);
+        QCOMPARE(port->value(), 3389);
+        QCOMPARE(group->currentData().toString(), QStringLiteral("办公电脑"));
+        name->setText(QStringLiteral("win-01"));
+        host->setText(QStringLiteral("203.0.113.20"));
+        user->setText(QStringLiteral("Administrator"));
+        password->setText(QStringLiteral("rdp-secret"));
+        QCOMPARE(password->echoMode(), QLineEdit::Password);
+        passwordReveal->trigger();
+        QCOMPARE(password->echoMode(), QLineEdit::Normal);
+        const auto profile = dialog.profile();
+        QCOMPARE(profile.connectionMode, noxshell::ConnectionMode::Rdp);
+        QCOMPARE(profile.os, QStringLiteral("windows"));
+        QCOMPARE(profile.port, static_cast<quint16>(3389));
+        QCOMPARE(profile.user, QStringLiteral("Administrator"));
+        QCOMPARE(profile.password, QStringLiteral("rdp-secret"));
+        QVERIFY(profile.credentialRef.isEmpty());
+
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("rdp.sqlite3")), false);
+        QVERIFY2(repository.initialize(), qPrintable(repository.lastError()));
+        auto saved = profile;
+        QVERIFY2(repository.saveServer(saved), qPrintable(repository.lastError()));
+        const auto loaded = repository.loadServers();
+        QCOMPARE(loaded.size(), 1);
+        QCOMPARE(loaded.first().connectionMode, noxshell::ConnectionMode::Rdp);
+        QCOMPARE(loaded.first().port, static_cast<quint16>(3389));
+        QCOMPARE(loaded.first().user, QStringLiteral("Administrator"));
+        QVERIFY(loaded.first().password.isEmpty());
     }
 
     void terminalTabContextMenuDuplicatesAndClosesSessions()
@@ -779,11 +993,63 @@ private slots:
         QVERIFY(history.isEmpty());
     }
 
+    void metricCardUsesThinTrackAndExpandsCpuCoresOnHover()
+    {
+        noxshell::ui::MetricCard card(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
+        card.resize(220, 38);
+        card.setValue(QStringLiteral("36.3%"), QStringLiteral("内核态 15.8%"), 36);
+        card.setCoreValues({12.0, 34.0, 56.0, 78.0});
+        card.show();
+        QCoreApplication::processEvents();
+
+        auto *summaryProgress = card.findChild<QProgressBar *>(QStringLiteral("metricProgress"));
+        auto *corePanel = card.findChild<QFrame *>(QStringLiteral("metricCorePanel"));
+        QVERIFY(summaryProgress);
+        QVERIFY(corePanel);
+        QCOMPARE(summaryProgress->height(), 24);
+        QVERIFY(summaryProgress->format().contains(QStringLiteral("36.3%")));
+        QVERIFY(summaryProgress->styleSheet().contains(QStringLiteral("stop:0.39")));
+        QEvent initialLeaveEvent(QEvent::Leave);
+        QApplication::sendEvent(&card, &initialLeaveEvent);
+        QVERIFY(!corePanel->isVisible());
+
+        QEnterEvent enterEvent(QPointF(10, 10), QPointF(10, 10), QPointF(10, 10));
+        QApplication::sendEvent(&card, &enterEvent);
+        QVERIFY(corePanel->isVisible());
+        QVERIFY(card.height() > 38);
+        const auto coreProgresses = corePanel->findChildren<QProgressBar *>(QStringLiteral("metricCoreProgress"));
+        QCOMPARE(coreProgresses.size(), 4);
+        for (int index = 1; index < coreProgresses.size(); ++index) {
+            QCOMPARE(coreProgresses.at(index)->x(), coreProgresses.first()->x());
+            QVERIFY(coreProgresses.at(index)->parentWidget()->y()
+                    > coreProgresses.at(index - 1)->parentWidget()->y());
+        }
+        const int expandedHeight = card.height();
+        card.setCoreValues({22.0, 44.0, 66.0, 88.0});
+        QCoreApplication::processEvents();
+        QCOMPARE(card.height(), expandedHeight);
+        const auto updatedProgresses = corePanel->findChildren<QProgressBar *>(QStringLiteral("metricCoreProgress"));
+        QCOMPARE(updatedProgresses.size(), coreProgresses.size());
+        for (int index = 0; index < coreProgresses.size(); ++index) {
+            QCOMPARE(updatedProgresses.at(index), coreProgresses.at(index));
+        }
+        QCOMPARE(updatedProgresses.last()->value(), 88);
+
+        QEvent leaveEvent(QEvent::Leave);
+        QApplication::sendEvent(&card, &leaveEvent);
+        QVERIFY(!corePanel->isVisible());
+        QCOMPARE(card.height(), 38);
+    }
+
     void parsesLinuxMetricsAndCalculatesCpuDelta()
     {
         const QByteArray firstPayload =
             "__CPU__\n"
             "cpu 100 0 50 800 10 0 0 0\n"
+            "cpu0 25 0 13 200 2 0 0 0\n"
+            "cpu1 25 0 12 200 3 0 0 0\n"
+            "cpu2 25 0 13 200 2 0 0 0\n"
+            "cpu3 25 0 12 200 3 0 0 0\n"
             "__MEM__\n"
             "MemTotal:       1048576 kB\n"
             "MemAvailable:    419430 kB\n"
@@ -805,6 +1071,10 @@ private slots:
         const QByteArray secondPayload =
             "__CPU__\n"
             "cpu 150 0 70 850 10 0 0 0\n"
+            "cpu0 40 0 18 210 2 0 0 0\n"
+            "cpu1 35 0 17 215 3 0 0 0\n"
+            "cpu2 45 0 15 205 5 0 0 0\n"
+            "cpu3 30 0 20 217 3 0 0 0\n"
             "__MEM__\n"
             "MemTotal:       1048576 kB\n"
             "MemAvailable:    419430 kB\n"
@@ -837,6 +1107,9 @@ private slots:
         QVERIFY(sample.cpuReady);
         QVERIFY(qAbs(sample.cpuPercent - 58.333) < 0.01);
         QVERIFY(qAbs(sample.kernelPercent - 16.666) < 0.01);
+        QCOMPARE(sample.cpuCorePercents.size(), 4);
+        QVERIFY(qAbs(sample.cpuCorePercents.at(0) - 66.666) < 0.01);
+        QVERIFY(qAbs(sample.cpuCorePercents.at(1) - 50.0) < 0.01);
         QVERIFY(qAbs(sample.memoryPercent - 60.0) < 0.01);
         QCOMPARE(sample.cpuCoreCount, 4);
         QCOMPARE(sample.primaryDisk.fileSystem, QStringLiteral("/dev/vda1"));
@@ -1108,42 +1381,124 @@ private slots:
         profile.host = QStringLiteral("192.0.2.20");
         profile.user = QStringLiteral("root");
         QVERIFY(repository.saveServer(profile));
+        noxshell::ServerProfile secondProfile;
+        secondProfile.name = QStringLiteral("other-host");
+        secondProfile.host = QStringLiteral("192.0.2.21");
+        secondProfile.user = QStringLiteral("ops");
+        QVERIFY(repository.saveServer(secondProfile));
 
         const auto older = QDateTime::currentDateTime().addSecs(-60);
         const auto newer = QDateTime::currentDateTime();
         QVERIFY(repository.recordCommand(profile.id, QStringLiteral("  pwd  "), older));
         QVERIFY(repository.recordCommand(profile.id, QStringLiteral("ls -la"), older));
         QVERIFY(repository.recordCommand(profile.id, QStringLiteral("pwd"), newer));
-        auto entries = repository.loadCommandHistory(profile.id);
+        auto entries = repository.loadCommandHistory();
         QCOMPARE(entries.size(), 2);
         QCOMPARE(entries.first().command, QStringLiteral("pwd"));
+        QCOMPARE(entries.first().serverName, QStringLiteral("history-host"));
         const auto pwdId = entries.first().id;
         QVERIFY(repository.setCommandFavorite(pwdId, true));
         QVERIFY(repository.setCommandNote(pwdId, QStringLiteral("查看当前目录")));
-        entries = repository.loadCommandHistory(profile.id, true);
+        // The same command remains one device-wide favorite when executed on
+        // another host; only its latest source context is updated.
+        QVERIFY(repository.recordCommand(secondProfile.id, QStringLiteral("pwd"), newer.addSecs(1)));
+        entries = repository.loadCommandHistory(true);
         QCOMPARE(entries.size(), 1);
         QCOMPARE(entries.first().note, QStringLiteral("查看当前目录"));
         QVERIFY(entries.first().favorite);
-        QVERIFY(repository.clearCommandHistory(profile.id));
-        entries = repository.loadCommandHistory(profile.id);
+        QCOMPARE(entries.first().serverName, QStringLiteral("other-host"));
+        QVERIFY(repository.clearCommandHistory());
+        entries = repository.loadCommandHistory();
         QCOMPARE(entries.size(), 1);
         QCOMPARE(entries.first().command, QStringLiteral("pwd"));
         QCOMPARE(entries.first().note, QStringLiteral("查看当前目录"));
         QVERIFY(entries.first().favorite);
-        QCOMPARE(repository.loadCommandHistory(profile.id, true).size(), 1);
+        QCOMPARE(repository.loadCommandHistory(true).size(), 1);
 
-        QVERIFY(repository.clearCommandFavorites(profile.id));
-        QVERIFY(repository.loadCommandHistory(profile.id, true).isEmpty());
-        entries = repository.loadCommandHistory(profile.id);
+        QVERIFY(repository.clearCommandFavorites());
+        QVERIFY(repository.loadCommandHistory(true).isEmpty());
+        entries = repository.loadCommandHistory();
         QCOMPARE(entries.size(), 1);
         QVERIFY(!entries.first().favorite);
         QVERIFY(repository.recordCommand(profile.id, QStringLiteral("whoami")));
-        entries = repository.loadCommandHistory(profile.id);
+        entries = repository.loadCommandHistory();
         QCOMPARE(entries.size(), 2);
         QVERIFY(repository.deleteCommandHistory(entries.last().id));
-        QCOMPARE(repository.loadCommandHistory(profile.id).size(), 1);
-        QVERIFY(repository.clearCommandHistory(profile.id));
-        QVERIFY(repository.loadCommandHistory(profile.id).isEmpty());
+        QCOMPARE(repository.loadCommandHistory().size(), 1);
+        QVERIFY(repository.clearCommandHistory());
+        QVERIFY(repository.loadCommandHistory().isEmpty());
+    }
+
+    void commandHistoryMigratesExistingPerServerDataWithoutLoss()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto databasePath = directory.filePath(QStringLiteral("legacy-command-history.sqlite3"));
+        QString firstServerId;
+        QString secondServerId;
+        {
+            noxshell::ServerRepository repository(databasePath, false);
+            QVERIFY2(repository.initialize(), qPrintable(repository.lastError()));
+            noxshell::ServerProfile first;
+            first.name = QStringLiteral("first-host");
+            first.host = QStringLiteral("192.0.2.30");
+            first.user = QStringLiteral("root");
+            QVERIFY(repository.saveServer(first));
+            firstServerId = first.id;
+            noxshell::ServerProfile second;
+            second.name = QStringLiteral("second-host");
+            second.host = QStringLiteral("192.0.2.31");
+            second.user = QStringLiteral("root");
+            QVERIFY(repository.saveServer(second));
+            secondServerId = second.id;
+        }
+
+        const auto seedConnection = QStringLiteral("legacy-command-history-seed");
+        {
+            auto database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), seedConnection);
+            database.setDatabaseName(databasePath);
+            QVERIFY(database.open());
+            QSqlQuery query(database);
+            QVERIFY(query.exec(QStringLiteral("DROP TABLE command_history")));
+            QVERIFY(query.exec(QStringLiteral(
+                "CREATE TABLE command_history (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "server_id TEXT NOT NULL,command TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',"
+                "favorite INTEGER NOT NULL DEFAULT 0,executed_at TEXT NOT NULL,"
+                "UNIQUE(server_id,command),FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE)")));
+            query.prepare(QStringLiteral(
+                "INSERT INTO command_history(server_id,command,note,favorite,executed_at) VALUES(?,?,?,?,?)"));
+            const auto insert = [&](const QString &serverId, const QString &command, const QString &note,
+                                    bool favorite, const QString &time) {
+                query.bindValue(0, serverId);
+                query.bindValue(1, command);
+                query.bindValue(2, note);
+                query.bindValue(3, favorite ? 1 : 0);
+                query.bindValue(4, time);
+                return query.exec();
+            };
+            QVERIFY(insert(firstServerId, QStringLiteral("systemctl restart app"),
+                QStringLiteral("发布后重启"), true, QStringLiteral("2026-08-27T09:00:00.000Z")));
+            QVERIFY(insert(secondServerId, QStringLiteral("systemctl restart app"),
+                QStringLiteral(""), false, QStringLiteral("2026-08-28T09:00:00.000Z")));
+            QVERIFY(insert(firstServerId, QStringLiteral("uptime"),
+                QStringLiteral(""), false, QStringLiteral("2026-08-27T08:00:00.000Z")));
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(seedConnection);
+
+        noxshell::ServerRepository migrated(databasePath, false);
+        QVERIFY2(migrated.initialize(), qPrintable(migrated.lastError()));
+        const auto entries = migrated.loadCommandHistory();
+        QCOMPARE(entries.size(), 2);
+        const auto restart = std::find_if(entries.cbegin(), entries.cend(), [](const auto &entry) {
+            return entry.command == QStringLiteral("systemctl restart app");
+        });
+        QVERIFY(restart != entries.cend());
+        QVERIFY(restart->favorite);
+        QCOMPARE(restart->note, QStringLiteral("发布后重启"));
+        QCOMPARE(restart->serverName, QStringLiteral("second-host"));
+        QVERIFY(migrated.deleteServer(secondServerId));
+        QCOMPARE(migrated.loadCommandHistory().size(), 2);
     }
 
     void realSshFailureIsReportedWithoutBlockingUi()
@@ -1301,6 +1656,10 @@ private slots:
         auto *transferPanel = panel.findChild<noxshell::ui::TransferQueuePanel *>(QStringLiteral("transferQueuePanel"));
         auto *fileToolbar = panel.findChild<QWidget *>(QStringLiteral("fileToolbar"));
         auto *fileStatus = panel.findChild<QLabel *>(QStringLiteral("fileStatusLabel"));
+        auto *fileLoadingOverlay = panel.findChild<QWidget *>(QStringLiteral("fileLoadingOverlay"));
+        auto *fileLoadingTitle = panel.findChild<QLabel *>(QStringLiteral("fileLoadingTitle"));
+        auto *fileLoadingDetail = panel.findChild<QLabel *>(QStringLiteral("fileLoadingDetail"));
+        auto *fileLoadingProgress = panel.findChild<QProgressBar *>(QStringLiteral("fileLoadingProgress"));
         QVERIFY(tree);
         QVERIFY(directoryTree);
         QVERIFY(browserSplitter);
@@ -1323,6 +1682,13 @@ private slots:
         QVERIFY(!transferEmpty->isHidden());
         QVERIFY(fileToolbar);
         QVERIFY(fileStatus);
+        QVERIFY(fileLoadingOverlay);
+        QVERIFY(fileLoadingTitle);
+        QVERIFY(fileLoadingDetail);
+        QVERIFY(fileLoadingProgress);
+        QCOMPARE(fileLoadingTitle->text(), QStringLiteral("正在加载文件"));
+        QCOMPARE(fileLoadingProgress->minimum(), 0);
+        QCOMPARE(fileLoadingProgress->maximum(), 0);
         QVERIFY(!queueButton->icon().isNull());
         for (auto *button : {backButton, upButton, refreshButton, queueButton}) {
             QCOMPARE(button->size(), QSize(26, 26));
@@ -1351,6 +1717,7 @@ private slots:
         QCOMPARE(browserSplitter->count(), 2);
         QCOMPARE(tree->selectionMode(), QAbstractItemView::ExtendedSelection);
         QTRY_COMPARE_WITH_TIMEOUT(tree->topLevelItemCount(), 8, 1000);
+        QVERIFY(!fileLoadingOverlay->isVisible());
         QTRY_COMPARE_WITH_TIMEOUT(directoryTree->topLevelItemCount(), 1, 1000);
         QCOMPARE(directoryTree->topLevelItem(0)->text(0), QStringLiteral("/"));
         QTRY_VERIFY_WITH_TIMEOUT(directoryTree->currentItem() != nullptr, 1000);
@@ -1401,6 +1768,8 @@ private slots:
         auto *replaceOne = fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileReplaceOne"));
         auto *replaceAll = fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileReplaceAll"));
         auto *findClose = fileEditor->findChild<QToolButton *>(QStringLiteral("remoteFileFindClose"));
+        auto *fileSearchMarkers = fileEditor->findChild<noxshell::ui::SearchMarkerScrollBar *>(
+            QStringLiteral("remoteFileSearchMarkerBar"));
         QVERIFY(editorText);
         QVERIFY(editorStatus);
         QVERIFY(editorTabs);
@@ -1415,6 +1784,7 @@ private slots:
         QVERIFY(replaceOne);
         QVERIFY(replaceAll);
         QVERIFY(findClose);
+        QVERIFY(fileSearchMarkers);
         QVERIFY(!fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileEditorSave")));
         QVERIFY(!fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileEditorClose")));
         QCOMPARE(editorTabs->count(), 1);
@@ -1433,7 +1803,7 @@ private slots:
         QVERIFY(!editorText->toPlainText().isEmpty());
         QVERIFY(!findPanel->isVisible());
 
-        editorText->setPlainText(QStringLiteral("alpha beta alpha\n"));
+        editorText->setPlainText(QStringLiteral("alpha beta\nother line\nalpha\n"));
         editorText->setFocus();
         QTest::keyClick(editorText, Qt::Key_F, Qt::MetaModifier);
         QTRY_VERIFY_WITH_TIMEOUT(findPanel->isVisible(), 1000);
@@ -1448,6 +1818,8 @@ private slots:
         QVERIFY(!replaceRow->isVisible());
         findEdit->setText(QStringLiteral("alpha"));
         QTRY_COMPARE_WITH_TIMEOUT(findStatus->text(), QStringLiteral("1 / 2"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(fileSearchMarkers->searchMarkerCount(), 2, 1000);
+        QCOMPARE(fileSearchMarkers->currentSearchMarker(), 0);
         QTRY_COMPARE_WITH_TIMEOUT(editorText->extraSelections().size(), 3, 1000);
         int allMatchHighlights = 0;
         int currentMatchHighlights = 0;
@@ -1458,6 +1830,13 @@ private slots:
         }
         QCOMPARE(allMatchHighlights, 1);
         QCOMPARE(currentMatchHighlights, 1);
+        QTest::mouseClick(fileSearchMarkers, Qt::LeftButton, Qt::NoModifier,
+            fileSearchMarkers->searchMarkerRect(1).center());
+        QCOMPARE(findStatus->text(), QStringLiteral("2 / 2"));
+        QCOMPARE(fileSearchMarkers->currentSearchMarker(), 1);
+        QTest::mouseClick(fileSearchMarkers, Qt::LeftButton, Qt::NoModifier,
+            fileSearchMarkers->searchMarkerRect(0).center());
+        QCOMPARE(findStatus->text(), QStringLiteral("1 / 2"));
         QTest::mouseClick(findNext, Qt::LeftButton);
         QCOMPARE(findStatus->text(), QStringLiteral("2 / 2"));
         QTest::keyClick(findEdit, Qt::Key_F, Qt::MetaModifier | Qt::AltModifier);
@@ -1475,6 +1854,7 @@ private slots:
         QTest::mouseClick(findClose, Qt::LeftButton);
         QVERIFY(!findPanel->isVisible());
         QCOMPARE(editorText->extraSelections().size(), 1);
+        QCOMPARE(fileSearchMarkers->searchMarkerCount(), 0);
 
         editorText->setPlainText(QStringLiteral("edited from standalone editor\n"));
         QVERIFY(!editorTabs->tabIcon(0).isNull());
@@ -2003,14 +2383,45 @@ private slots:
         auto *sidebarToggle = window.findChild<QToolButton *>(QStringLiteral("sidebarToggleButton"));
         auto *monitorToggle = window.findChild<QToolButton *>(QStringLiteral("monitorToggleButton"));
         auto *settingsButton = window.findChild<QToolButton *>(QStringLiteral("terminalSettingsButton"));
+        auto *themeButton = window.findChild<QToolButton *>(QStringLiteral("themeModeButton"));
         auto *windowToolbar = window.findChild<QToolBar *>(QStringLiteral("windowControlsToolbar"));
         QVERIFY(sidebar);
         QVERIFY(sidebarToggle);
         QVERIFY(monitorToggle);
         QVERIFY(settingsButton);
+        QVERIFY(themeButton);
         QVERIFY(windowToolbar);
         QCOMPARE(sidebarToggle->parentWidget(), monitorToggle->parentWidget());
         QCOMPARE(sidebarToggle->parentWidget(), settingsButton->parentWidget());
+        QCOMPARE(themeButton->parentWidget(), settingsButton->parentWidget());
+        QVERIFY(themeButton->menu());
+        auto *systemTheme = themeButton->menu()->findChild<QAction *>(QStringLiteral("themeSystemAction"));
+        auto *lightTheme = themeButton->menu()->findChild<QAction *>(QStringLiteral("themeLightAction"));
+        auto *darkTheme = themeButton->menu()->findChild<QAction *>(QStringLiteral("themeDarkAction"));
+        QVERIFY(systemTheme);
+        QVERIFY(lightTheme);
+        QVERIFY(darkTheme);
+        QCOMPARE(static_cast<int>(systemTheme->isChecked()) + static_cast<int>(lightTheme->isChecked())
+                + static_cast<int>(darkTheme->isChecked()), 1);
+        QSettings themeSettings;
+        const bool hadStoredTheme = themeSettings.contains(QStringLiteral("ui/themeMode"));
+        const auto previousStoredTheme = themeSettings.value(QStringLiteral("ui/themeMode"));
+        darkTheme->trigger();
+        QVERIFY(QApplication::instance()->property("noxshellDarkTheme").toBool());
+        QCOMPARE(themeSettings.value(QStringLiteral("ui/themeMode")).toString(), QStringLiteral("dark"));
+        QVERIFY(themeButton->toolTip().contains(QStringLiteral("暗色")));
+        lightTheme->trigger();
+        QVERIFY(!QApplication::instance()->property("noxshellDarkTheme").toBool());
+        QCOMPARE(themeSettings.value(QStringLiteral("ui/themeMode")).toString(), QStringLiteral("light"));
+        if (hadStoredTheme) {
+            themeSettings.setValue(QStringLiteral("ui/themeMode"), previousStoredTheme);
+            const auto restored = noxshell::ui::themeModeFromSetting(previousStoredTheme.toString());
+            (restored == noxshell::ui::ThemeMode::Dark ? darkTheme
+                : restored == noxshell::ui::ThemeMode::Light ? lightTheme : systemTheme)->trigger();
+        } else {
+            systemTheme->trigger();
+            themeSettings.remove(QStringLiteral("ui/themeMode"));
+        }
 #ifdef Q_OS_WIN
         QVERIFY(window.windowFlags().testFlag(Qt::FramelessWindowHint));
         QVERIFY(window.findChild<QToolButton *>(QStringLiteral("windowMinimizeButton")));
@@ -2109,8 +2520,10 @@ private slots:
         QVERIFY(monitorDetails);
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("monitorHeading")));
         QVERIFY(!window.findChild<QToolButton *>(QStringLiteral("monitorTrendToggle")));
-        QCOMPARE(metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow")).size(), 3);
-        for (auto *metricRow : metricSummary->findChildren<QFrame *>(QStringLiteral("metricRow"))) {
+        const auto metricRows = metricSummary->findChildren<noxshell::ui::MetricCard *>(
+            QStringLiteral("metricRow"), Qt::FindDirectChildrenOnly);
+        QCOMPARE(metricRows.size(), 3);
+        for (auto *metricRow : metricRows) {
             QCOMPARE(metricRow->height(), 38);
             auto *progress = metricRow->findChild<QProgressBar *>();
             QVERIFY(progress);
@@ -2118,6 +2531,17 @@ private slots:
             QCOMPARE(progress->height(), 24);
             QVERIFY(progress->isTextVisible());
         }
+        metricRows.at(0)->setCoreValues({12.0, 34.0, 56.0, 78.0});
+        QEnterEvent metricEnterEvent(QPointF(10, 10), QPointF(10, 10), QPointF(10, 10));
+        QApplication::sendEvent(metricRows.at(0), &metricEnterEvent);
+        QCoreApplication::processEvents();
+        QVERIFY(metricRows.at(0)->height() > 38);
+        QVERIFY(metricRows.at(0)->geometry().bottom() < metricRows.at(1)->geometry().top());
+        QVERIFY(metricRows.at(1)->geometry().bottom() < metricRows.at(2)->geometry().top());
+        QEvent metricLeaveEvent(QEvent::Leave);
+        QApplication::sendEvent(metricRows.at(0), &metricLeaveEvent);
+        QCoreApplication::processEvents();
+        QCOMPARE(metricRows.at(0)->height(), 38);
         QVERIFY(monitorDetails->isVisible());
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 0);
         QVERIFY(!window.findChild<QComboBox *>(QStringLiteral("historyRange")));
@@ -2218,6 +2642,12 @@ private slots:
         QVERIFY(commandHistoryClear->toolTip().contains(QStringLiteral("已收藏命令保持不变")));
         QTRY_COMPARE_WITH_TIMEOUT(commandHistory->topLevelItemCount(), 1, 1000);
         QCOMPARE(commandHistory->topLevelItem(0)->text(1), QStringLiteral("pwd"));
+        input->setText(QStringLiteral("draft command to replace"));
+        commandHistory->itemDoubleClicked(commandHistory->topLevelItem(0), 1);
+        QCOMPARE(input->text(), QStringLiteral("pwd"));
+        QVERIFY(!historyPanel->isVisible());
+        QTest::mouseClick(historyButton, Qt::LeftButton);
+        QVERIFY(historyPanel->isVisible());
         bool historyPrepared = false;
         QVERIFY(QMetaObject::invokeMethod(historyPanel, "prepareItemActions", Qt::DirectConnection,
             Q_RETURN_ARG(bool, historyPrepared), Q_ARG(int, 0)));
@@ -2227,8 +2657,14 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(commandHistory->topLevelItemCount(), 1, 1000);
         QCOMPARE(commandHistoryClear->text(), QStringLiteral("清空收藏"));
         QVERIFY(commandHistoryClear->toolTip().contains(QStringLiteral("保留在历史")));
-        QTest::mouseClick(historyButton, Qt::LeftButton);
+        QSignalSpy escapeInputSpy(output, &noxshell::ui::TerminalView::inputGenerated);
+        output->setFocus();
+        QTest::keyClick(output, Qt::Key_Escape);
         QVERIFY(!historyPanel->isVisible());
+        QCOMPARE(escapeInputSpy.count(), 0);
+        QTest::keyClick(output, Qt::Key_Escape);
+        QCOMPARE(escapeInputSpy.count(), 1);
+        QCOMPARE(escapeInputSpy.first().at(0).toByteArray(), QByteArray("\x1b"));
 
         QVERIFY(filePane->isVisible());
         QTest::mouseClick(fileToggleButton, Qt::LeftButton);
@@ -2485,7 +2921,7 @@ int main(int argc, char **argv)
     QApplication::setApplicationName(QStringLiteral("玄壳"));
     QApplication::setOrganizationName(QStringLiteral("NoxShell"));
     QApplication::setApplicationVersion(QString::fromLatin1(NOXSHELL_APP_VERSION));
-    app.setStyleSheet(noxshell::ui::applicationStyleSheet());
+    noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light);
     SmokeTest test;
     return QTest::qExec(&test, argc, argv);
 }

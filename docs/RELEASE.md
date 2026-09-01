@@ -19,6 +19,8 @@
 
 自动发布包含 macOS arm64/x86_64 DMG、Windows x64 NSIS EXE/便携 ZIP 和统一的 SHA-256 校验文件。Windows 使用 `vcpkg` 的 `x64-windows-static-md` triplet 静态链接 libssh2/zlib，避免安装后缺少非 Qt DLL；Qt 运行库和插件由 CMake 的 Qt 部署脚本写入安装包。
 
+macOS DMG 同时包含“一键修复玄壳.command”。该入口仅在未签名或未公证的测试包被 Gatekeeper 隔离时使用，目标固定为 `/Applications/玄壳.app`；它不能替代正式发布所需的 Developer ID 签名与 Apple 公证。
+
 Windows 本地打包要求：CMake 3.25+、Qt 6.5+、vcpkg、NSIS 3.03+。配置时指定 vcpkg toolchain，然后运行：
 
 ```powershell

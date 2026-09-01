@@ -14,6 +14,7 @@ enum class ServerState {
 enum class ConnectionMode {
     Demo,
     Ssh,
+    Rdp,
 };
 
 enum class AuthenticationMethod {

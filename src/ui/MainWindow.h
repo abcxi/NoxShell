@@ -2,6 +2,7 @@
 
 #include "../core/LinuxMetrics.h"
 #include "../core/ServerProfile.h"
+#include "AppTheme.h"
 
 #include <QMainWindow>
 #include <QHash>
@@ -14,6 +15,7 @@ class QToolButton;
 class QToolBar;
 class QStackedWidget;
 class QSplitter;
+class QAction;
 
 namespace noxshell {
 class SshSession;
@@ -51,6 +53,8 @@ private:
     void setMonitorVisible(bool visible);
     void setFileWorkspaceVisible(bool visible);
     void showTerminalSettings();
+    void setThemeMode(ThemeMode mode, bool persist = true);
+    void updateThemePresentation();
     void updateConnectionPresentation(const QString &serverId, bool connected, const QString &message);
     void setConnectionBadge(const QString &text, const QString &foreground, const QString &background);
     void selectServer(const ServerProfile &profile);
@@ -67,6 +71,8 @@ private:
     void resetMetrics(const QString &detail);
     void addServer();
     void addServerInGroup(const QString &group);
+    void addRdpServer();
+    void addRdpServerInGroup(const QString &group);
     void editServer(const ServerProfile &profile);
     void deleteServer(const ServerProfile &profile);
     bool persistProfile(ServerProfile &profile, bool preserveEmptySecret);
@@ -78,6 +84,10 @@ private:
     QToolButton *m_sidebarToggleButton{};
     QToolButton *m_monitorToggleButton{};
     QToolButton *m_settingsButton{};
+    QToolButton *m_themeModeButton{};
+    QAction *m_systemThemeAction{};
+    QAction *m_lightThemeAction{};
+    QAction *m_darkThemeAction{};
     QToolButton *m_maximizeWindowButton{};
     QWidget *m_monitorRail{};
     MetricCard *m_cpuCard{};
@@ -102,6 +112,7 @@ private:
     bool m_serverDeletionInFlight{false};
     bool m_nativeTitleBarControls{false};
     bool m_fileWorkspaceVisible{true};
+    ThemeMode m_themeMode{ThemeMode::System};
 };
 
 } // namespace noxshell::ui

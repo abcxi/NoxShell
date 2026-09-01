@@ -3,6 +3,7 @@
 #include "../core/SshSession.h"
 #include "../core/CredentialStore.h"
 #include "../core/ServerRepository.h"
+#include "../core/RdpLauncher.h"
 #include "FilePanel.h"
 #include "HostSidebar.h"
 #include "MetricCard.h"
@@ -10,12 +11,14 @@
 #include "MacTitleBarControls.h"
 #endif
 #include "ServerDialog.h"
+#include "RdpDialog.h"
 #include "SystemDetailPanel.h"
 #include "TerminalSettingsDialog.h"
 #include "TerminalView.h"
 #include "TerminalWorkspace.h"
 
 #include <QApplication>
+#include <QActionGroup>
 #include <QClipboard>
 #include <QDebug>
 #include <QEvent>
@@ -25,6 +28,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QScrollArea>
@@ -32,6 +36,7 @@
 #include <QSizePolicy>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QStyleHints>
 #include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
@@ -110,7 +115,9 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
     , m_repository(new ServerRepository(std::move(databasePath), true, this))
     , m_credentialStore(new CredentialStore(this))
 {
-    setWindowTitle(QStringLiteral("玄壳 · SSH 远程管理"));
+    m_themeMode = storedThemeMode();
+    applyApplicationTheme(m_themeMode);
+    setWindowTitle(QStringLiteral("玄壳 · 远程连接管理"));
 #ifdef Q_OS_WIN
     // Windows 使用应用内标题栏，把三枚工作区工具按钮与最小化、最大化、
     // 关闭按钮合并为一行；macOS 继续使用原生标题栏附件。
@@ -176,21 +183,25 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
                 return installMacTitleBarControls(this,
                     [this] { setSidebarVisible(m_sidebar->isHidden()); },
                     [this] { setMonitorVisible(m_monitorRail->isHidden()); },
-                    [this] { showTerminalSettings(); });
+                    [this] { showTerminalSettings(); },
+                    [this](int mode) { setThemeMode(static_cast<ThemeMode>(mode)); },
+                    static_cast<int>(m_themeMode));
             };
             if (install()) {
                 updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
-                    m_monitorRail && m_monitorRail->isVisible());
+                    m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
                 qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
             } else {
                 QTimer::singleShot(100, this, [this] {
                     const bool installed = installMacTitleBarControls(this,
                         [this] { setSidebarVisible(m_sidebar->isHidden()); },
                         [this] { setMonitorVisible(m_monitorRail->isHidden()); },
-                        [this] { showTerminalSettings(); });
+                        [this] { showTerminalSettings(); },
+                        [this](int mode) { setThemeMode(static_cast<ThemeMode>(mode)); },
+                        static_cast<int>(m_themeMode));
                     if (installed) {
                         updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
-                            m_monitorRail && m_monitorRail->isVisible());
+                            m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
                         qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
                     }
                     else qWarning().noquote() << QStringLiteral("macOS 原生标题栏双栏开关安装失败");
@@ -209,6 +220,8 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
     connect(m_sidebar, &HostSidebar::serverDeleteRequested, this, &MainWindow::selectAndDeleteServer);
     connect(m_sidebar, &HostSidebar::addServerRequested, this, &MainWindow::addServer);
     connect(m_sidebar, &HostSidebar::addServerInGroupRequested, this, &MainWindow::addServerInGroup);
+    connect(m_sidebar, &HostSidebar::addRdpServerRequested, this, &MainWindow::addRdpServer);
+    connect(m_sidebar, &HostSidebar::addRdpServerInGroupRequested, this, &MainWindow::addRdpServerInGroup);
     connect(m_sidebar, &HostSidebar::serverGroupChanged, this, [this](const ServerProfile &updated) {
         auto profile = updated;
         if (!m_repository->saveServer(profile)) {
@@ -256,6 +269,13 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent)
     connect(m_metricTimer, &QTimer::timeout, this, &MainWindow::requestMetrics);
     m_metricTimer->start();
 
+    connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this,
+        [this](Qt::ColorScheme) {
+            if (m_themeMode != ThemeMode::System) return;
+            applyApplicationTheme(m_themeMode);
+            updateThemePresentation();
+        });
+
     QTimer::singleShot(0, this, [this] {
         m_sidebar->selectFirstServer();
     });
@@ -295,6 +315,33 @@ QToolBar *MainWindow::createWindowToolbar()
     m_settingsButton->setToolTip(QStringLiteral("终端显示设置"));
     m_settingsButton->setAccessibleName(QStringLiteral("终端显示设置"));
 
+    m_themeModeButton = new QToolButton;
+    m_themeModeButton->setObjectName(QStringLiteral("themeModeButton"));
+    m_themeModeButton->setFixedSize(30, 28);
+    m_themeModeButton->setPopupMode(QToolButton::InstantPopup);
+    auto *themeMenu = new QMenu(m_themeModeButton);
+    themeMenu->setObjectName(QStringLiteral("themeModeMenu"));
+    auto *themeGroup = new QActionGroup(themeMenu);
+    themeGroup->setExclusive(true);
+    const auto addThemeAction = [themeMenu, themeGroup](const QString &text, const QString &name, ThemeMode mode) {
+        auto *action = themeMenu->addAction(text);
+        action->setObjectName(name);
+        action->setCheckable(true);
+        action->setData(static_cast<int>(mode));
+        themeGroup->addAction(action);
+        return action;
+    };
+    m_systemThemeAction = addThemeAction(QStringLiteral("跟随系统"),
+        QStringLiteral("themeSystemAction"), ThemeMode::System);
+    m_lightThemeAction = addThemeAction(QStringLiteral("亮色模式"),
+        QStringLiteral("themeLightAction"), ThemeMode::Light);
+    m_darkThemeAction = addThemeAction(QStringLiteral("暗色模式"),
+        QStringLiteral("themeDarkAction"), ThemeMode::Dark);
+    m_themeModeButton->setMenu(themeMenu);
+    connect(themeGroup, &QActionGroup::triggered, this, [this](QAction *action) {
+        setThemeMode(static_cast<ThemeMode>(action->data().toInt()));
+    });
+
     toolbar->addWidget(m_sidebarToggleButton);
     toolbar->addWidget(m_monitorToggleButton);
     toolbar->addWidget(m_settingsButton);
@@ -302,13 +349,14 @@ QToolBar *MainWindow::createWindowToolbar()
     auto *leftSpacer = new QWidget;
     leftSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(leftSpacer);
-    auto *title = new QLabel(QStringLiteral("玄壳 · SSH 远程管理"));
+    auto *title = new QLabel(QStringLiteral("玄壳 · 远程连接管理"));
     title->setObjectName(QStringLiteral("windowToolbarTitle"));
     title->setAlignment(Qt::AlignCenter);
     toolbar->addWidget(title);
     auto *rightSpacer = new QWidget;
     rightSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(rightSpacer);
+    toolbar->addWidget(m_themeModeButton);
 
 #ifdef Q_OS_WIN
     const auto systemButton = [toolbar](const QString &text, const QString &name, const QString &toolTip) {
@@ -334,6 +382,7 @@ QToolBar *MainWindow::createWindowToolbar()
     connect(closeButton, &QToolButton::clicked, this, &QWidget::close);
 #endif
     connect(m_settingsButton, &QToolButton::clicked, this, &MainWindow::showTerminalSettings);
+    updateThemePresentation();
     return toolbar;
 }
 
@@ -401,6 +450,45 @@ void MainWindow::showTerminalSettings()
     }
 }
 
+void MainWindow::setThemeMode(ThemeMode mode, bool persist)
+{
+    m_themeMode = mode;
+    if (persist) {
+        QSettings settings;
+        settings.setValue(QStringLiteral("ui/themeMode"), themeModeSettingValue(mode));
+    }
+    applyApplicationTheme(mode);
+    updateThemePresentation();
+}
+
+void MainWindow::updateThemePresentation()
+{
+    const bool dark = isDarkTheme(m_themeMode);
+    const QString modeName = m_themeMode == ThemeMode::System
+        ? QStringLiteral("跟随系统")
+        : m_themeMode == ThemeMode::Light ? QStringLiteral("亮色模式") : QStringLiteral("暗色模式");
+    if (m_themeModeButton) {
+        m_themeModeButton->setText(m_themeMode == ThemeMode::System
+                ? QStringLiteral("◐") : dark ? QStringLiteral("☾") : QStringLiteral("☀"));
+        m_themeModeButton->setToolTip(QStringLiteral("界面外观：%1").arg(modeName));
+        m_themeModeButton->setAccessibleName(m_themeModeButton->toolTip());
+    }
+    if (m_systemThemeAction) m_systemThemeAction->setChecked(m_themeMode == ThemeMode::System);
+    if (m_lightThemeAction) m_lightThemeAction->setChecked(m_themeMode == ThemeMode::Light);
+    if (m_darkThemeAction) m_darkThemeAction->setChecked(m_themeMode == ThemeMode::Dark);
+    if (m_onlineBadge && m_onlineBadge->property("badgeForeground").isValid()) {
+        setConnectionBadge(m_onlineBadge->text(),
+            m_onlineBadge->property("badgeForeground").toString(),
+            m_onlineBadge->property("badgeBackground").toString());
+    }
+#ifdef Q_OS_MACOS
+    if (m_nativeTitleBarControls) {
+        updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
+            m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
+    }
+#endif
+}
+
 void MainWindow::setSidebarVisible(bool visible)
 {
     if (!m_sidebar) return;
@@ -414,7 +502,8 @@ void MainWindow::setSidebarVisible(bool visible)
         m_sidebarToggleButton->setAccessibleName(action);
     }
 #ifdef Q_OS_MACOS
-    if (m_nativeTitleBarControls) updateMacTitleBarControls(this, visible, m_monitorRail && m_monitorRail->isVisible());
+    if (m_nativeTitleBarControls) updateMacTitleBarControls(this, visible,
+        m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
 #endif
 }
 
@@ -431,7 +520,8 @@ void MainWindow::setMonitorVisible(bool visible)
         m_monitorToggleButton->setAccessibleName(action);
     }
 #ifdef Q_OS_MACOS
-    if (m_nativeTitleBarControls) updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(), visible);
+    if (m_nativeTitleBarControls) updateMacTitleBarControls(this,
+        m_sidebar && m_sidebar->isVisible(), visible, static_cast<int>(m_themeMode));
 #endif
 }
 
@@ -537,10 +627,14 @@ QWidget *MainWindow::createMetricStrip()
     m_loadCard = new MetricCard(QStringLiteral("负载"), QColor(QStringLiteral("#00A870")));
     auto *summary = new QFrame;
     summary->setObjectName(QStringLiteral("monitorMetricSummary"));
-    summary->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    // CPU hover details temporarily increase the first metric row. The summary
+    // must be allowed to follow its layout's size hint or the core rows are
+    // compressed over the memory/load rows.
+    summary->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
     auto *summaryLayout = new QVBoxLayout(summary);
     summaryLayout->setContentsMargins(0, 0, 0, 0);
     summaryLayout->setSpacing(0);
+    summaryLayout->setSizeConstraint(QLayout::SetMinimumSize);
 
     auto *systemInfo = new QFrame;
     systemInfo->setObjectName(QStringLiteral("monitorSystemSummary"));
@@ -633,9 +727,9 @@ QWidget *MainWindow::createFileWorkspace()
     m_fileWorkspaceStack = new QStackedWidget;
     m_fileWorkspaceStack->setObjectName(QStringLiteral("fileWorkspaceStack"));
     m_filePlaceholder = new QLabel(QStringLiteral("选择 SSH 会话后显示文件管理"));
+    m_filePlaceholder->setObjectName(QStringLiteral("fileWorkspacePlaceholder"));
     auto *placeholderLabel = qobject_cast<QLabel *>(m_filePlaceholder);
     placeholderLabel->setAlignment(Qt::AlignCenter);
-    placeholderLabel->setStyleSheet(QStringLiteral("color:#8B9AAF;background:#FBFCFD;"));
     m_fileWorkspaceStack->addWidget(m_filePlaceholder);
     layout->addWidget(m_fileWorkspaceStack);
     return widget;
@@ -670,6 +764,20 @@ void MainWindow::selectServer(const ServerProfile &profile)
     m_hasMetricSample = false;
     resetMetrics(QStringLiteral("等待连接 · 双击主机或右键连接"));
     m_serverMeta->setText(profile.host);
+    if (profile.connectionMode == ConnectionMode::Rdp) {
+        m_session = nullptr;
+        m_filePanel = nullptr;
+        resetMetrics(QStringLiteral("Windows 远程桌面由系统客户端运行"));
+        if (auto *placeholder = qobject_cast<QLabel *>(m_filePlaceholder)) {
+            placeholder->setText(QStringLiteral("Windows 远程桌面在系统客户端中打开"));
+        }
+        if (m_fileWorkspaceStack && m_filePlaceholder) m_fileWorkspaceStack->setCurrentWidget(m_filePlaceholder);
+        setConnectionBadge(QStringLiteral("RDP 远程桌面"), QStringLiteral("#6F42C1"), QStringLiteral("#F1EAFE"));
+        return;
+    }
+    if (auto *placeholder = qobject_cast<QLabel *>(m_filePlaceholder)) {
+        placeholder->setText(QStringLiteral("选择 SSH 会话后显示文件管理"));
+    }
     const bool connectedNow = m_terminalWorkspace && m_terminalWorkspace->hasConnectedSession(profile.id);
     if (connectedNow) {
         m_currentServer.state = ServerState::Online;
@@ -706,7 +814,13 @@ void MainWindow::bindSession(SshSession *session)
         if (m_sampleStatus) m_sampleStatus->setText(QStringLiteral("采样失败 · %1").arg(message));
     });
     connect(session, &SshSession::connectionChanged, this, [this, session](bool connected, const QString &) {
-        if (connected && session == m_session) requestMetrics();
+        if (!connected || session != m_session) return;
+        // The terminal is the primary interactive surface. Give its login
+        // banner/prompt one short frame window before starting the first
+        // blocking metrics channel on the shared SSH transport.
+        QTimer::singleShot(120, this, [this, session] {
+            if (session == m_session && session->isConnected()) requestMetrics();
+        });
     });
 }
 
@@ -747,6 +861,38 @@ void MainWindow::connectToServer(const ServerProfile &profile)
 {
     if (profile.id.isEmpty()) return;
     selectServer(profile);
+    if (profile.connectionMode == ConnectionMode::Rdp) {
+        auto launchProfile = profile;
+        if (!profile.credentialRef.isEmpty()) {
+            launchProfile.password = m_credentialStore->load(profile.credentialRef).password;
+        }
+#ifdef Q_OS_MACOS
+        const auto copiedPassword = launchProfile.password;
+        if (!copiedPassword.isEmpty()) QApplication::clipboard()->setText(copiedPassword);
+#endif
+        QString error;
+        if (!RdpLauncher::launch(launchProfile, &error)) {
+#ifdef Q_OS_MACOS
+            if (!copiedPassword.isEmpty() && QApplication::clipboard()->text() == copiedPassword) {
+                QApplication::clipboard()->clear();
+            }
+#endif
+            QMessageBox::warning(this, QStringLiteral("无法打开远程桌面"), error);
+            setConnectionBadge(QStringLiteral("RDP 启动失败"), QStringLiteral("#B42318"), QStringLiteral("#FEECEB"));
+            return;
+        }
+        setConnectionBadge(QStringLiteral("↗ 已打开 RDP"), QStringLiteral("#6F42C1"), QStringLiteral("#F1EAFE"));
+#ifdef Q_OS_MACOS
+        if (!copiedPassword.isEmpty()) {
+            if (m_sampleStatus) m_sampleStatus->setText(QStringLiteral("Windows App 已打开 · 密码已复制，60 秒后清除"));
+            QTimer::singleShot(60000, this, [copiedPassword] {
+                if (QApplication::clipboard()->text() == copiedPassword) QApplication::clipboard()->clear();
+            });
+        } else
+#endif
+        if (m_sampleStatus) m_sampleStatus->setText(QStringLiteral("远程桌面已交给系统客户端"));
+        return;
+    }
     if (m_terminalWorkspace) m_terminalWorkspace->openOrActivate(profile);
 }
 
@@ -769,7 +915,8 @@ void MainWindow::duplicateServer(const ServerProfile &profile)
     duplicate.credentialRef.clear();
     duplicate.name = QStringLiteral("%1 副本").arg(profile.name);
     duplicate.state = ServerState::Offline;
-    if (duplicate.authentication != AuthenticationMethod::SshAgent && !sourceCredentialRef.isEmpty()) {
+    if (duplicate.connectionMode != ConnectionMode::Rdp
+        && duplicate.authentication != AuthenticationMethod::SshAgent && !sourceCredentialRef.isEmpty()) {
         const auto secret = m_credentialStore->load(sourceCredentialRef);
         duplicate.password = secret.password;
         duplicate.keyPassphrase = secret.keyPassphrase;
@@ -780,6 +927,29 @@ void MainWindow::duplicateServer(const ServerProfile &profile)
 bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret)
 {
     if (profile.id.isEmpty()) profile.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (profile.connectionMode == ConnectionMode::Rdp) {
+        CredentialSecret secret;
+        if (preserveEmptySecret && !profile.credentialRef.isEmpty()) {
+            secret = m_credentialStore->load(profile.credentialRef);
+        }
+        if (!profile.password.isEmpty()) secret.password = profile.password;
+        if (!secret.password.isEmpty()) {
+            if (profile.credentialRef.isEmpty()) profile.credentialRef = QStringLiteral("rdp/%1").arg(profile.id);
+            if (!m_credentialStore->save(profile.credentialRef, secret)) {
+                QMessageBox::critical(this, QStringLiteral("保存 RDP 密码失败"), m_credentialStore->lastError());
+                return false;
+            }
+        }
+        profile.password.clear();
+        profile.keyPassphrase.clear();
+        profile.privateKeyPath.clear();
+        profile.publicKeyPath.clear();
+        if (!m_repository->saveServer(profile)) {
+            QMessageBox::critical(this, QStringLiteral("保存远程桌面失败"), m_repository->lastError());
+            return false;
+        }
+        return true;
+    }
     if (profile.credentialRef.isEmpty()) profile.credentialRef = QStringLiteral("server/%1").arg(profile.id);
 
     CredentialSecret secret;
@@ -808,7 +978,7 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
 
 void MainWindow::addServer()
 {
-    addServerInGroup(QStringLiteral("我的主机"));
+    addServerInGroup(QString{});
 }
 
 void MainWindow::addServerInGroup(const QString &group)
@@ -822,9 +992,33 @@ void MainWindow::addServerInGroup(const QString &group)
     if (persistProfile(profile, false)) m_sidebar->addServer(profile);
 }
 
+void MainWindow::addRdpServer()
+{
+    addRdpServerInGroup(QString{});
+}
+
+void MainWindow::addRdpServerInGroup(const QString &group)
+{
+    RdpDialog dialog(this);
+    dialog.setAvailableGroups(m_repository->loadServerGroups());
+    dialog.setInitialGroup(group);
+    if (dialog.exec() != QDialog::Accepted) return;
+    auto profile = dialog.profile();
+    if (persistProfile(profile, false)) m_sidebar->addServer(profile);
+}
+
 void MainWindow::editServer(const ServerProfile &sourceProfile)
 {
     if (sourceProfile.id.isEmpty()) return;
+    if (sourceProfile.connectionMode == ConnectionMode::Rdp) {
+        RdpDialog dialog(sourceProfile, this);
+        dialog.setAvailableGroups(m_repository->loadServerGroups());
+        if (dialog.exec() != QDialog::Accepted) return;
+        auto profile = dialog.profile();
+        if (!persistProfile(profile, true)) return;
+        m_sidebar->updateServer(profile);
+        return;
+    }
     auto editable = sourceProfile;
     editable.expectedFingerprint = m_repository->knownHostFingerprint(editable.host, editable.port);
     ServerDialog dialog(editable, this);
@@ -845,8 +1039,8 @@ void MainWindow::deleteServer(const ServerProfile &removedProfile)
 {
     if (removedProfile.id.isEmpty() || m_serverDeletionInFlight) return;
     const auto answer = QMessageBox::warning(
-        this, QStringLiteral("删除服务器"),
-        QStringLiteral("确定删除“%1”（%2:%3）吗？服务器配置和关联凭据会被移除，此操作不可撤销。")
+        this, QStringLiteral("删除远程连接"),
+        QStringLiteral("确定删除“%1”（%2:%3）吗？连接配置和关联凭据会被移除，此操作不可撤销。")
             .arg(removedProfile.name, removedProfile.host).arg(removedProfile.port),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes) return;
@@ -876,8 +1070,24 @@ void MainWindow::setConnectionBadge(const QString &text, const QString &foregrou
 {
     if (!m_onlineBadge) return;
     m_onlineBadge->setText(text);
+    m_onlineBadge->setProperty("badgeForeground", foreground);
+    m_onlineBadge->setProperty("badgeBackground", background);
+    QString themedForeground = foreground;
+    QString themedBackground = background;
+    if (isApplicationDarkTheme()) {
+        if (text.contains(QStringLiteral("在线"))) {
+            themedForeground = QStringLiteral("#55D6A9");
+            themedBackground = QStringLiteral("#15372F");
+        } else if (text.contains(QStringLiteral("连接中"))) {
+            themedForeground = QStringLiteral("#70B7FF");
+            themedBackground = QStringLiteral("#16324A");
+        } else {
+            themedForeground = QStringLiteral("#9AABBD");
+            themedBackground = QStringLiteral("#252F3A");
+        }
+    }
     m_onlineBadge->setStyleSheet(QStringLiteral("color:%1;background:%2;border-radius:3px;padding:2px 8px;")
-            .arg(foreground, background));
+            .arg(themedForeground, themedBackground));
 }
 
 void MainWindow::updateConnectionPresentation(const QString &serverId, bool connected, const QString &message)
@@ -928,6 +1138,7 @@ void MainWindow::displayMetrics(const MetricSample &sample)
     } else {
         m_cpuCard->setValue(QStringLiteral("--"), QStringLiteral("已建立差分基线"), 0);
     }
+    m_cpuCard->setCoreValues(sample.cpuCorePercents);
 
     const int memoryProgress = qBound(0, qRound(sample.memoryPercent), 100);
     m_memoryCard->setValue(QStringLiteral("%1%").arg(sample.memoryPercent, 0, 'f', 1),
@@ -949,6 +1160,7 @@ void MainWindow::resetMetrics(const QString &detail)
     for (auto *card : {m_cpuCard, m_memoryCard, m_loadCard}) {
         card->setValue(QStringLiteral("--"), detail, 0);
     }
+    m_cpuCard->setCoreValues({});
     if (m_uptimeValue) m_uptimeValue->setText(QStringLiteral("--"));
     if (m_systemDetailPanel) m_systemDetailPanel->reset(detail);
     if (m_sampleStatus) m_sampleStatus->setText(detail + QStringLiteral("    周期 1.0 s"));

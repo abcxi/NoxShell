@@ -21,8 +21,10 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QProcess>
+#include <QProgressBar>
 #include <QStandardPaths>
 #include <QSplitter>
+#include <QStackedLayout>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
@@ -37,6 +39,7 @@
 namespace noxshell::ui {
 
 namespace {
+constexpr int kInteractiveStartupGraceMs = 120;
 constexpr int kPathRole = Qt::UserRole;
 constexpr int kDirectoryRole = Qt::UserRole + 1;
 constexpr int kDirectoryLoadedRole = Qt::UserRole + 2;
@@ -97,10 +100,9 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     headerLayout->setContentsMargins(11, 6, 9, 6);
     headerLayout->setSpacing(6);
     auto *title = new QLabel(QStringLiteral("文件管理"));
-    title->setStyleSheet(QStringLiteral("font-weight:650;"));
+    title->setObjectName(QStringLiteral("filePanelTitle"));
     m_serverLabel = new QLabel(QStringLiteral("SFTP"));
     m_serverLabel->setObjectName(QStringLiteral("fileServerLabel"));
-    m_serverLabel->setStyleSheet(QStringLiteral("color:#738297;font-size:12px;"));
     m_transferQueueButton = new QToolButton;
     m_transferQueueButton->setObjectName(QStringLiteral("transferQueueButton"));
     m_contextMenu = new QMenu(this);
@@ -125,16 +127,9 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_transferQueueButton->setAccessibleName(QStringLiteral("打开传输队列"));
     m_transferQueueButton->setAutoRaise(true);
     m_transferQueueButton->setFixedSize(26, 26);
-    m_transferQueueButton->setStyleSheet(QStringLiteral(
-        "QToolButton{border:1px solid transparent;border-radius:4px;padding:0;background:transparent;}"
-        "QToolButton:hover,QToolButton::menu-button:hover{background:#F0F5FA;border-color:#D5DFEA;}"
-        "QToolButton:pressed{background:#E7EFF7;border-color:#BFCEDF;}"
-        "QToolButton[active=\"true\"]{background:#E8F3FF;border-color:#8BBFFF;}"
-        "QToolButton::menu-indicator{image:none;}"));
 
     m_transferQueueMenu = new QMenu(m_transferQueueButton);
     m_transferQueueMenu->setObjectName(QStringLiteral("transferQueueMenu"));
-    m_transferQueueMenu->setStyleSheet(QStringLiteral("QMenu{padding:0;border:1px solid #CCD7E3;border-radius:5px;background:#FBFCFD;}"));
     auto *queueWidgetAction = new QWidgetAction(m_transferQueueMenu);
     m_transferQueuePanel = new TransferQueuePanel(m_session);
     m_transferQueuePanel->setProperty("popup", true);
@@ -149,7 +144,6 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_statusLabel->setMinimumWidth(0);
     m_statusLabel->setMaximumWidth(170);
     m_statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_statusLabel->setStyleSheet(QStringLiteral("color:#738297;font-size:11px;"));
 
     m_backButton = new QToolButton;
     m_upButton = new QToolButton;
@@ -163,16 +157,10 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_backButton->setToolTip(QStringLiteral("返回"));
     m_upButton->setToolTip(QStringLiteral("上级目录"));
     m_refreshButton->setToolTip(QStringLiteral("刷新目录"));
-    const auto compactToolButtonStyle = QStringLiteral(
-        "QToolButton{border:1px solid transparent;border-radius:4px;padding:0;background:transparent;}"
-        "QToolButton:hover{background:#F0F5FA;border-color:#D5DFEA;}"
-        "QToolButton:pressed{background:#E7EFF7;border-color:#BFCEDF;}"
-        "QToolButton:disabled{opacity:0.45;}");
     for (auto *button : {m_backButton, m_upButton, m_refreshButton}) {
         button->setAutoRaise(true);
         button->setFixedSize(26, 26);
         button->setIconSize(QSize(16, 16));
-        button->setStyleSheet(compactToolButtonStyle);
     }
     m_pathEdit = new QLineEdit(QStringLiteral("/"));
     m_pathEdit->setObjectName(QStringLiteral("remotePathEdit"));
@@ -211,6 +199,49 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     const int widths[] = {170, 78, 76, 132, 102, 112};
     for (int column = 0; column < m_tree->columnCount(); ++column) m_tree->setColumnWidth(column, widths[column]);
 
+    auto *fileListContainer = new QWidget;
+    fileListContainer->setObjectName(QStringLiteral("fileListContainer"));
+    auto *fileListStack = new QStackedLayout(fileListContainer);
+    fileListStack->setContentsMargins(0, 0, 0, 0);
+    fileListStack->setStackingMode(QStackedLayout::StackAll);
+    fileListStack->addWidget(m_tree);
+
+    m_fileLoadingOverlay = new QWidget;
+    m_fileLoadingOverlay->setObjectName(QStringLiteral("fileLoadingOverlay"));
+    auto *loadingOverlayLayout = new QVBoxLayout(m_fileLoadingOverlay);
+    loadingOverlayLayout->setContentsMargins(24, 24, 24, 24);
+    loadingOverlayLayout->addStretch();
+    auto *loadingRow = new QHBoxLayout;
+    loadingRow->addStretch();
+    auto *loadingCard = new QFrame;
+    loadingCard->setObjectName(QStringLiteral("fileLoadingCard"));
+    loadingCard->setFixedWidth(280);
+    auto *loadingCardLayout = new QVBoxLayout(loadingCard);
+    loadingCardLayout->setContentsMargins(22, 17, 22, 16);
+    loadingCardLayout->setSpacing(8);
+    auto *loadingTitle = new QLabel(QStringLiteral("正在加载文件"));
+    loadingTitle->setObjectName(QStringLiteral("fileLoadingTitle"));
+    loadingTitle->setAlignment(Qt::AlignCenter);
+    m_fileLoadingDetail = new QLabel(QStringLiteral("正在读取远端目录…"));
+    m_fileLoadingDetail->setObjectName(QStringLiteral("fileLoadingDetail"));
+    m_fileLoadingDetail->setAlignment(Qt::AlignCenter);
+    m_fileLoadingDetail->setWordWrap(true);
+    auto *loadingProgress = new QProgressBar;
+    loadingProgress->setObjectName(QStringLiteral("fileLoadingProgress"));
+    loadingProgress->setRange(0, 0);
+    loadingProgress->setTextVisible(false);
+    loadingProgress->setFixedHeight(4);
+    loadingCardLayout->addWidget(loadingTitle);
+    loadingCardLayout->addWidget(m_fileLoadingDetail);
+    loadingCardLayout->addSpacing(2);
+    loadingCardLayout->addWidget(loadingProgress);
+    loadingRow->addWidget(loadingCard);
+    loadingRow->addStretch();
+    loadingOverlayLayout->addLayout(loadingRow);
+    loadingOverlayLayout->addStretch();
+    fileListStack->addWidget(m_fileLoadingOverlay);
+    m_fileLoadingOverlay->hide();
+
     m_directoryTree = new QTreeWidget;
     m_directoryTree->setObjectName(QStringLiteral("remoteDirectoryTree"));
     m_directoryTree->setColumnCount(1);
@@ -224,14 +255,12 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     browserSplitter->setObjectName(QStringLiteral("fileBrowserSplitter"));
     browserSplitter->setChildrenCollapsible(false);
     browserSplitter->addWidget(m_directoryTree);
-    browserSplitter->addWidget(m_tree);
+    browserSplitter->addWidget(fileListContainer);
     browserSplitter->setStretchFactor(0, 0);
     browserSplitter->setStretchFactor(1, 1);
     browserSplitter->setSizes({205, 760});
 
     header->setFixedHeight(40);
-    header->setStyleSheet(QStringLiteral(
-        "QWidget#fileToolbar{border-bottom:1px solid #E5EAF0;background:#FBFCFD;}"));
     layout->addWidget(header);
     layout->addWidget(browserSplitter, 1);
 
@@ -370,8 +399,13 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
         m_directoryTree->setEnabled(connected);
         updateActionState();
         if (connected) {
-            openInitialDirectory();
+            // Let the interactive shell paint its first prompt before SFTP
+            // temporarily borrows the shared SSH transport.
+            QTimer::singleShot(kInteractiveStartupGraceMs, this, [this] {
+                if (m_connected && m_session && m_session->isConnected()) openInitialDirectory();
+            });
         } else {
+            hideFileLoading();
             m_statusLabel->setText(QStringLiteral("  %1").arg(message));
         }
     });
@@ -401,6 +435,7 @@ void FilePanel::setServer(const ServerProfile &profile)
     m_history = {m_currentPath};
     m_historyIndex = 0;
     m_tree->clear();
+    hideFileLoading();
     m_directoryTree->clear();
     m_directoryTree->setEnabled(false);
     m_pathEdit->setText(m_currentPath);
@@ -465,6 +500,7 @@ void FilePanel::openInitialDirectory()
     m_tree->clear();
     m_tree->setEnabled(false);
     m_statusLabel->setText(QStringLiteral("  正在定位远端主目录…"));
+    showFileLoading(QStringLiteral("正在定位远端主目录…"));
     m_session->requestHomeDirectory();
 }
 
@@ -486,6 +522,7 @@ void FilePanel::navigateTo(const QString &path, bool addToHistory)
     m_tree->clear();
     m_tree->setEnabled(false);
     m_statusLabel->setText(QStringLiteral("  正在读取 %1 …").arg(normalized));
+    showFileLoading(QStringLiteral("正在读取 %1").arg(normalized));
     updateActionState();
     revealDirectoryPath(normalized);
     m_session->listDirectory(normalized);
@@ -498,6 +535,7 @@ void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entrie
     }
     if (path != m_pendingPath) return;
     m_pendingPath.clear();
+    hideFileLoading();
     m_tree->clear();
     m_tree->setEnabled(true);
     for (const auto &entry : entries) {
@@ -537,6 +575,7 @@ void FilePanel::showError(const QString &path, const QString &message)
     }
     if (path != m_pendingPath) return;
     m_pendingPath.clear();
+    hideFileLoading();
     m_tree->clear();
     m_tree->setEnabled(true);
     auto *item = new QTreeWidgetItem(m_tree, {QStringLiteral("无法读取目录"), QStringLiteral("—"), QStringLiteral("—"),
@@ -544,6 +583,19 @@ void FilePanel::showError(const QString &path, const QString &message)
     item->setForeground(0, QColor(QStringLiteral("#D54941")));
     m_statusLabel->setText(QStringLiteral("  SFTP 错误 · %1").arg(message));
     updateActionState();
+}
+
+void FilePanel::showFileLoading(const QString &detail)
+{
+    if (!m_fileLoadingOverlay || !m_fileLoadingDetail) return;
+    m_fileLoadingDetail->setText(detail);
+    m_fileLoadingOverlay->show();
+    m_fileLoadingOverlay->raise();
+}
+
+void FilePanel::hideFileLoading()
+{
+    if (m_fileLoadingOverlay) m_fileLoadingOverlay->hide();
 }
 
 void FilePanel::initializeDirectoryTree()

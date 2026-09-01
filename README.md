@@ -5,8 +5,8 @@
 <h1 align="center">玄壳 NoxShell</h1>
 
 <p align="center">
-  一款面向服务器运维的现代化 SSH 桌面客户端。<br>
-  在同一个紧凑工作区中完成终端操作、实时监控、SFTP 文件管理与远程文件编辑。
+  一款面向服务器运维的现代化远程连接客户端。<br>
+  同时管理 SSH 终端与 Windows 远程桌面，并在紧凑工作区中完成监控、文件管理和远程编辑。
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 
 ![玄壳 SSH 运维工作区](docs/images/noxshell-workspace.png)
 
-> 截图使用本地演示会话生成，不包含真实服务器凭据。当前版本：`v0.2.56`。
+> 截图使用本地演示会话生成，不包含真实服务器凭据。当前版本：`v0.2.57`。
 
 ## 为什么选择玄壳
 
@@ -35,9 +35,17 @@
 | --- | --- | --- | --- |
 | 终端、监控、文件和编辑器同屏协作 | C++20 + Qt 6，界面紧凑、启动迅速 | 每个标签拥有独立 SSH 连接与配置快照 | 密码和私钥口令进入系统凭据库，不写入 SQLite |
 
-玄壳适合需要同时管理多台 Linux 服务器、频繁查看资源状态、编辑配置文件和传输文件的开发与运维人员。它不试图把功能藏进层层页面，而是把最常用的操作放在一个可拖动、可收起的工作区内。
+玄壳适合需要同时管理 Linux 服务器和 Windows 电脑、频繁查看资源状态、编辑配置文件和传输文件的开发与运维人员。它不试图把功能藏进层层页面，而是把最常用的操作放在一个可拖动、可收起的工作区内。
 
 ## 核心功能
+
+### Windows 远程桌面（RDP）
+
+- 新建连接时可选择 SSH 终端或 Windows 远程桌面，并在同一主机列表中分组、搜索、复制和编辑。
+- 支持自定义 RDP 端口和 `Administrator`、`DOMAIN\\user` 等 Windows 用户名。
+- Windows 调用系统自带的 `mstsc`；macOS 生成临时 `.rdp` 配置并调用已安装的 Microsoft Windows App。
+- Windows 密码保存在 macOS Keychain 或 Windows Credential Manager，不进入 SQLite、`.rdp` 文件或进程参数；macOS 连接时临时复制到剪贴板并在 60 秒后清除。
+- RDP 主机会显示独立协议标识；双击或右键“打开远程桌面”即可启动。
 
 ### SSH 终端
 
@@ -85,6 +93,7 @@
 - 已知主机指纹严格绑定 `IP/域名:端口`，目标变化时不会错误复用旧指纹。
 - 支持密码、私钥、SSH Agent，以及自动协商 `keyboard-interactive` / `password` 认证。
 - 密码和私钥口令分别保存在 macOS Keychain 或 Windows Credential Manager；SQLite 只保存凭据引用。
+- RDP 地址、端口、用户名和分组保存在 SQLite；密码只进入系统凭据库。
 
 ## 下载
 
@@ -92,13 +101,15 @@
 
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.56/%E7%8E%84%E5%A3%B3-v0.2.56-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.56/%E7%8E%84%E5%A3%B3-v0.2.56-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.56/NoxShell-v0.2.56-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.56/NoxShell-v0.2.56-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.56/SHA256SUMS.txt) | 验证下载文件完整性 |
+| macOS | [Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/%E7%8E%84%E5%A3%B3-v0.2.57-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | [Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/%E7%8E%84%E5%A3%B3-v0.2.57-macOS-x86_64.dmg) | Intel 芯片 Mac |
+| Windows | [安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/NoxShell-v0.2.57-Windows-x64.exe) | 64 位 Windows，推荐使用 |
+| Windows | [便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/NoxShell-v0.2.57-Windows-x64.zip) | 64 位 Windows，解压即用 |
+| 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/SHA256SUMS.txt) | 验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签且 GitHub Actions 构建成功后出现。当前 macOS 包使用临时签名，尚未进行 Apple Developer ID 签名和公证；首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
+
+macOS DMG 内提供“一键修复玄壳.command”。如果系统提示应用已损坏或无法验证，请先将“玄壳.app”拖入 Applications，再双击该入口；它只会清除 `/Applications/玄壳.app` 的 `com.apple.quarantine` 属性，不会处理其他应用。正式公开分发仍建议使用 Developer ID 签名并完成 Apple 公证。
 
 ## 开源许可
 

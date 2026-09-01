@@ -91,8 +91,8 @@ ServerDialog::ServerDialog(QWidget *parent)
     layout->setSpacing(12);
 
     auto *notice = new QLabel(QStringLiteral("服务器配置保存在 SQLite；密码和私钥口令写入 macOS Keychain，不会进入数据库。"));
+    notice->setObjectName(QStringLiteral("serverStorageNotice"));
     notice->setWordWrap(true);
-    notice->setStyleSheet(QStringLiteral("color:#6B7C91;background:#F4F7FA;border:1px solid #DFE6EF;padding:9px;border-radius:4px;"));
     layout->addWidget(notice);
 
     auto *form = new QFormLayout;
@@ -152,7 +152,6 @@ ServerDialog::ServerDialog(QWidget *parent)
     endpointLayout->setSpacing(8);
     auto *portLabel = new QLabel(QStringLiteral("端口"));
     portLabel->setObjectName(QStringLiteral("portInlineLabel"));
-    portLabel->setStyleSheet(QStringLiteral("color:#53657B;"));
     endpointLayout->addWidget(m_host, 1);
     endpointLayout->addWidget(portLabel);
     endpointLayout->addWidget(m_port);

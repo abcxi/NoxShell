@@ -1,12 +1,16 @@
 #include "TerminalView.h"
+#include "SearchMarkerScrollBar.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QContextMenuEvent>
+#include <QCursor>
 #include <QFontDatabase>
 #include <QFontMetricsF>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QIcon>
+#include <QImage>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QLabel>
@@ -16,7 +20,6 @@
 #include <QPainter>
 #include <QResizeEvent>
 #include <QRegularExpression>
-#include <QScrollBar>
 #include <QShortcut>
 #include <QStringList>
 #include <QTimer>
@@ -50,6 +53,14 @@ TerminalAppearance &sharedDefaultAppearance()
         QFontDatabase::systemFont(QFontDatabase::FixedFont).family(), 12, 1.05};
     return appearance;
 }
+
+const QRegularExpression &shellPromptExpression()
+{
+    static const QRegularExpression expression(QStringLiteral(
+        "^\\s*(?:\\([^\\r\\n)]*\\)\\s*)?(?:\\[[^\\]\\r\\n]+\\]|"
+        "[^\\s#$]+@[^\\s#$]+)[#$]\\s*"));
+    return expression;
+}
 }
 
 TerminalView::TerminalView(QWidget *parent)
@@ -59,13 +70,24 @@ TerminalView::TerminalView(QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
     setAttribute(Qt::WA_InputMethodEnabled);
     setAutoFillBackground(false);
+    setMouseTracking(true);
     setAppearance(defaultAppearance());
     setCursor(Qt::IBeamCursor);
-    m_scrollBar = new QScrollBar(Qt::Vertical, this);
+    m_scrollBar = new SearchMarkerScrollBar(Qt::Vertical, this);
     m_scrollBar->setObjectName(QStringLiteral("terminalScrollBar"));
     m_scrollBar->setSingleStep(1);
     m_scrollBar->setPageStep(m_model.rows());
-    connect(m_scrollBar, &QScrollBar::valueChanged, this, [this] { update(); });
+    connect(m_scrollBar, &QScrollBar::valueChanged, this, [this] {
+        if (m_lastMousePosition.x() >= 0) updateHoveredCommandBlock(m_lastMousePosition);
+        update();
+    });
+    connect(m_scrollBar, &SearchMarkerScrollBar::searchMarkerActivated, this, [this](int index) {
+        if (index < 0 || index >= m_searchMatches.size()) return;
+        m_currentSearchMatch = index;
+        updateSearchCounter();
+        scrollToCurrentSearchMatch();
+        update();
+    });
 
     m_contextMenu = new QMenu(this);
     m_contextMenu->setObjectName(QStringLiteral("terminalContextMenu"));
@@ -135,12 +157,39 @@ TerminalView::TerminalView(QWidget *parent)
     m_searchBar->setFixedHeight(35);
     m_searchBar->hide();
 
+    m_commandBlockTools = new QFrame(this);
+    m_commandBlockTools->setObjectName(QStringLiteral("terminalCommandBlockTools"));
+    m_commandBlockTools->setCursor(Qt::ArrowCursor);
+    auto *blockToolsLayout = new QHBoxLayout(m_commandBlockTools);
+    blockToolsLayout->setContentsMargins(3, 3, 3, 3);
+    blockToolsLayout->setSpacing(2);
+    m_copyCommandBlockText = new QToolButton(m_commandBlockTools);
+    m_copyCommandBlockText->setObjectName(QStringLiteral("terminalCommandBlockCopyText"));
+    m_copyCommandBlockText->setIcon(QIcon(QStringLiteral(":/assets/copy.svg")));
+    m_copyCommandBlockText->setIconSize(QSize(16, 16));
+    m_copyCommandBlockText->setToolTip(QStringLiteral("复制当前命令及输出"));
+    m_copyCommandBlockImage = new QToolButton(m_commandBlockTools);
+    m_copyCommandBlockImage->setObjectName(QStringLiteral("terminalCommandBlockCopyImage"));
+    m_copyCommandBlockImage->setIcon(QIcon(QStringLiteral(":/assets/copy-image.svg")));
+    m_copyCommandBlockImage->setIconSize(QSize(16, 16));
+    m_copyCommandBlockImage->setToolTip(QStringLiteral("复制当前命令及输出为图片"));
+    for (auto *button : {m_copyCommandBlockText, m_copyCommandBlockImage}) {
+        button->setFixedSize(26, 24);
+        blockToolsLayout->addWidget(button);
+    }
+    m_commandBlockTools->setFixedSize(62, 30);
+    m_commandBlockTools->hide();
+
     connect(m_searchInput, &QLineEdit::textChanged, this, [this] {
         rebuildSearchMatches(false, true);
     });
     connect(m_searchPrevious, &QToolButton::clicked, this, &TerminalView::findPrevious);
     connect(m_searchNext, &QToolButton::clicked, this, &TerminalView::findNext);
     connect(m_searchClose, &QToolButton::clicked, this, &TerminalView::hideSearch);
+    connect(m_copyCommandBlockText, &QToolButton::clicked,
+        this, &TerminalView::copyHoveredCommandBlockText);
+    connect(m_copyCommandBlockImage, &QToolButton::clicked,
+        this, &TerminalView::copyHoveredCommandBlockImage);
 
     auto *findNextShortcut = new QShortcut(QKeySequence::FindNext, this);
     findNextShortcut->setContext(Qt::WidgetWithChildrenShortcut);
@@ -197,6 +246,7 @@ void TerminalView::feedText(const QString &text)
     if (m_searchBar->isVisible() && !m_searchInput->text().isEmpty()) {
         rebuildSearchMatches(true, false);
     }
+    if (m_lastMousePosition.x() >= 0) updateHoveredCommandBlock(m_lastMousePosition);
     update();
 }
 
@@ -205,6 +255,7 @@ void TerminalView::clear()
     m_decoder.resetState();
     m_model.clear();
     clearSelection();
+    clearHoveredCommandBlock();
     rebuildSearchMatches(false, false);
     updateScrollBar(true);
     update();
@@ -340,6 +391,7 @@ void TerminalView::paintEvent(QPaintEvent *event)
             2.0, qMax(2.0, m_cellHeight - 4.0));
         painter.fillRect(cursorRect, QColor(QStringLiteral("#7DB1DE")));
     }
+
 }
 
 void TerminalView::resizeEvent(QResizeEvent *event)
@@ -348,6 +400,7 @@ void TerminalView::resizeEvent(QResizeEvent *event)
     m_scrollBar->setGeometry(width() - kScrollBarWidth, 0, kScrollBarWidth, height());
     m_scrollBar->raise();
     positionSearchBar();
+    positionCommandBlockTools();
     updateGridSize();
 }
 
@@ -363,6 +416,7 @@ void TerminalView::positionSearchBar()
 void TerminalView::showSearch()
 {
     if (!m_searchBar) return;
+    clearHoveredCommandBlock();
     m_searchBar->show();
     positionSearchBar();
     rebuildSearchMatches(true, false);
@@ -378,6 +432,7 @@ void TerminalView::hideSearch()
     m_currentSearchMatch = -1;
     updateSearchCounter();
     setFocus(Qt::ShortcutFocusReason);
+    if (m_lastMousePosition.x() >= 0) updateHoveredCommandBlock(m_lastMousePosition);
     update();
 }
 
@@ -455,6 +510,23 @@ void TerminalView::updateSearchCounter()
         : QStringLiteral("0 / 0"));
     if (m_searchPrevious) m_searchPrevious->setEnabled(hasMatches);
     if (m_searchNext) m_searchNext->setEnabled(hasMatches);
+    updateSearchMarkers();
+}
+
+void TerminalView::updateSearchMarkers()
+{
+    if (!m_scrollBar) return;
+    if (m_searchMatches.isEmpty()) {
+        m_scrollBar->clearSearchMarkers();
+        return;
+    }
+    QVector<qreal> positions;
+    positions.reserve(m_searchMatches.size());
+    const int maximumLine = qMax(1, m_model.documentLineCount() - 1);
+    for (const auto &match : std::as_const(m_searchMatches)) {
+        positions.append(qBound<qreal>(0.0, qreal(match.line) / maximumLine, 1.0));
+    }
+    m_scrollBar->setSearchMarkers(positions, m_currentSearchMatch);
 }
 
 void TerminalView::scrollToCurrentSearchMatch()
@@ -495,6 +567,162 @@ void TerminalView::findPrevious()
     update();
 }
 
+TerminalView::CommandBlock TerminalView::commandBlockAt(const QPointF &position) const
+{
+    CommandBlock block;
+    if (!m_scrollBar || (m_searchBar && m_searchBar->isVisible())) return block;
+    const QRectF contentRect(kContentLeft, kContentTop,
+        qMax(0, width() - kContentLeft - kContentRight - kScrollBarWidth),
+        qMax(0, height() - kContentTop - kContentBottom));
+    if (!contentRect.contains(position)) return block;
+
+    const int hoveredLine = documentPosition(position).y();
+    for (int line = hoveredLine; line >= 0; --line) {
+        const auto text = m_model.documentLineText(line);
+        const auto match = shellPromptExpression().match(text);
+        if (!match.hasMatch()) continue;
+        // A bare prompt starts a new, not-yet-executed region. It must not
+        // make the previous command appear hovered.
+        if (text.mid(match.capturedEnd()).trimmed().isEmpty()) return block;
+        block.startLine = line;
+        break;
+    }
+    if (block.startLine < 0) return {};
+
+    block.endLine = m_model.documentLineCount() - 1;
+    for (int line = block.startLine + 1; line < m_model.documentLineCount(); ++line) {
+        if (shellPromptExpression().match(m_model.documentLineText(line)).hasMatch()) {
+            block.endLine = line - 1;
+            break;
+        }
+    }
+    while (block.endLine > block.startLine
+        && m_model.documentLineText(block.endLine).trimmed().isEmpty()) {
+        --block.endLine;
+    }
+    if (hoveredLine < block.startLine || hoveredLine > block.endLine) return {};
+
+    const int firstVisible = m_scrollBar->value();
+    const int lastVisible = firstVisible + m_model.rows() - 1;
+    const int visibleStart = qMax(block.startLine, firstVisible);
+    const int visibleEnd = qMin(block.endLine, lastVisible);
+    if (visibleEnd < visibleStart) return {};
+    const qreal top = kContentTop + (visibleStart - firstVisible) * m_cellHeight;
+    const qreal bottom = kContentTop + (visibleEnd - firstVisible + 1) * m_cellHeight;
+    block.visibleRect = QRectF(kContentLeft - 5, qMax<qreal>(kContentTop, top - 2),
+        width() - (kContentLeft - 5) - kContentRight - kScrollBarWidth,
+        qMin<qreal>(height() - kContentBottom, bottom + 2) - qMax<qreal>(kContentTop, top - 2));
+    return block;
+}
+
+void TerminalView::updateHoveredCommandBlock(const QPointF &position)
+{
+    m_lastMousePosition = position;
+    const auto block = commandBlockAt(position);
+    const bool changed = block.startLine != m_hoveredCommandBlock.startLine
+        || block.endLine != m_hoveredCommandBlock.endLine
+        || block.visibleRect != m_hoveredCommandBlock.visibleRect;
+    m_hoveredCommandBlock = block;
+    positionCommandBlockTools();
+    if (changed) update();
+}
+
+void TerminalView::clearHoveredCommandBlock()
+{
+    if (!m_hoveredCommandBlock.isValid() && (!m_commandBlockTools || !m_commandBlockTools->isVisible())) return;
+    m_hoveredCommandBlock = {};
+    if (m_commandBlockTools) m_commandBlockTools->hide();
+    update();
+}
+
+void TerminalView::positionCommandBlockTools()
+{
+    if (!m_commandBlockTools || !m_hoveredCommandBlock.isValid()
+        || m_hoveredCommandBlock.visibleRect.isEmpty()
+        || (m_searchBar && m_searchBar->isVisible())) {
+        if (m_commandBlockTools) m_commandBlockTools->hide();
+        return;
+    }
+    const auto &hoverRect = m_hoveredCommandBlock.visibleRect;
+    const int x = qMax(kContentLeft,
+        qRound(hoverRect.right()) - m_commandBlockTools->width() - 5);
+    const int y = qBound(kContentTop, qRound(hoverRect.top()) + 3,
+        qMax(kContentTop, height() - kContentBottom - m_commandBlockTools->height()));
+    m_commandBlockTools->move(x, y);
+    m_commandBlockTools->show();
+    m_commandBlockTools->raise();
+}
+
+QString TerminalView::commandBlockText(const CommandBlock &block) const
+{
+    if (!block.isValid()) return {};
+    QStringList lines;
+    lines.reserve(block.endLine - block.startLine + 1);
+    for (int line = block.startLine; line <= block.endLine; ++line) {
+        lines.append(m_model.documentLineText(line));
+    }
+    while (!lines.isEmpty() && lines.last().isEmpty()) lines.removeLast();
+    return lines.join(QLatin1Char('\n'));
+}
+
+QImage TerminalView::commandBlockImage(const CommandBlock &block) const
+{
+    if (!block.isValid()) return {};
+    constexpr int imagePadding = 10;
+    constexpr int maximumRenderedLines = 300;
+    const int lineCount = qMin(maximumRenderedLines, block.endLine - block.startLine + 1);
+    const int imageWidth = qMax(1,
+        width() - kContentLeft - kContentRight - kScrollBarWidth + imagePadding * 2);
+    const int imageHeight = qMax(1, qCeil(lineCount * m_cellHeight) + imagePadding * 2);
+    QImage image(imageWidth, imageHeight, QImage::Format_ARGB32_Premultiplied);
+    const QColor defaultForeground(QStringLiteral("#D0DBE5"));
+    const QColor defaultBackground(QStringLiteral("#0C1825"));
+    const bool reverseVideo = m_model.reverseVideo();
+    image.fill(reverseVideo ? defaultForeground : defaultBackground);
+
+    QPainter painter(&image);
+    painter.setFont(m_font);
+    painter.setRenderHint(QPainter::TextAntialiasing);
+    for (int row = 0; row < lineCount; ++row) {
+        const int documentLine = block.startLine + row;
+        for (int column = 0; column < m_model.columns(); ++column) {
+            const auto &cell = m_model.documentCell(documentLine, column);
+            if (cell.wideContinuation) continue;
+            QColor foreground = cell.inverse ? cell.background : cell.foreground;
+            QColor background = cell.inverse ? cell.foreground : cell.background;
+            if (reverseVideo) std::swap(foreground, background);
+            const bool wide = column + 1 < m_model.columns()
+                && m_model.documentCell(documentLine, column + 1).wideContinuation;
+            const QRectF cellRect(imagePadding + column * m_cellWidth,
+                imagePadding + row * m_cellHeight,
+                wide ? m_cellWidth * 2 : m_cellWidth, m_cellHeight);
+            if (background != (reverseVideo ? defaultForeground : defaultBackground)) {
+                painter.fillRect(cellRect, background);
+            }
+            auto font = m_font;
+            font.setBold(cell.bold);
+            font.setUnderline(cell.underline);
+            painter.setFont(font);
+            painter.setPen(foreground);
+            painter.drawText(QPointF(imagePadding + column * m_cellWidth,
+                imagePadding + row * m_cellHeight + m_ascent), cell.text);
+        }
+    }
+    return image;
+}
+
+void TerminalView::copyHoveredCommandBlockText()
+{
+    const auto text = commandBlockText(m_hoveredCommandBlock);
+    if (!text.isEmpty()) QApplication::clipboard()->setText(text);
+}
+
+void TerminalView::copyHoveredCommandBlockImage()
+{
+    const auto image = commandBlockImage(m_hoveredCommandBlock);
+    if (!image.isNull()) QApplication::clipboard()->setImage(image);
+}
+
 void TerminalView::updateGridSize()
 {
     const int contentWidth = qMax(1, width() - kContentLeft - kContentRight - kScrollBarWidth);
@@ -516,10 +744,10 @@ QByteArray TerminalView::keySequence(QKeyEvent *event) const
     case Qt::Key_Tab: return "\t";
     case Qt::Key_Backtab: return "\x1b[Z";
     case Qt::Key_Escape: return "\x1b";
-    case Qt::Key_Up: return "\x1b[A";
-    case Qt::Key_Down: return "\x1b[B";
-    case Qt::Key_Right: return "\x1b[C";
-    case Qt::Key_Left: return "\x1b[D";
+    case Qt::Key_Up: return m_model.applicationCursorKeys() ? "\x1bOA" : "\x1b[A";
+    case Qt::Key_Down: return m_model.applicationCursorKeys() ? "\x1bOB" : "\x1b[B";
+    case Qt::Key_Right: return m_model.applicationCursorKeys() ? "\x1bOC" : "\x1b[C";
+    case Qt::Key_Left: return m_model.applicationCursorKeys() ? "\x1bOD" : "\x1b[D";
     case Qt::Key_Home: return "\x1b[H";
     case Qt::Key_End: return "\x1b[F";
     case Qt::Key_Insert: return "\x1b[2~";
@@ -783,6 +1011,7 @@ void TerminalView::mousePressEvent(QMouseEvent *event)
 
 void TerminalView::mouseMoveEvent(QMouseEvent *event)
 {
+    updateHoveredCommandBlock(event->position());
     if (shouldReportMouse(event->modifiers())) {
         const auto tracking = m_model.mouseTracking();
         if (tracking == VtTerminalModel::MouseTracking::AnyMotion
@@ -795,6 +1024,20 @@ void TerminalView::mouseMoveEvent(QMouseEvent *event)
         update();
     }
     event->accept();
+}
+
+void TerminalView::leaveEvent(QEvent *event)
+{
+    // Moving from the terminal canvas onto its child overlay can produce a
+    // leave event on some platforms. Keep the command tools alive while the
+    // pointer is still anywhere inside this widget's bounds.
+    if (rect().contains(mapFromGlobal(QCursor::pos()))) {
+        QWidget::leaveEvent(event);
+        return;
+    }
+    m_lastMousePosition = {-1, -1};
+    clearHoveredCommandBlock();
+    QWidget::leaveEvent(event);
 }
 
 void TerminalView::mouseReleaseEvent(QMouseEvent *event)

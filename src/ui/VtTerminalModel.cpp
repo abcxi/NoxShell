@@ -41,6 +41,7 @@ void VtTerminalModel::reset()
     m_wrapPending = false;
     m_cursorVisible = true;
     m_reverseVideo = false;
+    m_applicationCursorKeys = false;
     m_bracketedPaste = false;
     m_mouseTracking = MouseTracking::None;
     m_sgrMouseEncoding = false;
@@ -262,7 +263,8 @@ void VtTerminalModel::processCsi(char32_t finalCharacter)
         if (m_csiPrivate) {
             const bool enabled = finalCharacter == 'h';
             for (int parameter : parameters) {
-                if (parameter == 5) m_reverseVideo = enabled;
+                if (parameter == 1) m_applicationCursorKeys = enabled;
+                else if (parameter == 5) m_reverseVideo = enabled;
                 else if (parameter == 25) m_cursorVisible = enabled;
                 else if (parameter == 1049 || parameter == 47) setAlternateScreen(enabled, parameter == 1049);
                 else if (parameter == 2004) m_bracketedPaste = enabled;
