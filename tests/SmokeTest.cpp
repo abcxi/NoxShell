@@ -4,6 +4,7 @@
 #include "../src/core/FileTransferTask.h"
 #include "../src/core/MetricHistory.h"
 #include "../src/core/RdpLauncher.h"
+#include "../src/core/RemoteDirectoryFallback.h"
 #include "../src/core/SshSession.h"
 #include "../src/core/ServerRepository.h"
 #include "../src/ui/AppTheme.h"
@@ -109,6 +110,49 @@ private slots:
             "QTreeWidget#remoteDirectoryTree {\n            color:#D5E0EB; background:#151D25;")));
         QVERIFY(darkStyle.contains(QStringLiteral(
             "QTreeWidget#remoteDirectoryTree::item:selected {\n            color:#FFFFFF; background:#174E78;")));
+    }
+
+    void ubuntuDirectoryFallbackQuotesPathsAndParsesFindOutput()
+    {
+        const auto command = noxshell::detail::fallbackDirectoryListingCommand(
+            QStringLiteral("/home/user/a'b"));
+        QVERIFY(command.contains("find -- '/home/user/a'\\''b'"));
+        QVERIFY(command.contains("-printf '%f\\0%y\\0%s\\0%T@\\0%m\\0%u\\0%g\\0'"));
+
+        QByteArray payload;
+        const auto appendEntry = [&payload](const QByteArray &name, const QByteArray &type,
+                                     const QByteArray &size, const QByteArray &modified,
+                                     const QByteArray &mode, const QByteArray &owner,
+                                     const QByteArray &group) {
+            for (const auto &field : {name, type, size, modified, mode, owner, group}) {
+                payload.append(field);
+                payload.append('\0');
+            }
+        };
+        appendEntry("项目 文件", "d", "4096", "1788249600.25", "755", "ubuntu", "ubuntu");
+        appendEntry("release.txt", "f", "128", "1788249660.5", "640", "ubuntu", "deploy");
+        appendEntry("current", "l", "11", "1788249700", "777", "ubuntu", "ubuntu");
+
+        noxshell::RemoteFileEntries entries;
+        QString failure;
+        QVERIFY(noxshell::detail::parseFallbackDirectoryListing(
+            QStringLiteral("/home/ubuntu"), payload, entries, failure));
+        QVERIFY(failure.isEmpty());
+        QCOMPARE(entries.size(), 3);
+        QCOMPARE(entries.at(0).name, QStringLiteral("项目 文件"));
+        QCOMPARE(entries.at(0).path, QStringLiteral("/home/ubuntu/项目 文件"));
+        QVERIFY(entries.at(0).directory);
+        QCOMPARE(entries.at(0).permissions & 0777U, quint32{0755});
+        QCOMPARE(entries.at(1).size, quint64{128});
+        QCOMPARE(entries.at(1).owner, QStringLiteral("ubuntu"));
+        QCOMPARE(entries.at(1).group, QStringLiteral("deploy"));
+        QVERIFY(entries.at(2).symbolicLink);
+
+        auto malformed = payload;
+        malformed.append("extra");
+        QVERIFY(!noxshell::detail::parseFallbackDirectoryListing(
+            QStringLiteral("/home/ubuntu"), malformed, entries, failure));
+        QVERIFY(!failure.isEmpty());
     }
 
     void loggerRedactsCommonSecrets()

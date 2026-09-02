@@ -82,6 +82,8 @@ private:
     void cleanup();
     bool beginSftpOperation(quint64 requestId, RemoteFileOperation operation, const QString &path, _LIBSSH2_SFTP *&sftp);
     void endSftpOperation(_LIBSSH2_SFTP *sftp);
+    bool runRemoteCommand(const QByteArray &command, QByteArray &output, QByteArray &errorOutput,
+        QString &failure, const QString &description);
     bool connectSocket(const QString &host, quint16 port, int timeoutMs, QString &error);
     bool waitForSocket(int timeoutMs) const;
     void closeSocket();
@@ -94,6 +96,7 @@ private:
     QString m_fingerprint;
     bool m_waitingForHostKey{false};
     bool m_connected{false};
+    bool m_directoryShellFallback{false};
     std::atomic<quint64> m_cancelTransferId{};
 };
 

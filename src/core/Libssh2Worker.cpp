@@ -1,4 +1,5 @@
 #include "Libssh2Worker.h"
+#include "RemoteDirectoryFallback.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -501,6 +502,50 @@ void Libssh2Worker::collectMetrics(quint64 requestId)
     emit metricsPayloadReceived(requestId, output);
 }
 
+bool Libssh2Worker::runRemoteCommand(const QByteArray &command, QByteArray &output,
+    QByteArray &errorOutput, QString &failure, const QString &description)
+{
+    output.clear();
+    errorOutput.clear();
+    auto *channel = libssh2_channel_open_session(m_session);
+    if (!channel) {
+        failure = QStringLiteral("无法打开%1通道：%2").arg(description, lastSessionError());
+        return false;
+    }
+    if (libssh2_channel_exec(channel, command.constData()) != 0) {
+        failure = QStringLiteral("无法执行%1：%2").arg(description, lastSessionError());
+    } else {
+        std::array<char, 8192> buffer{};
+        auto readStream = [&](int stream, QByteArray &target) {
+            for (;;) {
+                const auto received = libssh2_channel_read_ex(channel, stream, buffer.data(), buffer.size());
+                if (received > 0) {
+                    target.append(buffer.data(), static_cast<qsizetype>(received));
+                    continue;
+                }
+                if (received < 0 && received != LIBSSH2_ERROR_EAGAIN) {
+                    failure = QStringLiteral("读取%1结果失败：%2").arg(description, lastSessionError());
+                }
+                break;
+            }
+        };
+        readStream(0, output);
+        readStream(1, errorOutput);
+    }
+
+    libssh2_channel_send_eof(channel);
+    libssh2_channel_close(channel);
+    const int exitStatus = libssh2_channel_get_exit_status(channel);
+    libssh2_channel_free(channel);
+    if (failure.isEmpty() && exitStatus != 0) {
+        const auto detail = QString::fromUtf8(errorOutput).trimmed();
+        failure = detail.isEmpty()
+            ? QStringLiteral("%1退出状态为 %2").arg(description).arg(exitStatus)
+            : detail;
+    }
+    return failure.isEmpty();
+}
+
 void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
 {
     if (!m_connected || !m_session) {
@@ -517,15 +562,20 @@ void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
     libssh2_session_set_blocking(m_session, 1);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
 
-    LIBSSH2_SFTP *sftp = libssh2_sftp_init(m_session);
+    LIBSSH2_SFTP *sftp = nullptr;
     LIBSSH2_SFTP_HANDLE *directory = nullptr;
     QString failure;
     RemoteFileEntries entries;
     const auto encodedPath = path.toUtf8();
 
-    if (!sftp) {
-        failure = QStringLiteral("无法初始化 SFTP：%1").arg(lastSessionError());
+    if (m_directoryShellFallback) {
+        failure = QStringLiteral("已启用 SSH 目录兼容模式");
     } else {
+        sftp = libssh2_sftp_init(m_session);
+    }
+    if (!m_directoryShellFallback && !sftp) {
+        failure = QStringLiteral("无法初始化 SFTP：%1").arg(lastSessionError());
+    } else if (sftp) {
         directory = libssh2_sftp_opendir(sftp, encodedPath.constData());
         if (!directory) {
             failure = QStringLiteral("无法打开目录 %1（SFTP %2）").arg(path).arg(libssh2_sftp_last_error(sftp));
@@ -581,6 +631,26 @@ void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
 
     if (directory) libssh2_sftp_closedir(directory);
     if (sftp) libssh2_sftp_shutdown(sftp);
+
+    if (!failure.isEmpty()) {
+        const auto sftpFailure = failure;
+        QByteArray fallbackOutput;
+        QByteArray fallbackError;
+        QString fallbackFailure;
+        if (runRemoteCommand(detail::fallbackDirectoryListingCommand(path), fallbackOutput,
+                fallbackError, fallbackFailure, QStringLiteral("SSH 目录兼容命令"))) {
+            RemoteFileEntries fallbackEntries;
+            if (detail::parseFallbackDirectoryListing(path, fallbackOutput,
+                    fallbackEntries, fallbackFailure)) {
+                entries = std::move(fallbackEntries);
+                failure.clear();
+                m_directoryShellFallback = true;
+            }
+        }
+        if (!fallbackFailure.isEmpty()) {
+            failure = QStringLiteral("%1；兼容模式失败：%2").arg(sftpFailure, fallbackFailure);
+        }
+    }
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
     libssh2_session_set_blocking(m_session, 0);
     if (m_connected) {
@@ -614,18 +684,44 @@ void Libssh2Worker::resolveHomeDirectory(quint64 requestId)
     libssh2_session_set_blocking(m_session, 1);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
 
-    LIBSSH2_SFTP *sftp = libssh2_sftp_init(m_session);
+    LIBSSH2_SFTP *sftp = nullptr;
     QString path;
     QString failure;
-    if (!sftp) {
-        failure = QStringLiteral("无法初始化 SFTP：%1").arg(lastSessionError());
+    if (m_directoryShellFallback) {
+        failure = QStringLiteral("已启用 SSH 目录兼容模式");
     } else {
+        sftp = libssh2_sftp_init(m_session);
+    }
+    if (!m_directoryShellFallback && !sftp) {
+        failure = QStringLiteral("无法初始化 SFTP：%1").arg(lastSessionError());
+    } else if (sftp) {
         std::array<char, 4096> buffer{};
         const auto length = libssh2_sftp_realpath(sftp, ".", buffer.data(), buffer.size());
         if (length > 0) path = QString::fromUtf8(buffer.data(), static_cast<qsizetype>(length));
         else failure = QStringLiteral("无法获取远端主目录（SFTP %1）").arg(libssh2_sftp_last_error(sftp));
     }
     if (sftp) libssh2_sftp_shutdown(sftp);
+
+    if (!failure.isEmpty()) {
+        const auto sftpFailure = failure;
+        QByteArray fallbackOutput;
+        QByteArray fallbackError;
+        QString fallbackFailure;
+        if (runRemoteCommand(detail::fallbackHomeDirectoryCommand(), fallbackOutput,
+                fallbackError, fallbackFailure, QStringLiteral("SSH 主目录兼容命令"))) {
+            const auto fallbackPath = QString::fromUtf8(fallbackOutput).trimmed();
+            if (fallbackPath.startsWith(QLatin1Char('/'))) {
+                path = QDir::cleanPath(fallbackPath);
+                failure.clear();
+                m_directoryShellFallback = true;
+            } else {
+                fallbackFailure = QStringLiteral("服务端返回了无效的主目录");
+            }
+        }
+        if (!fallbackFailure.isEmpty()) {
+            failure = QStringLiteral("%1；兼容模式失败：%2").arg(sftpFailure, fallbackFailure);
+        }
+    }
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
     libssh2_session_set_blocking(m_session, 0);
     if (m_connected) {
@@ -1147,6 +1243,7 @@ void Libssh2Worker::cleanup()
     m_readTimer->stop();
     m_waitingForHostKey = false;
     m_connected = false;
+    m_directoryShellFallback = false;
     if (m_channel) {
         libssh2_channel_send_eof(m_channel);
         libssh2_channel_close(m_channel);

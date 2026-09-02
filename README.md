@@ -27,7 +27,7 @@
 
 ![玄壳 SSH 运维工作区](docs/images/noxshell-workspace.png)
 
-> 截图使用本地演示会话生成，不包含真实服务器凭据。当前版本：`v0.2.57`。
+> 截图使用本地演示会话生成，不包含真实服务器凭据。当前版本：`v0.2.58`。
 
 ## 为什么选择玄壳
 
@@ -101,11 +101,11 @@
 
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/%E7%8E%84%E5%A3%B3-v0.2.57-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/%E7%8E%84%E5%A3%B3-v0.2.57-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/NoxShell-v0.2.57-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/NoxShell-v0.2.57-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.57/SHA256SUMS.txt) | 验证下载文件完整性 |
+| macOS | [Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.58/%E7%8E%84%E5%A3%B3-v0.2.58-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | [Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.58/%E7%8E%84%E5%A3%B3-v0.2.58-macOS-x86_64.dmg) | Intel 芯片 Mac |
+| Windows | [安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.58/NoxShell-v0.2.58-Windows-x64.exe) | 64 位 Windows，推荐使用 |
+| Windows | [便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.58/NoxShell-v0.2.58-Windows-x64.zip) | 64 位 Windows，解压即用 |
+| 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.58/SHA256SUMS.txt) | 验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签且 GitHub Actions 构建成功后出现。当前 macOS 包使用临时签名，尚未进行 Apple Developer ID 签名和公证；首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
 

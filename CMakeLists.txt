@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.57 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.58 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -59,6 +59,8 @@ set(NOXSHELL_CORE_SOURCES
     src/core/MetricHistory.h
     src/core/MonitoringData.h
     src/core/RemoteFileEntry.h
+    src/core/RemoteDirectoryFallback.cpp
+    src/core/RemoteDirectoryFallback.h
     src/core/RdpLauncher.cpp
     src/core/RdpLauncher.h
     src/core/ServerProfile.h
