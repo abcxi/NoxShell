@@ -230,6 +230,8 @@ QString applicationStyleSheet(bool dark)
             height:22px; background:#F5F8FB; border:0; border-bottom:1px solid #E2E8F0;
             padding:0 4px; color:#738297; font-size:9px;
         }
+    )QSS");
+    style += QStringLiteral(R"QSS(
         QFrame#transferQueuePanel { background: #F7F9FC; border-top: 1px solid #D9E2EC; }
         QFrame#transferQueuePanel[popup="true"] { border: 0; background: #F7F9FC; }
         QLabel#transferQueueTitle { color:#1C324B; font-size:14px; font-weight:650; }
