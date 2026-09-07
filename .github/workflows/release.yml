@@ -3,6 +3,8 @@ name: Build and release NoxShell
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -109,9 +111,14 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: |
-          cmake --build build-release --config Release --parallel
-          if ($LASTEXITCODE -ne 0) {
-            throw "NoxShell build failed with exit code $LASTEXITCODE"
+          $buildLog = Join-Path $PWD "build-release/NoxShellBuild.log"
+          cmake --build build-release --config Release --parallel 2 2>&1 | Tee-Object -FilePath $buildLog
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
+            Select-String -Path $buildLog -Pattern '(^|[ :])(fatal error|error C[0-9]+|LNK[0-9]+|error:)' | ForEach-Object {
+              Write-Output "::error title=Windows build::$($_.Line)"
+            }
+            throw "NoxShell build failed with exit code $buildExit"
           }
           $env:QT_QPA_PLATFORM = "offscreen"
           $testLog = Join-Path $PWD "build-release/NoxShellSmokeTest.log"

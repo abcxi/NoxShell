@@ -59,7 +59,10 @@ LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(keyboardInteractiveResponse)
                   static_cast<qsizetype>(prompts[index].length)).toLower()
             : QByteArray{};
         const bool asksForUser = prompts && prompts[index].echo != 0
-            && (prompt.contains("user") || prompt.contains("login"));
+            && (prompt.contains("user") || prompt.contains("login")
+                || prompt.contains(QStringLiteral("用户").toUtf8())
+                || prompt.contains(QStringLiteral("账号").toUtf8())
+                || prompt.contains(QStringLiteral("账户").toUtf8()));
         const auto &value = asksForUser ? g_keyboardInteractiveUser : g_keyboardInteractivePassword;
         auto *text = static_cast<char *>(std::malloc(static_cast<size_t>(value.size()) + 1));
         if (!text) {
@@ -255,15 +258,19 @@ void Libssh2Worker::continueAuthentication()
             break;
         }
         const bool methodsUnknown = advertisedMethods.isEmpty();
-        if (methodsUnknown || advertisedMethods.contains(QStringLiteral("keyboard-interactive"))) {
-            attemptedMethods.append(QStringLiteral("keyboard-interactive"));
-            emit connectionChanged(false, QStringLiteral("正在使用键盘交互认证 %1@%2…").arg(m_profile.user, m_profile.host));
-            authenticated = authenticateKeyboardInteractive();
-        }
-        if (!authenticated && (methodsUnknown || advertisedMethods.contains(QStringLiteral("password")))) {
+        // Prefer the SSH password method when both are advertised. Some older
+        // OpenSSH/PAM configurations count a failed keyboard-interactive
+        // exchange as an authentication failure and reject the following
+        // password attempt even though the password itself is valid.
+        if (methodsUnknown || advertisedMethods.contains(QStringLiteral("password"))) {
             attemptedMethods.append(QStringLiteral("password"));
             emit connectionChanged(false, QStringLiteral("正在使用密码认证 %1@%2…").arg(m_profile.user, m_profile.host));
             authenticated = authenticatePassword();
+        }
+        if (!authenticated && (methodsUnknown || advertisedMethods.contains(QStringLiteral("keyboard-interactive")))) {
+            attemptedMethods.append(QStringLiteral("keyboard-interactive"));
+            emit connectionChanged(false, QStringLiteral("正在使用键盘交互认证 %1@%2…").arg(m_profile.user, m_profile.host));
+            authenticated = authenticateKeyboardInteractive();
         }
         if (!authenticated && attemptedMethods.isEmpty()) {
             localFailure = QStringLiteral("当前选择的是密码认证，但服务端没有开放 password 或 keyboard-interactive");
