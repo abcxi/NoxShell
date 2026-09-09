@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.60 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.61 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -139,6 +139,7 @@ if(BUILD_TESTING)
             target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Ws2_32)
         endif()
         add_test(NAME auth_integration COMMAND NoxShellAuthIntegrationTest -v1)
+        set_tests_properties(auth_integration PROPERTIES TIMEOUT 120)
     endif()
     qt_add_executable(NoxShellSmokeTest
         tests/SmokeTest.cpp

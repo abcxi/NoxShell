@@ -8,6 +8,9 @@
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTest>
+#include <QTimer>
+
+#include <libssh2.h>
 
 #include <chrono>
 #include <thread>
@@ -81,13 +84,39 @@ struct ConnectionAttempt {
     bool connected{};
     QStringList messages;
     qint64 elapsedMs{};
+    qint64 firstOutputMs{-1};
 };
+
+noxshell::ServerProfile fixtureProfile(quint16 port)
+{
+    noxshell::ServerProfile profile;
+    profile.name = QStringLiteral("Local authentication fixture");
+    profile.connectionMode = noxshell::ConnectionMode::Ssh;
+    profile.authentication = noxshell::AuthenticationMethod::Password;
+    profile.host = QStringLiteral("127.0.0.1");
+    profile.port = port;
+    profile.user = QStringLiteral("fixture-user");
+    profile.password = QString::fromLatin1(kSyntheticPassword);
+    return profile;
+}
+
+void trustLocalFixture(noxshell::Libssh2Worker &worker)
+{
+    // Trust is limited to this ephemeral loopback fixture, never real servers.
+    QObject::connect(&worker, &noxshell::Libssh2Worker::hostKeyVerificationRequired,
+        &worker, [&worker](const QString &, const QString &) { worker.approveHostKey(true); });
+}
 
 ConnectionAttempt attemptConnection(LocalSshServer &server, int timeoutMs,
     const QString &password = QString::fromLatin1(kSyntheticPassword), int cancelAfterMs = -1)
 {
     noxshell::Libssh2Worker worker(nullptr, timeoutMs);
     ConnectionAttempt attempt;
+    QElapsedTimer elapsed;
+    QObject::connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived,
+        &worker, [&](const QByteArray &) {
+            if (attempt.firstOutputMs < 0) attempt.firstOutputMs = elapsed.elapsed();
+        });
     std::thread cancellation;
     QObject::connect(&worker, &noxshell::Libssh2Worker::connectionChanged,
         &worker, [&](bool connected, const QString &message) {
@@ -103,17 +132,9 @@ ConnectionAttempt attemptConnection(LocalSshServer &server, int timeoutMs,
         });
     // The fixture uses an ephemeral key and listens exclusively on loopback.
     // Approval is confined to this synthetic test; it does not consult known_hosts.
-    QObject::connect(&worker, &noxshell::Libssh2Worker::hostKeyVerificationRequired,
-        &worker, [&worker](const QString &, const QString &) { worker.approveHostKey(true); });
-    noxshell::ServerProfile profile;
-    profile.name = QStringLiteral("Local authentication fixture");
-    profile.connectionMode = noxshell::ConnectionMode::Ssh;
-    profile.authentication = noxshell::AuthenticationMethod::Password;
-    profile.host = QStringLiteral("127.0.0.1");
-    profile.port = server.port;
-    profile.user = QStringLiteral("fixture-user");
+    trustLocalFixture(worker);
+    auto profile = fixtureProfile(server.port);
     profile.password = password;
-    QElapsedTimer elapsed;
     elapsed.start();
     worker.connectTo(profile);
     attempt.elapsedMs = elapsed.elapsed();
@@ -159,6 +180,198 @@ private slots:
         const auto attempt = attemptConnection(server, 30000);
         QVERIFY2(attempt.connected, qPrintable(attempt.messages.join('\n')));
         QCOMPARE(server.startedMethods(), expectedMethods);
+    }
+
+    void algorithmCompatibility_data()
+    {
+        QTest::addColumn<QStringList>("arguments");
+        QTest::newRow("ed25519-curve25519-aes128gcm") << QStringList{
+            "-host-key", "ed25519", "-kex", "curve25519-sha256", "-cipher", "aes128-gcm@openssh.com"};
+        QTest::newRow("ecdsa-p256-aes256ctr") << QStringList{
+            "-host-key", "ecdsa", "-kex", "ecdh-sha2-nistp256", "-cipher", "aes256-ctr"};
+        QTest::newRow("rsa-sha256-group14-aes128ctr") << QStringList{
+            "-host-key", "rsa256", "-kex", "diffie-hellman-group14-sha256", "-cipher", "aes128-ctr"};
+        QTest::newRow("rsa-sha512-curve25519-aes256gcm") << QStringList{
+            "-host-key", "rsa512", "-kex", "curve25519-sha256", "-cipher", "aes256-gcm@openssh.com"};
+    }
+
+    void algorithmCompatibility()
+    {
+        QFETCH(QStringList, arguments);
+        LocalSshServer server;
+        QVERIFY2(server.start(arguments), server.error().constData());
+        const auto attempt = attemptConnection(server, 5000);
+        QVERIFY2(attempt.connected, qPrintable(attempt.messages.join('\n')));
+        QVERIFY(attempt.firstOutputMs >= 0);
+        qInfo("Local connect: %lld ms; first terminal output: %lld ms", attempt.elapsedMs, attempt.firstOutputMs);
+    }
+
+    void hostKeyMismatchNeverSendsCredentials()
+    {
+        LocalSshServer server;
+        QVERIFY2(server.start({}), server.error().constData());
+        noxshell::Libssh2Worker worker;
+        QSignalSpy changes(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        QSignalSpy verification(&worker, &noxshell::Libssh2Worker::hostKeyVerificationRequired);
+        auto profile = fixtureProfile(server.port);
+        profile.expectedFingerprint = QStringLiteral("SHA256:deliberately-wrong-test-fingerprint");
+        worker.connectTo(profile);
+        QVERIFY(!changes.isEmpty());
+        QVERIFY(!changes.last().at(0).toBool());
+        QVERIFY(changes.last().at(1).toString().contains(QStringLiteral("指纹")));
+        QCOMPARE(verification.count(), 0);
+        QVERIFY(server.startedMethods().isEmpty());
+    }
+
+    void reconnectAndEchoWithRekey()
+    {
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        QSignalSpy changes(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        QByteArray output;
+        QObject::connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived,
+            &worker, [&](const QByteArray &chunk) { output.append(chunk); });
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            LocalSshServer server;
+            QVERIFY2(server.start({"-shell-mode", "echo", "-rekey-bytes", "65536"}), server.error().constData());
+            worker.connectTo(fixtureProfile(server.port));
+            QVERIFY2(changes.last().at(0).toBool(), qPrintable(changes.last().at(1).toString()));
+            QTRY_VERIFY_WITH_TIMEOUT(output.contains("fixture-user@localtest:~$ "), 2000);
+            output.clear();
+            const QByteArray input = QByteArray::number(iteration) + QByteArray(256 * 1024, 'x') + "end-marker\n";
+            worker.sendInput(input);
+            QTRY_COMPARE_WITH_TIMEOUT(output, input, 5000);
+            worker.disconnectFromHost();
+            QVERIFY(!changes.last().at(0).toBool());
+            output.clear();
+        }
+    }
+
+    void blockedInput_data()
+    {
+        QTest::addColumn<bool>("cancel");
+        QTest::newRow("bounded-stall-timeout") << false;
+        QTest::newRow("cancel-stalled-write") << true;
+    }
+
+    void blockedInput()
+    {
+        QFETCH(bool, cancel);
+        LocalSshServer server;
+        QVERIFY2(server.start({"-shell-mode", "no-read"}), server.error().constData());
+        noxshell::Libssh2Worker worker(nullptr, 5000, cancel ? 8000 : 1000);
+        trustLocalFixture(worker);
+        QSignalSpy changes(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        worker.connectTo(fixtureProfile(server.port));
+        QVERIFY(changes.last().at(0).toBool());
+        std::thread cancellation;
+        if (cancel) {
+            cancellation = std::thread([&worker] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                worker.cancelConnection();
+            });
+        }
+        QElapsedTimer elapsed;
+        elapsed.start();
+        // Larger than the server's receive window; the server never consumes it.
+        worker.sendInput(QByteArray(8 * 1024 * 1024, 'x'));
+        const auto duration = elapsed.elapsed();
+        if (cancellation.joinable()) cancellation.join();
+        QVERIFY(!changes.last().at(0).toBool());
+        const auto message = changes.last().at(1).toString();
+        QVERIFY2(message.contains(cancel ? QStringLiteral("连接已取消") : QStringLiteral("不会自动重发")), qPrintable(message));
+        QVERIFY2(duration < (cancel ? 1500 : 3500), qPrintable(QString::number(duration)));
+        if (!cancel) QVERIFY(duration >= 900);
+        qInfo("Blocked input %s returned in %lld ms", cancel ? "cancellation" : "timeout", duration);
+    }
+
+    void outputFloodHasBoundedBatchesAndFairStderr()
+    {
+        LocalSshServer server;
+        QVERIFY2(server.start({"-shell-mode", "flood"}), server.error().constData());
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        QSignalSpy changes(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        qsizetype bytes = 0;
+        bool stderrSeen = false;
+        QObject::connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived,
+            &worker, [&](const QByteArray &chunk) {
+                bytes += chunk.size();
+                stderrSeen = stderrSeen || chunk.contains("stderr-fairness-marker");
+            });
+        worker.connectTo(fixtureProfile(server.port));
+        QVERIFY(changes.last().at(0).toBool());
+        QTest::qWait(100);
+        const auto before = bytes;
+        bool received = false;
+        QVERIFY(QMetaObject::invokeMethod(&worker, "drainChannel", Qt::DirectConnection, Q_RETURN_ARG(bool, received)));
+        QVERIFY(received);
+        QVERIFY(bytes - before <= 2 * 64 * 1024);
+        QTRY_VERIFY_WITH_TIMEOUT(stderrSeen, 1500);
+        bool queuedOperationRan = false;
+        QTimer::singleShot(0, &worker, [&] {
+            worker.resizePty(100, 30, 0, 0);
+            worker.disconnectFromHost();
+            queuedOperationRan = true;
+        });
+        QElapsedTimer elapsed;
+        elapsed.start();
+        QTRY_VERIFY_WITH_TIMEOUT(queuedOperationRan, 1000);
+        QVERIFY(elapsed.elapsed() < 1000);
+        QVERIFY(!changes.last().at(0).toBool());
+    }
+
+    void finalOutputIsNotTruncatedAtEof_data()
+    {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("channel-eof") << QStringLiteral("burst");
+        QTest::newRow("channel-and-tcp-close") << QStringLiteral("burst-close");
+    }
+
+    void finalOutputIsNotTruncatedAtEof()
+    {
+        QFETCH(QString, mode);
+        LocalSshServer server;
+        QVERIFY2(server.start({"-shell-mode", mode}), server.error().constData());
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        QSignalSpy changes(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        QByteArray output;
+        QObject::connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived,
+            &worker, [&](const QByteArray &chunk) { output.append(chunk); });
+        worker.connectTo(fixtureProfile(server.port));
+        QTRY_VERIFY_WITH_TIMEOUT(!changes.last().at(0).toBool(), 5000);
+        const bool hasMarkers = output.contains("stderr-tail-marker\n")
+            && output.startsWith("fixture-user@localtest:~$ ");
+        const bool hasExpectedSize = output.size()
+            == 1024 * 1024 + QByteArray("fixture-user@localtest:~$ stderr-tail-marker\n").size();
+        output.remove(0, QByteArray("fixture-user@localtest:~$ ").size());
+        output.replace("stderr-tail-marker\n", "");
+#if LIBSSH2_VERSION_NUM <= 0x010B01
+        // A distinct upstream limitation, not fixed by the bounded-read patch:
+        // 1.11.1 channel_read returns transport EOF errors before delivering
+        // already buffered packets. Preserve this reproducer as an explicit
+        // expected failure; an unexpected pass requires removing the exception.
+        QEXPECT_FAIL("channel-and-tcp-close", "Known libssh2 <= 1.11.1 limitation: immediate TCP close can hide buffered final output; not fixed", Continue);
+#endif
+        QVERIFY(hasMarkers && hasExpectedSize && output == QByteArray(1024 * 1024, 'x'));
+    }
+
+    void abruptDisconnectIsReportedAndCanReconnect()
+    {
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        QSignalSpy changes(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        LocalSshServer droppingServer;
+        QVERIFY2(droppingServer.start({"-shell-mode", "reset"}), droppingServer.error().constData());
+        worker.connectTo(fixtureProfile(droppingServer.port));
+        QVERIFY(changes.last().at(0).toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!changes.last().at(0).toBool(), 2000);
+        LocalSshServer healthyServer;
+        QVERIFY2(healthyServer.start({}), healthyServer.error().constData());
+        worker.connectTo(fixtureProfile(healthyServer.port));
+        QVERIFY2(changes.last().at(0).toBool(), qPrintable(changes.last().at(1).toString()));
+        worker.disconnectFromHost();
     }
 
     void discoveryTimeoutDoesNotAttemptAuthentication()

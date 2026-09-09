@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -162,10 +163,11 @@ QString commitRemoteTemporaryFile(LIBSSH2_SFTP *sftp, const QByteArray &temporar
 }
 } // namespace
 
-Libssh2Worker::Libssh2Worker(QObject *parent, int authenticationTimeoutMs)
+Libssh2Worker::Libssh2Worker(QObject *parent, int authenticationTimeoutMs, int inputStallTimeoutMs)
     : QObject(parent)
     , m_readTimer(new QTimer(this))
     , m_authenticationTimeoutMs(qMax(1, authenticationTimeoutMs))
+    , m_inputStallTimeoutMs(qMax(1, inputStallTimeoutMs))
 {
     static const bool initialized = [] { return libssh2_init(0) == 0; }();
     Q_UNUSED(initialized);
@@ -498,13 +500,20 @@ void Libssh2Worker::sendInput(const QByteArray &data)
     }
     qsizetype offset = 0;
     while (offset < data.size()) {
-        const auto written = libssh2_channel_write(m_channel, data.constData() + offset, static_cast<size_t>(data.size() - offset));
-        if (written == LIBSSH2_ERROR_EAGAIN) {
-            waitForSocket(100);
-            continue;
-        }
+        // Keep the exact buffer and length across EAGAIN retries. A blocked
+        // remote receive window must not leave this worker stuck indefinitely.
+        const auto length = static_cast<size_t>(qMin<qsizetype>(32768, data.size() - offset));
+        const auto written = runConnectionOperation([&] {
+            const auto result = libssh2_channel_write(m_channel, data.constData() + offset, length);
+            return result == 0 ? LIBSSH2_ERROR_EAGAIN : static_cast<int>(result);
+        }, m_inputStallTimeoutMs);
         if (written < 0) {
-            emit outputReceived(QStringLiteral("命令发送失败：%1\n").arg(lastSessionError()));
+            const auto detail = written == LIBSSH2_ERROR_TIMEOUT
+                ? QStringLiteral("服务端持续未接收输入，已断开会话；部分内容可能已送达，请重连后核对，不会自动重发")
+                : connectionOperationError();
+            // Do not reuse a session with an unfinished packet or silently
+            // replay a partially delivered command after reconnecting.
+            fail(QStringLiteral("终端输入发送"), detail);
             return;
         }
         offset += written;
@@ -514,7 +523,14 @@ void Libssh2Worker::sendInput(const QByteArray &data)
 void Libssh2Worker::resizePty(int columns, int rows, int pixelWidth, int pixelHeight)
 {
     if (!m_connected || !m_channel) return;
-    libssh2_channel_request_pty_size_ex(m_channel, qMax(2, columns), qMax(2, rows), qMax(0, pixelWidth), qMax(0, pixelHeight));
+    const int result = runConnectionOperation([&] {
+        return libssh2_channel_request_pty_size_ex(m_channel, qMax(2, columns), qMax(2, rows),
+            qMax(0, pixelWidth), qMax(0, pixelHeight));
+    }, m_inputStallTimeoutMs);
+    if (result != 0) {
+        fail(QStringLiteral("终端尺寸更新"), result == LIBSSH2_ERROR_TIMEOUT
+            ? QStringLiteral("服务端响应超时，已断开会话") : connectionOperationError());
+    }
 }
 
 void Libssh2Worker::collectMetrics(quint64 requestId)
@@ -1296,20 +1312,34 @@ bool Libssh2Worker::drainChannel()
 {
     if (!m_channel) return false;
     bool receivedAny = false;
+    bool fullyDrained = true;
     std::array<char, 8192> buffer{};
+    // Bound each stream independently so continuous stdout cannot starve
+    // stderr, queued input, resize or disconnect events. Batch UI signals too.
+    constexpr qsizetype maxBytesPerStream = 64 * 1024;
     for (int stream = 0; stream < 2; ++stream) {
-        for (;;) {
+        QByteArray batch;
+        QString failure;
+        while (batch.size() < maxBytesPerStream) {
             const auto received = libssh2_channel_read_ex(m_channel, stream, buffer.data(), buffer.size());
             if (received > 0) {
                 receivedAny = true;
-                const QByteArray chunk(buffer.data(), static_cast<qsizetype>(received));
-                emit rawOutputReceived(chunk);
+                batch.append(buffer.data(), static_cast<qsizetype>(received));
                 continue;
             }
+            if (received < 0 && received != LIBSSH2_ERROR_EAGAIN) failure = lastSessionError();
             break;
         }
+        if (batch.size() >= maxBytesPerStream) fullyDrained = false;
+        if (!batch.isEmpty()) emit rawOutputReceived(batch);
+        if (!failure.isEmpty()) {
+            fail(QStringLiteral("SSH 连接读取"), failure);
+            return receivedAny;
+        }
     }
-    if (libssh2_channel_eof(m_channel)) {
+    // EOF can arrive while libssh2 still has buffered output. Do not truncate
+    // the final output just because this tick reached its byte budget.
+    if (fullyDrained && libssh2_channel_eof(m_channel)) {
         emit connectionChanged(false, QStringLiteral("远端已关闭 SSH 会话"));
         cleanup();
     }
@@ -1494,6 +1524,11 @@ bool Libssh2Worker::connectSocket(const QString &host, quint16 port, int timeout
             continue;
         }
 #endif
+        // Small interactive packets should not wait for Nagle/delayed ACK.
+        // These are best-effort transport hints, not SSH security settings.
+        const int enabled = 1;
+        setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY,
+            reinterpret_cast<const char *>(&enabled), sizeof(enabled));
         m_socketDescriptor = static_cast<qintptr>(descriptor);
         freeaddrinfo(addresses);
         return true;
@@ -1524,7 +1559,10 @@ bool Libssh2Worker::connectSocket(const QString &host, quint16 port, int timeout
 bool Libssh2Worker::waitForSocket(int timeoutMs) const
 {
     if (m_socketDescriptor < 0 || !m_session) return false;
-    const int directions = libssh2_session_block_directions(m_session);
+    int directions = libssh2_session_block_directions(m_session);
+    // A zero-length channel write can indicate a full SSH receive window
+    // without setting block directions; wait for a window update, not a spin.
+    if (directions == 0) directions = LIBSSH2_SESSION_BLOCK_INBOUND;
 #ifdef Q_OS_WIN
     const auto descriptor = static_cast<SOCKET>(m_socketDescriptor);
     fd_set readSet;

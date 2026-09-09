@@ -21,7 +21,8 @@ class Libssh2Worker final : public QObject {
     Q_OBJECT
 
 public:
-    explicit Libssh2Worker(QObject *parent = nullptr, int authenticationTimeoutMs = 30000);
+    explicit Libssh2Worker(QObject *parent = nullptr, int authenticationTimeoutMs = 30000,
+        int inputStallTimeoutMs = 8000);
     ~Libssh2Worker() override;
 
     // May be called from the GUI thread while a connection operation is pending.
@@ -106,6 +107,7 @@ private:
     bool m_connected{false};
     bool m_directoryShellFallback{false};
     const int m_authenticationTimeoutMs;
+    const int m_inputStallTimeoutMs;
     QString m_connectionFailure;
     std::atomic<quint64> m_connectionGeneration{1};
     quint64 m_activeConnectionGeneration{1};
