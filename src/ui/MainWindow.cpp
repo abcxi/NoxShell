@@ -110,10 +110,10 @@ bool isConnectingMessage(const QString &message)
 
 } // namespace
 
-MainWindow::MainWindow(QString databasePath, QWidget *parent)
+MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *credentialStore)
     : QMainWindow(parent)
     , m_repository(new ServerRepository(std::move(databasePath), true, this))
-    , m_credentialStore(new CredentialStore(this))
+    , m_credentialStore(credentialStore ? credentialStore : new CredentialStore(this))
 {
     m_themeMode = storedThemeMode();
     applyApplicationTheme(m_themeMode);
@@ -924,13 +924,18 @@ void MainWindow::duplicateServer(const ServerProfile &profile)
     if (persistProfile(duplicate, false)) m_sidebar->addServer(duplicate);
 }
 
-bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret)
+bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret, const ServerProfile *originalProfile)
 {
     if (profile.id.isEmpty()) profile.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (profile.connectionMode == ConnectionMode::Rdp) {
         CredentialSecret secret;
         if (preserveEmptySecret && !profile.credentialRef.isEmpty()) {
             secret = m_credentialStore->load(profile.credentialRef);
+            if (!m_credentialStore->lastError().isEmpty() && profile.password.isEmpty()) {
+                QMessageBox::critical(this, QStringLiteral("保存 RDP 密码失败"),
+                    QStringLiteral("无法读取原密码，未覆盖已保存凭据：%1").arg(m_credentialStore->lastError()));
+                return false;
+            }
         }
         if (!profile.password.isEmpty()) secret.password = profile.password;
         if (!secret.password.isEmpty()) {
@@ -953,14 +958,28 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
     if (profile.credentialRef.isEmpty()) profile.credentialRef = QStringLiteral("server/%1").arg(profile.id);
 
     CredentialSecret secret;
-    if (preserveEmptySecret && profile.authentication != AuthenticationMethod::SshAgent) {
-        secret = m_credentialStore->load(profile.credentialRef);
-        if (!m_credentialStore->lastError().isEmpty() && secret.password.isEmpty() && secret.keyPassphrase.isEmpty()) {
-            // Missing credentials are allowed when switching from Agent to a new password/key entered below.
+    const bool sameAuthentication = originalProfile && originalProfile->authentication == profile.authentication;
+    const bool samePrivateKey = profile.authentication != AuthenticationMethod::PrivateKey
+        || (originalProfile && originalProfile->privateKeyPath == profile.privateKeyPath);
+    const bool canPreserveSecret = preserveEmptySecret && originalProfile && sameAuthentication && samePrivateKey
+        && !originalProfile->credentialRef.isEmpty();
+    if (canPreserveSecret && profile.authentication != AuthenticationMethod::SshAgent) {
+        secret = m_credentialStore->load(originalProfile->credentialRef);
+        const bool needsStoredSecret = (profile.authentication == AuthenticationMethod::Password && profile.password.isEmpty())
+            || (profile.authentication == AuthenticationMethod::PrivateKey && profile.keyPassphrase.isEmpty());
+        if (!m_credentialStore->lastError().isEmpty() && needsStoredSecret) {
+            QMessageBox::critical(this, QStringLiteral("保存凭据失败"),
+                QStringLiteral("无法读取原凭据，未覆盖已保存内容：%1\n请解锁系统凭据库，或重新输入凭据。")
+                    .arg(m_credentialStore->lastError()));
+            return false;
         }
     }
     if (!profile.password.isEmpty()) secret.password = profile.password;
     if (!profile.keyPassphrase.isEmpty()) secret.keyPassphrase = profile.keyPassphrase;
+    if (profile.authentication == AuthenticationMethod::Password && secret.password.isEmpty()) {
+        QMessageBox::critical(this, QStringLiteral("保存凭据失败"), QStringLiteral("未找到可用的 SSH 密码，请重新输入后保存。"));
+        return false;
+    }
     if (profile.authentication == AuthenticationMethod::SshAgent) {
         if (preserveEmptySecret && !profile.credentialRef.isEmpty()) m_credentialStore->remove(profile.credentialRef);
     } else if (!m_credentialStore->save(profile.credentialRef, secret)) {
@@ -1015,7 +1034,7 @@ void MainWindow::editServer(const ServerProfile &sourceProfile)
         dialog.setAvailableGroups(m_repository->loadServerGroups());
         if (dialog.exec() != QDialog::Accepted) return;
         auto profile = dialog.profile();
-        if (!persistProfile(profile, true)) return;
+        if (!persistProfile(profile, true, &sourceProfile)) return;
         m_sidebar->updateServer(profile);
         return;
     }
@@ -1029,7 +1048,7 @@ void MainWindow::editServer(const ServerProfile &sourceProfile)
     const auto runtimeState = sourceProfile.state;
     profile.state = ServerState::Offline;
     profile.connectionMode = sourceProfile.connectionMode;
-    if (!persistProfile(profile, true)) return;
+    if (!persistProfile(profile, true, &sourceProfile)) return;
     profile.state = runtimeState;
     m_sidebar->updateServer(profile);
     if (m_terminalWorkspace) m_terminalWorkspace->updateServer(profile);

@@ -37,6 +37,8 @@ namespace noxshell {
 
 namespace {
 constexpr int kConnectTimeoutMs = 8000;
+constexpr int kTcpConnectTimeoutMs = 30000;
+constexpr int kHandshakeTimeoutMs = 15000;
 constexpr int kMetricsTimeoutMs = 3500;
 
 // libssh2 的 keyboard-interactive 回调没有用户数据参数。每个 SSH worker
@@ -160,9 +162,10 @@ QString commitRemoteTemporaryFile(LIBSSH2_SFTP *sftp, const QByteArray &temporar
 }
 } // namespace
 
-Libssh2Worker::Libssh2Worker(QObject *parent)
+Libssh2Worker::Libssh2Worker(QObject *parent, int authenticationTimeoutMs)
     : QObject(parent)
     , m_readTimer(new QTimer(this))
+    , m_authenticationTimeoutMs(qMax(1, authenticationTimeoutMs))
 {
     static const bool initialized = [] { return libssh2_init(0) == 0; }();
     Q_UNUSED(initialized);
@@ -178,15 +181,62 @@ Libssh2Worker::~Libssh2Worker()
     cleanup();
 }
 
-void Libssh2Worker::connectTo(const ServerProfile &profile)
+void Libssh2Worker::cancelConnection()
+{
+    ++m_connectionGeneration;
+}
+
+quint64 Libssh2Worker::connectionGeneration() const
+{
+    return m_connectionGeneration.load();
+}
+
+bool Libssh2Worker::connectionCanceled() const
+{
+    return m_activeConnectionGeneration != connectionGeneration();
+}
+
+int Libssh2Worker::runConnectionOperation(const std::function<int()> &operation, int timeoutMs)
+{
+    m_connectionFailure.clear();
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (;;) {
+        if (connectionCanceled()) {
+            m_connectionFailure = QStringLiteral("连接已取消");
+            return LIBSSH2_ERROR_SOCKET_DISCONNECT;
+        }
+        const int result = operation();
+        if (result != LIBSSH2_ERROR_EAGAIN) return result;
+        const auto remaining = timeoutMs - elapsed.elapsed();
+        if (remaining <= 0) {
+            m_connectionFailure = QStringLiteral("等待服务端响应超时（%1 秒），已终止本次连接；尚不能据此判断密码是否正确")
+                                      .arg(timeoutMs / 1000.0, 0, 'g', 4);
+            return LIBSSH2_ERROR_TIMEOUT;
+        }
+        // Resume the SAME libssh2 operation after EAGAIN. Switching auth methods
+        // on a timeout can consume the previous request's late reply as its own.
+        waitForSocket(static_cast<int>(qMin<qint64>(100, remaining)));
+    }
+}
+
+QString Libssh2Worker::connectionOperationError() const
+{
+    return m_connectionFailure.isEmpty() ? lastSessionError() : m_connectionFailure;
+}
+
+void Libssh2Worker::connectTo(const ServerProfile &profile, quint64 requestGeneration)
 {
     cleanup();
+    m_activeConnectionGeneration = requestGeneration ? requestGeneration : connectionGeneration();
+    if (connectionCanceled()) return;
+    m_connectionFailure.clear();
     m_readTimer->setParent(this);
     m_profile = profile;
     emit connectionChanged(false, QStringLiteral("TCP 连接 %1:%2…").arg(profile.host).arg(profile.port));
 
     QString socketError;
-    if (!connectSocket(profile.host, profile.port, kConnectTimeoutMs, socketError)) {
+    if (!connectSocket(profile.host, profile.port, kTcpConnectTimeoutMs, socketError)) {
         fail(QStringLiteral("TCP"), socketError);
         return;
     }
@@ -196,12 +246,14 @@ void Libssh2Worker::connectTo(const ServerProfile &profile)
         fail(QStringLiteral("SSH 初始化"), QStringLiteral("libssh2_session_init 失败"));
         return;
     }
-    libssh2_session_set_blocking(m_session, 1);
+    libssh2_session_set_blocking(m_session, 0);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
     emit connectionChanged(false, QStringLiteral("正在进行 SSH 握手…"));
-    const auto handshakeResult = libssh2_session_handshake(m_session, static_cast<libssh2_socket_t>(m_socketDescriptor));
+    const auto handshakeResult = runConnectionOperation([this] {
+        return libssh2_session_handshake(m_session, static_cast<libssh2_socket_t>(m_socketDescriptor));
+    }, kHandshakeTimeoutMs);
     if (handshakeResult != 0) {
-        fail(QStringLiteral("SSH 握手"), lastSessionError());
+        fail(QStringLiteral("SSH 握手"), connectionOperationError());
         return;
     }
 
@@ -246,31 +298,40 @@ void Libssh2Worker::approveHostKey(bool approved)
 
 void Libssh2Worker::continueAuthentication()
 {
-    emit connectionChanged(false, QStringLiteral("正在认证 %1@%2…").arg(m_profile.user, m_profile.host));
-    const auto advertisedMethods = advertisedAuthenticationMethods();
+    emit connectionChanged(false, QStringLiteral("正在查询 %1@%2 的认证方式（最多等待 %3 秒）…")
+        .arg(m_profile.user, m_profile.host).arg(m_authenticationTimeoutMs / 1000));
+    QStringList advertisedMethods;
+    if (!advertisedAuthenticationMethods(advertisedMethods)) {
+        fail(QStringLiteral("SSH 认证方式协商"), connectionOperationError());
+        return;
+    }
     QStringList attemptedMethods;
+    QStringList methodFailures;
     QString localFailure;
-    bool authenticated = false;
-    switch (m_profile.authentication) {
+    bool authenticated = libssh2_userauth_authenticated(m_session) != 0;
+    auto attempt = [&](const QString &name, const std::function<int()> &authenticate) {
+        attemptedMethods.append(name);
+        emit connectionChanged(false, QStringLiteral("正在使用 %1 认证 %2@%3…").arg(name, m_profile.user, m_profile.host));
+        const int result = authenticate();
+        authenticated = result == 0;
+        if (!authenticated) methodFailures.append(name + QStringLiteral("：") + connectionOperationError());
+        return result;
+    };
+    if (!authenticated) switch (m_profile.authentication) {
     case AuthenticationMethod::Password: {
         if (m_profile.password.isEmpty()) {
             localFailure = QStringLiteral("密码为空，请重新输入或检查系统凭据库");
             break;
         }
-        const bool methodsUnknown = advertisedMethods.isEmpty();
-        // Prefer the SSH password method when both are advertised. Some older
-        // OpenSSH/PAM configurations count a failed keyboard-interactive
-        // exchange as an authentication failure and reject the following
-        // password attempt even though the password itself is valid.
-        if (methodsUnknown || advertisedMethods.contains(QStringLiteral("password"))) {
-            attemptedMethods.append(QStringLiteral("password"));
-            emit connectionChanged(false, QStringLiteral("正在使用密码认证 %1@%2…").arg(m_profile.user, m_profile.host));
-            authenticated = authenticatePassword();
+        int passwordResult = LIBSSH2_ERROR_AUTHENTICATION_FAILED;
+        if (advertisedMethods.contains(QStringLiteral("password"))) {
+            passwordResult = attempt(QStringLiteral("password"), [this] { return authenticatePassword(); });
         }
-        if (!authenticated && (methodsUnknown || advertisedMethods.contains(QStringLiteral("keyboard-interactive")))) {
-            attemptedMethods.append(QStringLiteral("keyboard-interactive"));
-            emit connectionChanged(false, QStringLiteral("正在使用键盘交互认证 %1@%2…").arg(m_profile.user, m_profile.host));
-            authenticated = authenticateKeyboardInteractive();
+        // A timeout/transport failure is NOT an authentication rejection. Do not
+        // send another request on that session or discard the original error.
+        if (!authenticated && passwordResult == LIBSSH2_ERROR_AUTHENTICATION_FAILED
+            && advertisedMethods.contains(QStringLiteral("keyboard-interactive"))) {
+            attempt(QStringLiteral("keyboard-interactive"), [this] { return authenticateKeyboardInteractive(); });
         }
         if (!authenticated && attemptedMethods.isEmpty()) {
             localFailure = QStringLiteral("当前选择的是密码认证，但服务端没有开放 password 或 keyboard-interactive");
@@ -278,16 +339,14 @@ void Libssh2Worker::continueAuthentication()
         break;
     }
     case AuthenticationMethod::PrivateKey:
-        attemptedMethods.append(QStringLiteral("publickey"));
-        authenticated = authenticatePrivateKey();
+        attempt(QStringLiteral("publickey"), [this] { return authenticatePrivateKey(); });
         break;
     case AuthenticationMethod::SshAgent:
-        attemptedMethods.append(QStringLiteral("publickey/agent"));
-        authenticated = authenticateAgent();
+        attempt(QStringLiteral("publickey/agent"), [this] { return authenticateAgent(); });
         break;
     }
     if (!authenticated) {
-        QString detail = localFailure.isEmpty() ? lastSessionError() : localFailure;
+        QString detail = localFailure.isEmpty() ? methodFailures.join(QStringLiteral("；")) : localFailure;
         if (!advertisedMethods.isEmpty()) {
             detail += QStringLiteral("；服务端允许：%1").arg(advertisedMethods.join(QStringLiteral("、")));
         }
@@ -298,7 +357,11 @@ void Libssh2Worker::continueAuthentication()
         return;
     }
     if (!openShell()) {
-        fail(QStringLiteral("PTY/Shell"), lastSessionError());
+        fail(QStringLiteral("PTY/Shell"), connectionOperationError());
+        return;
+    }
+    if (connectionCanceled()) {
+        cleanup();
         return;
     }
     m_connected = true;
@@ -315,93 +378,108 @@ void Libssh2Worker::continueAuthentication()
     emit promptChanged(QStringLiteral("%1@%2:~$ ").arg(m_profile.user, m_profile.name));
 }
 
-bool Libssh2Worker::authenticatePassword()
+int Libssh2Worker::authenticatePassword()
 {
     const auto user = m_profile.user.toUtf8();
     const auto password = m_profile.password.toUtf8();
     if (password.isEmpty()) {
-        return false;
+        return LIBSSH2_ERROR_AUTHENTICATION_FAILED;
     }
-    return libssh2_userauth_password_ex(m_session, user.constData(), static_cast<unsigned int>(user.size()), password.constData(), static_cast<unsigned int>(password.size()), nullptr) == 0;
+    return runConnectionOperation([&] {
+        return libssh2_userauth_password_ex(m_session, user.constData(), static_cast<unsigned int>(user.size()),
+            password.constData(), static_cast<unsigned int>(password.size()), nullptr);
+    }, m_authenticationTimeoutMs);
 }
 
-bool Libssh2Worker::authenticateKeyboardInteractive()
+int Libssh2Worker::authenticateKeyboardInteractive()
 {
     const auto user = m_profile.user.toUtf8();
     const auto password = m_profile.password.toUtf8();
-    if (password.isEmpty()) return false;
+    if (password.isEmpty()) return LIBSSH2_ERROR_AUTHENTICATION_FAILED;
 
     g_keyboardInteractiveUser = user;
     g_keyboardInteractivePassword = password;
-    const auto result = libssh2_userauth_keyboard_interactive_ex(
-        m_session,
-        user.constData(), static_cast<unsigned int>(user.size()),
-        keyboardInteractiveResponse);
+    const auto result = runConnectionOperation([&] {
+        return libssh2_userauth_keyboard_interactive_ex(m_session,
+            user.constData(), static_cast<unsigned int>(user.size()), keyboardInteractiveResponse);
+    }, m_authenticationTimeoutMs);
     g_keyboardInteractivePassword.fill('\0');
     g_keyboardInteractivePassword.clear();
     g_keyboardInteractiveUser.clear();
-    return result == 0;
-}
-
-QStringList Libssh2Worker::advertisedAuthenticationMethods() const
-{
-    if (!m_session) return {};
-    const auto user = m_profile.user.toUtf8();
-    const auto *methods = libssh2_userauth_list(
-        m_session, user.constData(), static_cast<unsigned int>(user.size()));
-    if (!methods) return {};
-
-    auto result = QString::fromLatin1(methods).split(QLatin1Char(','), Qt::SkipEmptyParts);
-    for (auto &method : result) method = method.trimmed().toLower();
-    result.removeDuplicates();
     return result;
 }
 
-bool Libssh2Worker::authenticatePrivateKey()
+bool Libssh2Worker::advertisedAuthenticationMethods(QStringList &methods)
+{
+    methods.clear();
+    if (!m_session) return false;
+    const auto user = m_profile.user.toUtf8();
+    const char *offered = nullptr;
+    const int result = runConnectionOperation([&] {
+        offered = libssh2_userauth_list(m_session, user.constData(), static_cast<unsigned int>(user.size()));
+        if (offered || libssh2_userauth_authenticated(m_session)) return 0;
+        const int error = libssh2_session_last_errno(m_session);
+        return error != 0 ? error : LIBSSH2_ERROR_PROTO;
+    }, m_authenticationTimeoutMs);
+    if (result != 0) return false;
+    if (offered) {
+        methods = QString::fromLatin1(offered).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (auto &method : methods) method = method.trimmed().toLower();
+        methods.removeDuplicates();
+    }
+    return true;
+}
+
+int Libssh2Worker::authenticatePrivateKey()
 {
     const auto user = m_profile.user.toUtf8();
     const auto publicKey = nativePath(m_profile.publicKeyPath).toUtf8();
     const auto privateKey = nativePath(m_profile.privateKeyPath).toUtf8();
     const auto passphrase = m_profile.keyPassphrase.toUtf8();
     if (privateKey.isEmpty()) {
-        return false;
+        m_connectionFailure = QStringLiteral("未指定私钥文件");
+        return LIBSSH2_ERROR_FILE;
     }
-    return libssh2_userauth_publickey_fromfile_ex(
+    return runConnectionOperation([&] { return libssh2_userauth_publickey_fromfile_ex(
                m_session,
                user.constData(), static_cast<unsigned int>(user.size()),
                publicKey.isEmpty() ? nullptr : publicKey.constData(), privateKey.constData(),
-               passphrase.isEmpty() ? nullptr : passphrase.constData()) == 0;
+               passphrase.isEmpty() ? nullptr : passphrase.constData()); }, m_authenticationTimeoutMs);
 }
 
-bool Libssh2Worker::authenticateAgent()
+int Libssh2Worker::authenticateAgent()
 {
     LIBSSH2_AGENT *agent = libssh2_agent_init(m_session);
-    if (!agent) return false;
+    if (!agent) return libssh2_session_last_errno(m_session);
     const auto user = m_profile.user.toUtf8();
-    bool authenticated = false;
-    if (libssh2_agent_connect(agent) == 0 && libssh2_agent_list_identities(agent) == 0) {
+    int result = libssh2_agent_connect(agent);
+    if (result == 0) result = libssh2_agent_list_identities(agent);
+    if (result == 0) {
+        result = LIBSSH2_ERROR_AUTHENTICATION_FAILED;
+        m_connectionFailure = QStringLiteral("SSH Agent 中没有可用的身份");
         struct libssh2_agent_publickey *identity = nullptr;
         struct libssh2_agent_publickey *previous = nullptr;
         while (libssh2_agent_get_identity(agent, &identity, previous) == 0) {
-            if (libssh2_agent_userauth(agent, user.constData(), identity) == 0) {
-                authenticated = true;
-                break;
-            }
+            result = runConnectionOperation([&] { return libssh2_agent_userauth(agent, user.constData(), identity); }, m_authenticationTimeoutMs);
+            if (result == 0 || (result != LIBSSH2_ERROR_AUTHENTICATION_FAILED && result != LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED)) break;
             previous = identity;
         }
     }
     libssh2_agent_disconnect(agent);
     libssh2_agent_free(agent);
-    return authenticated;
+    return result;
 }
 
 bool Libssh2Worker::openShell()
 {
-    m_channel = libssh2_channel_open_session(m_session);
-    if (!m_channel) return false;
-    if (libssh2_channel_request_pty_ex(m_channel, "xterm-256color", 14, nullptr, 0, 120, 36, 0, 0) != 0) return false;
-    if (libssh2_channel_shell(m_channel) != 0) return false;
-    libssh2_session_set_blocking(m_session, 0);
+    if (runConnectionOperation([this] {
+            m_channel = libssh2_channel_open_session(m_session);
+            return m_channel ? 0 : libssh2_session_last_errno(m_session);
+        }, kHandshakeTimeoutMs) != 0 || !m_channel) return false;
+    if (runConnectionOperation([this] {
+            return libssh2_channel_request_pty_ex(m_channel, "xterm-256color", 14, nullptr, 0, 120, 36, 0, 0);
+        }, kHandshakeTimeoutMs) != 0) return false;
+    if (runConnectionOperation([this] { return libssh2_channel_shell(m_channel); }, kHandshakeTimeoutMs) != 0) return false;
     return true;
 }
 
@@ -1251,14 +1329,30 @@ void Libssh2Worker::cleanup()
     m_waitingForHostKey = false;
     m_connected = false;
     m_directoryShellFallback = false;
+    // Never block teardown on a peer that has already timed out.
+    if (m_session) libssh2_session_set_blocking(m_session, 0);
     if (m_channel) {
         libssh2_channel_send_eof(m_channel);
         libssh2_channel_close(m_channel);
+    }
+    if (m_session) {
+        libssh2_session_disconnect_ex(m_session, SSH_DISCONNECT_BY_APPLICATION, "Client disconnect", "en");
+    }
+    // Keep ownership of the descriptor until libssh2 has released its session:
+    // session_free may restore socket flags. Closing first could let another
+    // worker reuse that descriptor while libssh2 still refers to it.
+    if (m_socketDescriptor >= 0) {
+#ifdef Q_OS_WIN
+        ::shutdown(static_cast<SOCKET>(m_socketDescriptor), SD_BOTH);
+#else
+        ::shutdown(static_cast<int>(m_socketDescriptor), SHUT_RDWR);
+#endif
+    }
+    if (m_channel) {
         libssh2_channel_free(m_channel);
         m_channel = nullptr;
     }
     if (m_session) {
-        libssh2_session_disconnect_ex(m_session, SSH_DISCONNECT_BY_APPLICATION, "Client disconnect", "en");
         libssh2_session_free(m_session);
         m_session = nullptr;
     }
@@ -1300,8 +1394,13 @@ bool Libssh2Worker::connectSocket(const QString &host, quint16 port, int timeout
     elapsed.start();
     int lastSocketError = 0;
     for (auto *address = addresses; address; address = address->ai_next) {
+        if (connectionCanceled()) break;
         const int remaining = qMax(1, timeoutMs - static_cast<int>(elapsed.elapsed()));
         if (remaining <= 1 && elapsed.elapsed() >= timeoutMs) break;
+        // Leave time for another resolved address (e.g. IPv4 if IPv6 is unreachable).
+        const int attemptTimeout = address->ai_next ? qMin(remaining, kConnectTimeoutMs) : remaining;
+        QElapsedTimer attemptElapsed;
+        attemptElapsed.start();
         const auto descriptor = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
 #ifdef Q_OS_WIN
         if (descriptor == INVALID_SOCKET) {
@@ -1309,28 +1408,47 @@ bool Libssh2Worker::connectSocket(const QString &host, quint16 port, int timeout
             continue;
         }
         u_long nonBlocking = 1;
-        ioctlsocket(descriptor, FIONBIO, &nonBlocking);
+        if (ioctlsocket(descriptor, FIONBIO, &nonBlocking) != 0) {
+            lastSocketError = WSAGetLastError();
+            closesocket(descriptor);
+            continue;
+        }
         int result = ::connect(descriptor, address->ai_addr, static_cast<int>(address->ai_addrlen));
         if (result != 0 && WSAGetLastError() != WSAEWOULDBLOCK && WSAGetLastError() != WSAEINPROGRESS) {
             lastSocketError = WSAGetLastError();
             closesocket(descriptor);
             continue;
         }
-        fd_set writeSet;
-        FD_ZERO(&writeSet);
-        FD_SET(descriptor, &writeSet);
-        timeval timeout{remaining / 1000, (remaining % 1000) * 1000};
-        result = select(0, nullptr, &writeSet, nullptr, &timeout);
         int connectionError = 0;
-        int connectionErrorLength = sizeof(connectionError);
-        if (result > 0) getsockopt(descriptor, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&connectionError), &connectionErrorLength);
-        if (result <= 0 || connectionError != 0) {
-            lastSocketError = connectionError != 0 ? connectionError : WSAGetLastError();
+        if (result != 0) {
+            for (;;) {
+                const int waitMs = static_cast<int>(qMin<qint64>(100, attemptTimeout - attemptElapsed.elapsed()));
+                if (connectionCanceled() || waitMs <= 0) { connectionError = WSAETIMEDOUT; break; }
+                fd_set writeSet, errorSet;
+                FD_ZERO(&writeSet);
+                FD_ZERO(&errorSet);
+                FD_SET(descriptor, &writeSet);
+                FD_SET(descriptor, &errorSet);
+                timeval timeout{0, waitMs * 1000};
+                result = select(0, nullptr, &writeSet, &errorSet, &timeout);
+                if (result == 0 || (result < 0 && WSAGetLastError() == WSAEINTR)) continue;
+                int length = sizeof(connectionError);
+                if (result < 0 || getsockopt(descriptor, SOL_SOCKET, SO_ERROR,
+                        reinterpret_cast<char *>(&connectionError), &length) != 0) connectionError = WSAGetLastError();
+                break;
+            }
+        }
+        if (connectionError != 0 || connectionCanceled()) {
+            lastSocketError = connectionError;
             closesocket(descriptor);
             continue;
         }
         nonBlocking = 0;
-        ioctlsocket(descriptor, FIONBIO, &nonBlocking);
+        if (ioctlsocket(descriptor, FIONBIO, &nonBlocking) != 0) {
+            lastSocketError = WSAGetLastError();
+            closesocket(descriptor);
+            continue;
+        }
 #else
         if (descriptor < 0) {
             lastSocketError = errno;
@@ -1341,30 +1459,60 @@ bool Libssh2Worker::connectSocket(const QString &host, quint16 port, int timeout
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));
 #endif
         const int originalFlags = fcntl(descriptor, F_GETFL, 0);
-        fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK);
+        if (originalFlags < 0 || fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) != 0) {
+            lastSocketError = errno;
+            ::close(descriptor);
+            continue;
+        }
         int result = ::connect(descriptor, address->ai_addr, address->ai_addrlen);
         if (result != 0 && errno != EINPROGRESS && errno != EWOULDBLOCK) {
             lastSocketError = errno;
             ::close(descriptor);
             continue;
         }
-        pollfd socketPoll{descriptor, POLLOUT, 0};
-        result = ::poll(&socketPoll, 1, remaining);
         int connectionError = 0;
-        socklen_t connectionErrorLength = sizeof(connectionError);
-        if (result > 0) getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &connectionError, &connectionErrorLength);
-        if (result <= 0 || connectionError != 0) {
-            lastSocketError = connectionError != 0 ? connectionError : (result == 0 ? ETIMEDOUT : errno);
+        if (result != 0) {
+            for (;;) {
+                const int waitMs = static_cast<int>(qMin<qint64>(100, attemptTimeout - attemptElapsed.elapsed()));
+                if (connectionCanceled() || waitMs <= 0) { connectionError = ETIMEDOUT; break; }
+                pollfd socketPoll{descriptor, POLLOUT, 0};
+                result = ::poll(&socketPoll, 1, waitMs);
+                if (result == 0 || (result < 0 && errno == EINTR)) continue;
+                socklen_t length = sizeof(connectionError);
+                if (result < 0 || getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &connectionError, &length) != 0) connectionError = errno;
+                break;
+            }
+        }
+        if (connectionError != 0 || connectionCanceled()) {
+            lastSocketError = connectionError;
             ::close(descriptor);
             continue;
         }
-        fcntl(descriptor, F_SETFL, originalFlags & ~O_NONBLOCK);
+        if (fcntl(descriptor, F_SETFL, originalFlags & ~O_NONBLOCK) != 0) {
+            lastSocketError = errno;
+            ::close(descriptor);
+            continue;
+        }
 #endif
         m_socketDescriptor = static_cast<qintptr>(descriptor);
         freeaddrinfo(addresses);
         return true;
     }
     freeaddrinfo(addresses);
+    if (connectionCanceled()) {
+        error = QStringLiteral("连接已取消");
+        return false;
+    }
+#ifdef Q_OS_WIN
+    const bool timedOut = lastSocketError == WSAETIMEDOUT || elapsed.elapsed() >= timeoutMs;
+#else
+    const bool timedOut = lastSocketError == ETIMEDOUT || elapsed.elapsed() >= timeoutMs;
+#endif
+    if (timedOut) {
+        error = QStringLiteral("连接 %1:%2 超时（%3 秒），尚未进入 SSH 认证。请检查地址、SSH 端口、防火墙及 VPN/代理网络；尚未发送密码")
+                    .arg(host).arg(port).arg(timeoutMs / 1000);
+        return false;
+    }
 #ifdef Q_OS_WIN
     error = QStringLiteral("连接 %1:%2 失败（Socket 错误 %3）").arg(host).arg(port).arg(lastSocketError);
 #else

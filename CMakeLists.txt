@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.59 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.60 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -125,8 +125,21 @@ if(APPLE)
 endif()
 
 include(CTest)
+option(NOXSHELL_BUILD_AUTH_INTEGRATION_TESTS "Build local SSH authentication regression tests" OFF)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
+    if(NOXSHELL_BUILD_AUTH_INTEGRATION_TESTS)
+        qt_add_executable(NoxShellAuthIntegrationTest
+            tests/AuthIntegrationTest.cpp
+            src/core/Libssh2Worker.cpp src/core/Libssh2Worker.h
+            src/core/RemoteDirectoryFallback.cpp src/core/RemoteDirectoryFallback.h
+        )
+        target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Qt6::Core Qt6::Network Qt6::Test ${NOXSHELL_LIBSSH2_TARGET})
+        if(WIN32)
+            target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Ws2_32)
+        endif()
+        add_test(NAME auth_integration COMMAND NoxShellAuthIntegrationTest -v1)
+    endif()
     qt_add_executable(NoxShellSmokeTest
         tests/SmokeTest.cpp
         resources.qrc

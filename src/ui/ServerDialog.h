@@ -38,7 +38,6 @@ private:
     void validateAndAccept();
     void testConnection();
     void updatePasswordHint();
-    void normalizeCredentialInput(QLineEdit *editor, const QString &text, bool showPasswordHint);
     [[nodiscard]] bool validateProfile(const ServerProfile &profile, bool allowStoredPassword);
     [[nodiscard]] bool prepareConnectionTestProfile(ServerProfile &profile);
     void populate(const ServerProfile &profile);

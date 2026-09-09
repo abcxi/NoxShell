@@ -69,6 +69,39 @@
 
 #include <algorithm>
 
+class MemoryCredentialStore final : public noxshell::CredentialStore {
+public:
+    bool save(const QString &reference, const noxshell::CredentialSecret &secret) override
+    {
+        ++saveCalls;
+        error.clear();
+        secrets.insert(reference, secret);
+        return true;
+    }
+
+    noxshell::CredentialSecret load(const QString &reference) override
+    {
+        ++loadCalls;
+        error = failLoads ? QStringLiteral("测试凭据库已锁定") : QString{};
+        return failLoads ? noxshell::CredentialSecret{} : secrets.value(reference);
+    }
+
+    bool remove(const QString &reference) override
+    {
+        error.clear();
+        secrets.remove(reference);
+        return true;
+    }
+
+    QString lastError() const override { return error; }
+
+    QHash<QString, noxshell::CredentialSecret> secrets;
+    bool failLoads{};
+    int saveCalls{};
+    int loadCalls{};
+    QString error;
+};
+
 class SmokeTest final : public QObject {
     Q_OBJECT
 
@@ -2833,6 +2866,235 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
     }
 
+    void sshCredentialLoadingPreservesExplicitInputAndStopsOnFailure()
+    {
+        MemoryCredentialStore credentials;
+        const auto exactPassword = QStringLiteral("  pass。中文é！‘’\u00a0🔑  ");
+        const auto reference = QStringLiteral("server/credential-regression");
+        credentials.secrets.insert(reference, {exactPassword, QStringLiteral("密钥。口令 ")});
+        noxshell::SshSession session(nullptr, &credentials);
+        // Observe the request before the transport without opening any socket.
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+        QSignalSpy states(&session, &noxshell::SshSession::connectionChanged);
+        noxshell::ServerProfile profile;
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.authentication = noxshell::AuthenticationMethod::Password;
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("root");
+        profile.credentialRef = reference;
+        profile.password = QStringLiteral("explicit。新密码 ");
+        credentials.failLoads = true;
+        session.connectTo(profile);
+        QCOMPARE(credentials.loadCalls, 0);
+        QCOMPARE(requests.count(), 1);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.takeFirst().at(0)).password.toUtf8(), profile.password.toUtf8());
+
+        profile.password.clear();
+        credentials.failLoads = false;
+        session.connectTo(profile);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(requests.count(), 1);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.takeFirst().at(0)).password.toUtf8(), exactPassword.toUtf8());
+
+        credentials.failLoads = true;
+        session.connectTo(profile);
+        QCOMPARE(requests.count(), 0);
+        QVERIFY(states.last().at(1).toString().contains(QStringLiteral("凭据读取失败")));
+
+        profile.authentication = noxshell::AuthenticationMethod::PrivateKey;
+        profile.keyPassphrase = QStringLiteral("explicit。私钥 ");
+        const auto loadsBeforeExplicitKey = credentials.loadCalls;
+        session.connectTo(profile);
+        QCOMPARE(credentials.loadCalls, loadsBeforeExplicitKey);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.takeFirst().at(0)).keyPassphrase, profile.keyPassphrase);
+
+        profile.keyPassphrase.clear();
+        credentials.failLoads = false;
+        session.connectTo(profile);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.takeFirst().at(0)).keyPassphrase,
+            QStringLiteral("密钥。口令 "));
+
+        credentials.failLoads = true;
+        profile.authentication = noxshell::AuthenticationMethod::SshAgent;
+        const auto loadsBeforeAgent = credentials.loadCalls;
+        session.connectTo(profile);
+        QCOMPARE(credentials.loadCalls, loadsBeforeAgent);
+        QCOMPARE(requests.count(), 1);
+    }
+
+    void newServerCredentialsRoundTripAndFailedEditDoesNotOverwrite()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("credentials.sqlite3")), nullptr, &credentials);
+        auto *sidebar = window.findChild<noxshell::ui::HostSidebar *>();
+        auto *repository = window.findChild<noxshell::ServerRepository *>();
+        QVERIFY(sidebar);
+        QVERIFY(repository);
+        const auto exactPassword = QStringLiteral("  新建。passwordé！‘’\u00a0🔑  ");
+        bool populated = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("credential-round-trip"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("hostEditor"))->setText(QStringLiteral("192.0.2.11"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("userEditor"))->setText(QStringLiteral("root"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("passwordEditor"))->insert(exactPassword);
+            populated = true;
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->addServerRequested();
+        QVERIFY(populated);
+        QCOMPARE(credentials.saveCalls, 1);
+        const auto profiles = repository->loadServers();
+        const auto found = std::find_if(profiles.cbegin(), profiles.cend(), [](const auto &profile) {
+            return profile.name == QStringLiteral("credential-round-trip");
+        });
+        QVERIFY(found != profiles.cend());
+        const auto saved = *found;
+        QVERIFY(!saved.id.isEmpty());
+        QVERIFY(!saved.credentialRef.isEmpty());
+        QVERIFY(saved.password.isEmpty());
+        QCOMPARE(credentials.secrets.value(saved.credentialRef).password.toUtf8(), exactPassword.toUtf8());
+
+        noxshell::SshSession session(repository, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+        session.connectTo(saved);
+        QCOMPARE(requests.count(), 1);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.takeFirst().at(0)).password.toUtf8(), exactPassword.toUtf8());
+
+        credentials.failLoads = true;
+        bool sawFailure = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("must-not-save"));
+            QTimer::singleShot(0, &window, [&] {
+                for (auto *widget : QApplication::topLevelWidgets()) {
+                    if (auto *message = qobject_cast<QMessageBox *>(widget)) {
+                        sawFailure = message->text().contains(QStringLiteral("未覆盖"));
+                        message->accept();
+                    }
+                }
+            });
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->serverEditRequested(saved);
+        QVERIFY(sawFailure);
+        QCOMPARE(credentials.saveCalls, 1);
+        QCOMPARE(credentials.secrets.value(saved.credentialRef).password.toUtf8(), exactPassword.toUtf8());
+        for (const auto &profile : repository->loadServers()) {
+            if (profile.id == saved.id) QCOMPARE(profile.name, saved.name);
+        }
+    }
+
+    void agentCanSwitchToUnencryptedPrivateKeyWithoutLoadingMissingCredentials()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("agent-to-key.sqlite3")), nullptr, &credentials);
+        auto *sidebar = window.findChild<noxshell::ui::HostSidebar *>();
+        auto *repository = window.findChild<noxshell::ServerRepository *>();
+        QVERIFY(sidebar);
+        QVERIFY(repository);
+        noxshell::ServerProfile agent;
+        agent.id = QStringLiteral("agent-to-key");
+        agent.name = QStringLiteral("agent-to-key");
+        agent.host = QStringLiteral("127.0.0.1");
+        agent.port = 1;
+        agent.user = QStringLiteral("root");
+        agent.connectionMode = noxshell::ConnectionMode::Ssh;
+        agent.authentication = noxshell::AuthenticationMethod::SshAgent;
+        agent.privateKeyPath = directory.filePath(QStringLiteral("unencrypted-key"));
+        agent.credentialRef = QStringLiteral("server/agent-to-key");
+        QVERIFY(repository->saveServer(agent));
+        sidebar->addServer(agent);
+
+        bool unexpectedFailure = false;
+        QTimer dismissMessages;
+        connect(&dismissMessages, &QTimer::timeout, &window, [&] {
+            for (auto *widget : QApplication::topLevelWidgets()) {
+                if (auto *message = qobject_cast<QMessageBox *>(widget)) {
+                    unexpectedFailure = true;
+                    message->accept();
+                }
+            }
+        });
+        dismissMessages.start(1);
+
+        noxshell::ui::ServerDialog testDialog(agent);
+        testDialog.setConnectionServices(repository, &credentials);
+        auto *testAuthentication = testDialog.findChild<QComboBox *>(QStringLiteral("authenticationEditor"));
+        testAuthentication->setCurrentIndex(testAuthentication->findData(static_cast<int>(noxshell::AuthenticationMethod::PrivateKey)));
+        auto *testButton = testDialog.findChild<QPushButton *>(QStringLiteral("dialogTestConnectionButton"));
+        testButton->click();
+        QVERIFY(!unexpectedFailure);
+        QCOMPARE(credentials.loadCalls, 0);
+        auto *progress = testDialog.findChild<QProgressDialog *>();
+        QVERIFY(progress);
+        auto *session = progress->findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QCOMPARE(session->profile().authentication, noxshell::AuthenticationMethod::PrivateKey);
+        QVERIFY(session->profile().keyPassphrase.isEmpty());
+        QVERIFY(session->profile().credentialRef.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(progress, "canceled", Qt::DirectConnection));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+
+        bool edited = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog) return;
+            auto *authentication = dialog->findChild<QComboBox *>(QStringLiteral("authenticationEditor"));
+            authentication->setCurrentIndex(authentication->findData(static_cast<int>(noxshell::AuthenticationMethod::PrivateKey)));
+            edited = true;
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->serverEditRequested(agent);
+        QVERIFY(edited);
+        QVERIFY(!unexpectedFailure);
+        QCOMPARE(credentials.loadCalls, 0);
+        QCOMPARE(credentials.saveCalls, 1);
+        QVERIFY(credentials.secrets.contains(agent.credentialRef));
+        QVERIFY(credentials.secrets.value(agent.credentialRef).keyPassphrase.isEmpty());
+        auto privateKeyProfile = agent;
+        for (const auto &profile : repository->loadServers()) {
+            if (profile.id == agent.id) privateKeyProfile = profile;
+        }
+        QCOMPARE(privateKeyProfile.authentication, noxshell::AuthenticationMethod::PrivateKey);
+
+        // An existing private key still needs its saved passphrase; a genuine
+        // credential-store read error must not be treated as an empty passphrase.
+        noxshell::ui::ServerDialog existingKeyDialog(privateKeyProfile);
+        existingKeyDialog.setConnectionServices(repository, &credentials);
+        existingKeyDialog.findChild<QPushButton *>(QStringLiteral("dialogTestConnectionButton"))->click();
+        QVERIFY(unexpectedFailure);
+        QCOMPARE(credentials.loadCalls, 1);
+        QVERIFY(!existingKeyDialog.findChild<QProgressDialog *>());
+        QCOMPARE(credentials.saveCalls, 1);
+
+        unexpectedFailure = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("new-unencrypted-key"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("hostEditor"))->setText(QStringLiteral("127.0.0.1"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("userEditor"))->setText(QStringLiteral("root"));
+            auto *authentication = dialog->findChild<QComboBox *>(QStringLiteral("authenticationEditor"));
+            authentication->setCurrentIndex(authentication->findData(static_cast<int>(noxshell::AuthenticationMethod::PrivateKey)));
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->addServerRequested();
+        QVERIFY(!unexpectedFailure);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(credentials.saveCalls, 2);
+        dismissMessages.stop();
+    }
+
     void serverDialogOffersConnectionTestBeforeSave()
     {
         QTemporaryDir directory;
@@ -2853,13 +3115,15 @@ private slots:
         QVERIFY(passwordReveal);
         QVERIFY(passwordHint);
         QCOMPARE(passwordEditor->echoMode(), QLineEdit::Password);
-        QVERIFY(passwordEditor->inputMethodHints().testFlag(Qt::ImhLatinOnly));
-        passwordEditor->insert(QStringLiteral("abc。123"));
-        QCOMPARE(passwordEditor->text(), QStringLiteral("abc.123"));
-        QTRY_VERIFY(passwordHint->text().contains(QStringLiteral("自动转换")));
-        passwordEditor->insert(QStringLiteral("中文"));
-        QCOMPARE(passwordEditor->text(), QStringLiteral("abc.123"));
-        QTRY_VERIFY(passwordHint->text().contains(QStringLiteral("已忽略")));
+        const auto exactPassword = QStringLiteral("  abc。中文é！‘’\u00a0🔑123  ");
+        passwordEditor->insert(exactPassword);
+        QCOMPARE(passwordEditor->text(), exactPassword);
+        QCOMPARE(addDialog.profile().password.toUtf8(), exactPassword.toUtf8());
+        QVERIFY(passwordHint->text().contains(QStringLiteral("按原样保留")));
+        auto *passphraseEditor = addDialog.findChild<QLineEdit *>(QStringLiteral("passphraseEditor"));
+        QVERIFY(passphraseEditor);
+        passphraseEditor->insert(exactPassword);
+        QCOMPARE(addDialog.profile().keyPassphrase.toUtf8(), exactPassword.toUtf8());
         passwordEditor->clear();
         passwordEditor->setText(QStringLiteral("临时密码"));
         QVERIFY(!passwordReveal->icon().isNull());

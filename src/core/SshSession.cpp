@@ -153,6 +153,7 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
 SshSession::~SshSession()
 {
     if (m_workerThread.isRunning()) {
+        m_worker->cancelConnection();
         QMetaObject::invokeMethod(m_worker, "disconnectFromHost", Qt::BlockingQueuedConnection);
         m_workerThread.quit();
         m_workerThread.wait(3000);
@@ -190,13 +191,20 @@ void SshSession::connectTo(const ServerProfile &profile)
     if (request.expectedFingerprint.isEmpty()) {
         request.expectedFingerprint = m_repository ? m_repository->knownHostFingerprint(request.host, request.port) : QString{};
     }
-    if (m_credentialStore && !request.credentialRef.isEmpty()) {
+    const bool needsStoredSecret = (request.authentication == AuthenticationMethod::Password && request.password.isEmpty())
+        || (request.authentication == AuthenticationMethod::PrivateKey && request.keyPassphrase.isEmpty());
+    if (needsStoredSecret && m_credentialStore && !request.credentialRef.isEmpty()) {
         const auto secret = m_credentialStore->load(request.credentialRef);
-        request.password = secret.password;
-        request.keyPassphrase = secret.keyPassphrase;
+        if (!m_credentialStore->lastError().isEmpty()) {
+            emit connectionChanged(false, QStringLiteral("SSH 凭据读取失败：%1；请解锁系统凭据库或重新输入凭据")
+                .arg(m_credentialStore->lastError()));
+            return;
+        }
+        if (request.password.isEmpty()) request.password = secret.password;
+        if (request.keyPassphrase.isEmpty()) request.keyPassphrase = secret.keyPassphrase;
     }
     emit connectionChanged(false, QStringLiteral("正在连接 %1:%2…").arg(request.host).arg(request.port));
-    emit connectRequested(request);
+    emit connectRequested(request, m_worker->connectionGeneration());
 }
 
 void SshSession::disconnectFromHost()
@@ -220,6 +228,7 @@ void SshSession::disconnectFromHost()
         return;
     }
     if (m_workerThread.isRunning()) {
+        m_worker->cancelConnection();
         emit disconnectRequested();
     }
 }

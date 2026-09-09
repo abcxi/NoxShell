@@ -52,7 +52,7 @@ public:
     [[nodiscard]] ServerProfile profile() const { return m_profile; }
 
 signals:
-    void connectRequested(const ServerProfile &profile);
+    void connectRequested(const ServerProfile &profile, quint64 requestGeneration);
     void disconnectRequested();
     void executeRequested(const QString &command);
     void inputRequested(const QByteArray &data);

@@ -59,7 +59,7 @@ jobs:
           cache: true
 
       - name: Install native dependencies
-        run: brew install libssh2 pkg-config
+        run: brew install libssh2 pkg-config go
 
       - name: Build, test and package DMG
         shell: bash
@@ -68,6 +68,11 @@ jobs:
         run: |
           export QT_ROOT="$QT_ROOT_DIR"
           export PKG_CONFIG_PATH="$(brew --prefix libssh2)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          mkdir -p build-release
+          (cd tests/auth_fixture && go build -o ../../build-release/noxshell-auth-fixture .)
+          cmake -S . -B build-release -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DBUILD_TESTING=ON -DNOXSHELL_BUILD_AUTH_INTEGRATION_TESTS=ON
+          export NOXSHELL_AUTH_TEST_SERVER="$PWD/build-release/noxshell-auth-fixture"
           ./script/package-release.sh
           test -f "output/玄壳-v${{ needs.validate-version.outputs.version }}-macOS-${{ matrix.arch }}.dmg"
 
@@ -184,6 +189,12 @@ jobs:
       - name: Generate checksums
         shell: bash
         run: |
+          # Use ASCII asset names so GitHub does not sanitize the Chinese prefix
+          # into a different filename than the README download links.
+          for package in dist/玄壳-*.dmg; do
+            test -f "$package" || continue
+            mv "$package" "dist/NoxShell-${package#dist/玄壳-}"
+          done
           checksum_file="$(mktemp)"
           find dist -maxdepth 1 -type f -print0 \
             | sort -z \

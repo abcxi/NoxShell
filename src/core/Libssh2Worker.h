@@ -8,6 +8,7 @@
 #include <QStringList>
 
 #include <atomic>
+#include <functional>
 
 class QTimer;
 struct _LIBSSH2_SESSION;
@@ -20,11 +21,15 @@ class Libssh2Worker final : public QObject {
     Q_OBJECT
 
 public:
-    explicit Libssh2Worker(QObject *parent = nullptr);
+    explicit Libssh2Worker(QObject *parent = nullptr, int authenticationTimeoutMs = 30000);
     ~Libssh2Worker() override;
 
+    // May be called from the GUI thread while a connection operation is pending.
+    void cancelConnection();
+    quint64 connectionGeneration() const;
+
 public slots:
-    void connectTo(const ServerProfile &profile);
+    void connectTo(const ServerProfile &profile, quint64 requestGeneration = 0);
     void approveHostKey(bool approved);
     void execute(const QString &command);
     void sendInput(const QByteArray &data);
@@ -70,11 +75,14 @@ private slots:
 private:
     void fail(const QString &stage, const QString &detail);
     void continueAuthentication();
-    bool authenticatePassword();
-    bool authenticateKeyboardInteractive();
-    bool authenticatePrivateKey();
-    bool authenticateAgent();
-    QStringList advertisedAuthenticationMethods() const;
+    int authenticatePassword();
+    int authenticateKeyboardInteractive();
+    int authenticatePrivateKey();
+    int authenticateAgent();
+    bool advertisedAuthenticationMethods(QStringList &methods);
+    int runConnectionOperation(const std::function<int()> &operation, int timeoutMs);
+    QString connectionOperationError() const;
+    bool connectionCanceled() const;
     bool openShell();
     QString lastSessionError() const;
     QString hostKeyAlgorithm() const;
@@ -97,6 +105,10 @@ private:
     bool m_waitingForHostKey{false};
     bool m_connected{false};
     bool m_directoryShellFallback{false};
+    const int m_authenticationTimeoutMs;
+    QString m_connectionFailure;
+    std::atomic<quint64> m_connectionGeneration{1};
+    quint64 m_activeConnectionGeneration{1};
     std::atomic<quint64> m_cancelTransferId{};
 };
 

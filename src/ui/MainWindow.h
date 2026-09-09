@@ -35,7 +35,7 @@ class MainWindow final : public QMainWindow {
     Q_OBJECT
 
 public:
-    explicit MainWindow(QString databasePath = {}, QWidget *parent = nullptr);
+    explicit MainWindow(QString databasePath = {}, QWidget *parent = nullptr, CredentialStore *credentialStore = nullptr);
 
 protected:
     void changeEvent(QEvent *event) override;
@@ -75,7 +75,7 @@ private:
     void addRdpServerInGroup(const QString &group);
     void editServer(const ServerProfile &profile);
     void deleteServer(const ServerProfile &profile);
-    bool persistProfile(ServerProfile &profile, bool preserveEmptySecret);
+    bool persistProfile(ServerProfile &profile, bool preserveEmptySecret, const ServerProfile *originalProfile = nullptr);
 
     HostSidebar *m_sidebar{};
     QLabel *m_serverMeta{};

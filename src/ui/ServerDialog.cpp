@@ -42,41 +42,6 @@ void selectGroupOption(QComboBox *editor, const QString &group)
     editor->setCurrentIndex(index >= 0 ? index : 0);
 }
 
-QString normalizedAsciiCredential(const QString &value, bool &converted, bool &rejected)
-{
-    QString result;
-    result.reserve(value.size());
-    for (const auto character : value) {
-        const auto code = character.unicode();
-        if (code >= 0x20 && code <= 0x7e) {
-            result.append(character);
-        } else if (code >= 0xff01 && code <= 0xff5e) {
-            result.append(QChar(code - 0xfee0));
-            converted = true;
-        } else if (code == 0x3002 || code == 0xff61) {
-            result.append(QLatin1Char('.'));
-            converted = true;
-        } else if (code == 0x3000 || code == 0x00a0) {
-            result.append(QLatin1Char(' '));
-            converted = true;
-        } else if (code == 0x2018 || code == 0x2019) {
-            result.append(QLatin1Char('\''));
-            converted = true;
-        } else if (code == 0x201c || code == 0x201d) {
-            result.append(QLatin1Char('"'));
-            converted = true;
-        } else if (code == 0x2014) {
-            result.append(QLatin1Char('-'));
-            converted = true;
-        } else if (code == 0x2026) {
-            result.append(QStringLiteral("..."));
-            converted = true;
-        } else {
-            rejected = true;
-        }
-    }
-    return result;
-}
 } // namespace
 
 ServerDialog::ServerDialog(QWidget *parent)
@@ -172,7 +137,7 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_password->setObjectName(QStringLiteral("passwordEditor"));
     m_password->setEchoMode(QLineEdit::Password);
     m_password->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
-        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase | Qt::ImhLatinOnly);
+        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
     m_password->setPlaceholderText(QStringLiteral("SSH 密码"));
     alignEditor(m_password);
     m_passwordReveal = m_password->addAction(QIcon(QStringLiteral(":/assets/eye.svg")), QLineEdit::TrailingPosition);
@@ -203,7 +168,7 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_passphrase->setObjectName(QStringLiteral("passphraseEditor"));
     m_passphrase->setEchoMode(QLineEdit::Password);
     m_passphrase->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
-        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase | Qt::ImhLatinOnly);
+        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
     m_passphrase->setPlaceholderText(QStringLiteral("私钥口令，可选"));
     alignEditor(m_privateKey);
     alignEditor(m_publicKey);
@@ -246,12 +211,6 @@ ServerDialog::ServerDialog(QWidget *parent)
         m_passwordReveal->setToolTip(visible ? QStringLiteral("隐藏密码") : QStringLiteral("显示密码"));
     });
     connect(m_password, &QLineEdit::textChanged, this, &ServerDialog::updatePasswordHint);
-    connect(m_password, &QLineEdit::textEdited, this, [this](const QString &text) {
-        normalizeCredentialInput(m_password, text, true);
-    });
-    connect(m_passphrase, &QLineEdit::textEdited, this, [this](const QString &text) {
-        normalizeCredentialInput(m_passphrase, text, false);
-    });
     connect(browse, &QPushButton::clicked, this, &ServerDialog::choosePrivateKey);
     connect(m_testButton, &QPushButton::clicked, this, &ServerDialog::testConnection);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -360,42 +319,13 @@ void ServerDialog::updatePasswordHint()
     m_passwordHint->setStyleSheet(QStringLiteral("color:#738297;font-size:11px;"));
     if (!m_password->text().isEmpty()) {
         m_passwordHint->setText(m_editing
-            ? QStringLiteral("连接测试将使用当前输入；保存后替换旧密码。密码框固定为英文半角。")
-            : QStringLiteral("连接测试和保存将使用当前输入。密码框固定为英文半角。"));
+            ? QStringLiteral("连接测试将使用当前输入；保存后替换旧密码。字符和空格均按原样保留。")
+            : QStringLiteral("连接测试和保存将使用当前输入。字符和空格均按原样保留。"));
         return;
     }
     m_passwordHint->setText(m_editing
-        ? QStringLiteral("密码不会从 Keychain 回填；留空将沿用已保存密码。重新输入时请使用英文半角。")
-        : QStringLiteral("请输入 SSH 密码；中文/全角标点会自动转换为英文半角。"));
-}
-
-void ServerDialog::normalizeCredentialInput(QLineEdit *editor, const QString &text, bool showPasswordHint)
-{
-    if (!editor) return;
-    bool converted = false;
-    bool rejected = false;
-    const auto normalized = normalizedAsciiCredential(text, converted, rejected);
-    if (!converted && !rejected) return;
-
-    bool prefixConverted = false;
-    bool prefixRejected = false;
-    const auto cursor = normalizedAsciiCredential(
-        text.left(editor->cursorPosition()), prefixConverted, prefixRejected).size();
-    editor->setText(normalized);
-    editor->setCursorPosition(qMin(cursor, normalized.size()));
-    if (!showPasswordHint || !m_passwordHint) return;
-
-    const auto warning = rejected
-        ? QStringLiteral("检测到中文或非英文字符：已忽略无法转换的内容，请使用英文输入法核对密码。")
-        : QStringLiteral("已将中文/全角标点自动转换为英文半角，请点击密码框右侧眼睛图标核对。");
-    const auto showWarning = [this, warning] {
-        if (!m_passwordHint) return;
-        m_passwordHint->setStyleSheet(QStringLiteral("color:#C65D00;font-size:11px;"));
-        m_passwordHint->setText(warning);
-    };
-    showWarning();
-    // QLineEdit 会在 textEdited 之后继续发送 textChanged；排队重设一次，避免通用提示覆盖转换警告。
-    QTimer::singleShot(0, this, showWarning);
+        ? QStringLiteral("密码不会从 Keychain 回填；留空将沿用已保存密码。")
+        : QStringLiteral("请输入 SSH 密码；支持中文和特殊字符，输入内容不会自动转换。"));
 }
 
 void ServerDialog::validateAndAccept()
@@ -428,9 +358,20 @@ bool ServerDialog::prepareConnectionTestProfile(ServerProfile &candidate)
     if (!validateProfile(candidate, m_editing)) return false;
 
     CredentialSecret storedSecret;
-    if (m_editing && m_credentialStore && !m_original.credentialRef.isEmpty()
-        && (candidate.password.isEmpty() || candidate.keyPassphrase.isEmpty())) {
+    const bool needsStoredSecret = (candidate.authentication == AuthenticationMethod::Password && candidate.password.isEmpty())
+        || (candidate.authentication == AuthenticationMethod::PrivateKey && candidate.keyPassphrase.isEmpty());
+    const bool sameAuthentication = candidate.authentication == m_original.authentication;
+    const bool samePrivateKey = candidate.authentication != AuthenticationMethod::PrivateKey
+        || candidate.privateKeyPath == m_original.privateKeyPath;
+    if (needsStoredSecret && m_editing && sameAuthentication && samePrivateKey
+        && m_credentialStore && !m_original.credentialRef.isEmpty()) {
         storedSecret = m_credentialStore->load(m_original.credentialRef);
+        if (!m_credentialStore->lastError().isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("无法测试"),
+                QStringLiteral("无法读取已保存凭据：%1\n请解锁系统凭据库，或重新输入凭据后测试。")
+                    .arg(m_credentialStore->lastError()));
+            return false;
+        }
     }
     if (candidate.authentication == AuthenticationMethod::Password && candidate.password.isEmpty()) {
         candidate.password = storedSecret.password;
