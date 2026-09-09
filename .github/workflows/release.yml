@@ -65,6 +65,7 @@ jobs:
         shell: bash
         env:
           NOXSHELL_MACOS_DEPLOYMENT_TARGET: "14.0"
+          QT_UI_JOBS: "4"
         run: |
           export QT_ROOT="$QT_ROOT_DIR"
           export PKG_CONFIG_PATH="$(brew --prefix libssh2)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
