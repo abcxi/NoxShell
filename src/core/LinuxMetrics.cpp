@@ -118,6 +118,7 @@ bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &
             continue;
         }
         if (line == "__DISK__") {
+            snapshot.includesDisks = true;
             section = Section::Disk;
             continue;
         }
@@ -130,6 +131,7 @@ bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &
             continue;
         }
         if (line == "__PROC__") {
+            snapshot.includesProcesses = true;
             section = Section::Process;
             continue;
         }
@@ -278,11 +280,23 @@ bool LinuxMetricsParser::parse(const QByteArray &payload, LinuxMetricsSnapshot &
         setError(error, QStringLiteral("无法解析 /proc/loadavg"));
         return false;
     }
+    if (!hasCores && !snapshot.cpuCores.isEmpty()) {
+        snapshot.cpuCoreCount = static_cast<int>(snapshot.cpuCores.size());
+        hasCores = true;
+    }
     if (!hasCores) {
         setError(error, QStringLiteral("无法获取 CPU 核心数"));
         return false;
     }
     return true;
+}
+
+void LinuxMetricsParser::retainSlowMetrics(LinuxMetricsSnapshot &current, const LinuxMetricsSnapshot &previous)
+{
+    // An omitted section means "not sampled this time", not "empty". Never
+    // carry CPU/network counters forward: they must remain fresh for deltas.
+    if (!current.includesDisks) current.disks = previous.disks;
+    if (!current.includesProcesses) current.processes = previous.processes;
 }
 
 MetricSample LinuxMetricsParser::calculate(const LinuxMetricsSnapshot &current, const LinuxMetricsSnapshot *previous)

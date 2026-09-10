@@ -1,4 +1,7 @@
 #include "AppTheme.h"
+#ifdef Q_OS_MACOS
+#include "MacTitleBarControls.h"
+#endif
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -107,6 +110,39 @@ QString applicationStyleSheet(bool dark)
             background: white; padding: 0 9px; selection-background-color: #006EFF;
         }
         QLineEdit:focus { border: 1px solid #006EFF; }
+        QSpinBox, QDoubleSpinBox {
+            min-height:30px; border:1px solid #D8E0EA; border-radius:4px;
+            background:#FFFFFF; padding:0 24px 0 8px;
+            selection-color:white; selection-background-color:#006EFF;
+        }
+        QSpinBox:focus, QDoubleSpinBox:focus { border-color:#006EFF; }
+        /* The embedded editor must not inherit QLineEdit's frame, padding or
+           minimum height. A full border also disables the native macOS bezel. */
+        QAbstractSpinBox QLineEdit {
+            min-height:0; border:0; border-radius:0; padding:0; background:transparent;
+        }
+        QSpinBox::up-button, QDoubleSpinBox::up-button {
+            subcontrol-origin:border; subcontrol-position:top right;
+            width:20px; border:0; border-left:1px solid #D8E0EA;
+            border-top-right-radius:4px; background:#F4F7FA;
+        }
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
+            subcontrol-origin:border; subcontrol-position:bottom right;
+            width:20px; border:0; border-left:1px solid #D8E0EA;
+            border-bottom-right-radius:4px; background:#F4F7FA;
+        }
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+        QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background:#E4EDF7; }
+        QSpinBox::up-button:pressed, QSpinBox::down-button:pressed,
+        QDoubleSpinBox::up-button:pressed, QDoubleSpinBox::down-button:pressed { background:#D5E4F5; }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+            image:url(:/assets/spin-up.svg); width:10px; height:10px;
+        }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+            image:url(:/assets/spin-down.svg); width:10px; height:10px;
+        }
+        QSpinBox:disabled, QDoubleSpinBox:disabled { color:#9AA7B6; background:#F4F7FA; }
+        QAbstractSpinBox QLineEdit:disabled { color:#9AA7B6; }
         QPushButton {
             min-height: 30px; border: 1px solid #D6DEE8; border-radius: 4px;
             background: white; padding: 0 12px; color: #3C4D63;
@@ -137,6 +173,13 @@ QString applicationStyleSheet(bool dark)
         }
         QComboBox:hover { border-color: #8BBFFF; }
         QComboBox::drop-down { border: 0; width: 22px; }
+        QComboBox#groupEditor, QComboBox#terminalFontFamilyCombo { padding-right:32px; }
+        QComboBox#groupEditor::drop-down, QComboBox#terminalFontFamilyCombo::drop-down {
+            width:30px; border-left:1px solid #E1E7EF;
+        }
+        QComboBox#groupEditor::down-arrow, QComboBox#terminalFontFamilyCombo::down-arrow {
+            image:url(:/assets/spin-down.svg); width:12px; height:12px;
+        }
         QComboBox QAbstractItemView { background: white; border: 1px solid #D8E0EA; selection-background-color: #E8F3FF; }
         QMenu {
             background: white; border: 1px solid #D8E0EA; border-radius: 5px; padding: 5px;
@@ -456,6 +499,20 @@ QString applicationStyleSheet(bool dark)
         }
         QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus,
         QDoubleSpinBox:focus, QComboBox:focus { border-color: #3F9BFF; }
+        QAbstractSpinBox QLineEdit { color:#DCE6F0; background:transparent; }
+        QSpinBox::up-button, QSpinBox::down-button,
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+            background:#1B2530; border-left-color:#354252;
+        }
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+        QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background:#293949; }
+        QSpinBox::up-button:pressed, QSpinBox::down-button:pressed,
+        QDoubleSpinBox::up-button:pressed, QDoubleSpinBox::down-button:pressed { background:#344B61; }
+        QSpinBox:disabled, QDoubleSpinBox:disabled { color:#647384; background:#151D25; }
+        QAbstractSpinBox QLineEdit:disabled { color:#647384; }
+        QComboBox#groupEditor::drop-down, QComboBox#terminalFontFamilyCombo::drop-down {
+            border-left-color:#354252;
+        }
         QPushButton {
             color: #C9D5E1; background: #1B2530; border-color: #354252;
         }
@@ -574,6 +631,13 @@ void applyApplicationTheme(ThemeMode mode)
 {
     auto *application = qobject_cast<QApplication *>(QCoreApplication::instance());
     if (!application) return;
+#ifdef Q_OS_MACOS
+    // Set the application appearance, not only the main window: new dialogs
+    // and their native title bars must inherit the user's theme too.
+    if (QGuiApplication::platformName() == QStringLiteral("cocoa")) {
+        applyMacApplicationAppearance(static_cast<int>(mode));
+    }
+#endif
     const bool dark = isDarkTheme(mode);
     QPalette palette = application->style()->standardPalette();
     if (dark) {

@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ func main() {
 	cipher := flag.String("cipher", "", "restrict the encryption algorithm")
 	rekeyBytes := flag.Uint64("rekey-bytes", 0, "rekey after this many bytes")
 	shellMode := flag.String("shell-mode", "prompt", "prompt, echo, no-read, flood, burst, burst-close, or reset")
+	metricsMode := flag.String("metrics-mode", "off", "off, normal, or oversized (synthetic data, never execute commands)")
 	flag.Parse()
 
 	var privateKey any
@@ -159,9 +161,32 @@ func main() {
 				}()
 			}
 			for request := range channelRequests {
-				supported := request.Type == "pty-req" || request.Type == "shell" || request.Type == "window-change"
+				supported := request.Type == "pty-req" || request.Type == "shell" || request.Type == "window-change" ||
+					(request.Type == "exec" && *metricsMode != "off")
 				if request.WantReply {
 					_ = request.Reply(supported, nil)
+				}
+				if request.Type == "exec" && *metricsMode != "off" {
+					var payload struct{ Command string }
+					if err := ssh.Unmarshal(request.Payload, &payload); err != nil {
+						return
+					}
+					processes := strings.Contains(payload.Command, "ps -eo")
+					disks := strings.Contains(payload.Command, "df -Pkl")
+					report("metrics_requested", map[string]any{"processes": processes, "disks": disks})
+					if *metricsMode == "oversized" {
+						_, _ = channel.Write(bytes.Repeat([]byte("x"), 600*1024))
+					} else {
+						_, _ = io.WriteString(channel, "__CPU__\ncpu 10 0 2 50 0 0 0 0\ncpu0 10 0 2 50 0 0 0 0\n__MEM__\nMemTotal: 1024 kB\nMemAvailable: 512 kB\n__LOAD__\n0.1 0.2 0.3 1/10 22\n__UPTIME__\n42 30\n__NET__\n")
+						if processes {
+							_, _ = io.WriteString(channel, "__PROC__\n42 test 1.0 2.0 10 sh\n")
+						}
+						if disks {
+							_, _ = io.WriteString(channel, "__DISK__\n/dev/test 100 20 80 20% /\n")
+						}
+					}
+					_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+					return
 				}
 				if request.Type == "shell" {
 					report("shell_opened", nil)

@@ -182,6 +182,51 @@ private slots:
         QCOMPARE(server.startedMethods(), expectedMethods);
     }
 
+    void metricsCollectionIsBoundedAndShellRemainsUsable_data()
+    {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("normal") << QStringLiteral("normal");
+        QTest::newRow("oversized") << QStringLiteral("oversized");
+    }
+
+    void metricsCollectionIsBoundedAndShellRemainsUsable()
+    {
+        QFETCH(QString, mode);
+        LocalSshServer server;
+        QVERIFY2(server.start({"-auth", "password", "-shell-mode", "echo", "-metrics-mode", mode}), server.error().constData());
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        QSignalSpy output(&worker, &noxshell::Libssh2Worker::rawOutputReceived);
+        QSignalSpy samples(&worker, &noxshell::Libssh2Worker::metricsPayloadReceived);
+        QSignalSpy failures(&worker, &noxshell::Libssh2Worker::metricsCollectionFailed);
+        worker.connectTo(fixtureProfile(server.port));
+        QElapsedTimer elapsed;
+        elapsed.start();
+        worker.collectMetrics(1);
+        QVERIFY2(elapsed.elapsed() < 5000, "Metric collection must be bounded");
+        if (mode == QStringLiteral("oversized")) {
+            QCOMPARE(samples.size(), 0);
+            QCOMPARE(failures.size(), 1);
+            QVERIFY(failures.first().at(1).toString().contains(QStringLiteral("512 KiB")));
+        } else {
+            QCOMPARE(failures.size(), 0);
+            QCOMPARE(samples.size(), 1);
+            QVERIFY(samples.first().at(1).toByteArray().contains("__DISK__"));
+            worker.collectMetrics(2);
+            QCOMPARE(samples.size(), 2);
+            QVERIFY(!samples.last().at(1).toByteArray().contains("__DISK__"));
+            QVERIFY(!samples.last().at(1).toByteArray().contains("__PROC__"));
+        }
+        output.clear();
+        worker.sendInput("interactive-after-metrics\n");
+        auto hasEcho = [&] {
+            QByteArray bytes;
+            for (const auto &event : output) bytes += event.first().toByteArray();
+            return bytes.contains("interactive-after-metrics");
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(hasEcho(), 2000);
+    }
+
     void algorithmCompatibility_data()
     {
         QTest::addColumn<QStringList>("arguments");

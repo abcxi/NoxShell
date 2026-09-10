@@ -8,6 +8,7 @@
 #include <QObject>
 #include <QHash>
 #include <QThread>
+#include <QElapsedTimer>
 
 #include <optional>
 
@@ -50,6 +51,7 @@ public:
 
     [[nodiscard]] bool isConnected() const { return m_connected; }
     [[nodiscard]] ServerProfile profile() const { return m_profile; }
+    [[nodiscard]] std::optional<MetricSample> lastMetricSample() const { return m_lastMetricSample; }
 
 signals:
     void connectRequested(const ServerProfile &profile, quint64 requestGeneration);
@@ -109,11 +111,14 @@ private:
     bool m_connected{false};
     bool m_demo{true};
     bool m_metricsInFlight{false};
+    QElapsedTimer m_metricsCooldown;
+    int m_metricsRetryMs{1000};
     quint64 m_metricRequestId{};
     int m_demoMetricTick{};
     QByteArray m_demoInputBuffer;
     quint32 m_directoryGeneration{1};
     quint32 m_directoryRequestSerial{};
+    QHash<QString, quint64> m_pendingDirectories;
     QHash<QString, RemoteFileEntries> m_demoFileOverrides;
     QHash<QString, QByteArray> m_demoFileContents;
     QVector<FileTransferTask> m_transferQueue;
@@ -122,6 +127,7 @@ private:
     quint64 m_transferRateLimit{};
     bool m_transferPersistenceEnabled{true};
     std::optional<LinuxMetricsSnapshot> m_previousMetrics;
+    std::optional<MetricSample> m_lastMetricSample;
     QString m_pendingFingerprint;
     QString m_pendingAlgorithm;
     ServerRepository *m_repository{};

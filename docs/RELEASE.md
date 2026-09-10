@@ -10,6 +10,23 @@
 
 脚本执行独立 Release 构建、全量测试、安装部署和压缩包生成。产物写入 `output/`。
 
+macOS 必须在 `macdeployqt` 完成依赖复制及路径改写后，为内嵌 dylib、
+framework 和应用包从内到外重新签名。`codesign --verify --deep --strict`
+失败会中止打包，不能当作“未配置 Developer ID”的普通提示放行。
+打包脚本还会启动最终部署的应用执行 `--startup-smoke-test`，验证原生 Cocoa
+窗口与 SQLite 插件；测试使用临时数据库和临时设置，不读取真实服务器配置、
+系统凭据库或写入正常运行日志，最多等待 20 秒。
+
+可对部署后的包单独执行：
+
+```bash
+bash script/sign-macos-bundle.sh /path/to/NoxShell.app
+bash script/verify-macos-bundle.sh /path/to/NoxShell.app
+```
+
+签名之后不能继续使用 `install_name_tool`、`strip` 或修改包内资源；若有修改，
+必须重新签名、验证和测试启动。`xattr` 清理隔离属性不能修复无效代码签名。
+
 ## GitHub Actions 自动发布
 
 `.github/workflows/release.yml` 提供两种触发方式：
@@ -32,7 +49,7 @@ ctest --test-dir build-release -C Release --output-on-failure
 cpack --config build-release/CPackConfig.cmake -C Release -B output
 ```
 
-未配置签名证书时，工作流生成的是未签名安装包。正式公开分发前仍需增加 macOS Developer ID 签名/公证和 Windows Authenticode 签名步骤，并将证书及口令保存在 GitHub Secrets 中。
+未配置发布证书时，macOS 应用使用 ad-hoc 临时签名保证代码完整性；这不是 Developer ID 身份认证或 Apple 公证，也不会自动解除 Gatekeeper 限制。Windows 安装包仍未进行 Authenticode 签名。正式公开分发前仍需增加相应签名/公证步骤，并将证书及口令保存在 GitHub Secrets 中。
 
 ## 发布前人工检查
 

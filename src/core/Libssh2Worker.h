@@ -2,8 +2,10 @@
 
 #include "ServerProfile.h"
 #include "RemoteFileEntry.h"
+#include "MetricsCollectionPolicy.h"
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QObject>
 #include <QStringList>
 
@@ -106,6 +108,8 @@ private:
     bool m_waitingForHostKey{false};
     bool m_connected{false};
     bool m_directoryShellFallback{false};
+    QElapsedTimer m_metricsClock;
+    MetricsCollectionPolicy m_metricsPolicy;
     const int m_authenticationTimeoutMs;
     const int m_inputStallTimeoutMs;
     QString m_connectionFailure;

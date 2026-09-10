@@ -66,6 +66,8 @@ struct LinuxMetricsSnapshot {
     QVector<LinuxDiskUsage> disks;
     QVector<LinuxNetworkUsage> networks;
     QVector<LinuxProcessUsage> processes;
+    bool includesDisks{false};
+    bool includesProcesses{false};
 };
 
 struct MetricSample {
@@ -92,6 +94,7 @@ class LinuxMetricsParser final {
 public:
     static bool parse(const QByteArray &payload, LinuxMetricsSnapshot &snapshot, QString *error = nullptr);
     static MetricSample calculate(const LinuxMetricsSnapshot &current, const LinuxMetricsSnapshot *previous = nullptr);
+    static void retainSlowMetrics(LinuxMetricsSnapshot &current, const LinuxMetricsSnapshot &previous);
 };
 
 } // namespace noxshell

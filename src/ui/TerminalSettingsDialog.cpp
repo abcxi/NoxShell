@@ -44,10 +44,6 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     m_fontFamily->setMinimumContentsLength(18);
     m_fontFamily->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     m_fontFamily->setToolTip(QStringLiteral("选择本机系统中已安装的字体"));
-    m_fontFamily->setStyleSheet(QStringLiteral(
-        "QComboBox{padding-right:32px;}"
-        "QComboBox::drop-down{width:30px;border-left:1px solid #E1E7EF;}"
-        "QComboBox::down-arrow{image:url(:/assets/chevron-down.svg);width:12px;height:12px;}"));
     m_fontFamily->setCurrentFont(QFont(appearance.fontFamily));
     m_fontSize = new QSpinBox;
     m_fontSize->setObjectName(QStringLiteral("terminalFontSizeSpin"));

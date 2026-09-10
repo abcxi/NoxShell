@@ -6,6 +6,7 @@ class QMainWindow;
 
 namespace noxshell::ui {
 
+void applyMacApplicationAppearance(int themeMode);
 bool installMacTitleBarControls(QMainWindow *window,
     std::function<void()> toggleSidebar,
     std::function<void()> toggleMonitor,

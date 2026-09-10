@@ -58,7 +58,7 @@ case "$(uname -s)" in
             "${PLUGIN_DIR}/styles/libqmacstyle.dylib"
             "${PLUGIN_DIR}/iconengines/libqsvgicon.dylib"
         )
-        deploy_args=("${APP_PATH}" -no-plugins -always-overwrite)
+        deploy_args=("${APP_PATH}" -no-plugins -always-overwrite -codesign=-)
         for plugin in "${local_plugins[@]}"; do deploy_args+=("-executable=${plugin}"); done
         "${QT_PREFIX}/bin/macdeployqt" "${deploy_args[@]}"
 
@@ -78,8 +78,8 @@ case "$(uname -s)" in
         }
 
         readonly ARCH="$(uname -m)"
-        codesign --verify --deep --strict "${APP_PATH}" 2>/dev/null || \
-            printf '提示：当前包未使用 Developer ID 签名；内测可用，公开分发前需签名和公证。\n'
+        bash "${SCRIPT_DIR}/sign-macos-bundle.sh" "${APP_PATH}"
+        bash "${SCRIPT_DIR}/verify-macos-bundle.sh" "${APP_PATH}"
 
         readonly DMG_ROOT="${STAGE_DIR}/dmg-root"
         readonly DMG_PATH="${OUTPUT_DIR}/玄壳-v${VERSION}-macOS-${ARCH}.dmg"
@@ -87,6 +87,7 @@ case "$(uname -s)" in
         [[ -f "${REPAIR_TOOL}" ]] || { printf '缺少 macOS 一键修复工具：%s\n' "${REPAIR_TOOL}" >&2; exit 1; }
         mkdir -p "${DMG_ROOT}"
         ditto "${APP_PATH}" "${DMG_ROOT}/玄壳.app"
+        codesign --verify --deep --strict "${DMG_ROOT}/玄壳.app"
         ln -s /Applications "${DMG_ROOT}/Applications"
         install -m 0755 "${REPAIR_TOOL}" "${DMG_ROOT}/一键修复玄壳.command"
         hdiutil create -quiet -ov -volname "玄壳" -fs HFS+ -format ULMO \

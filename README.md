@@ -27,7 +27,9 @@
 
 ![玄壳 SSH 运维工作区](docs/images/noxshell-workspace.png)
 
-> 截图使用本地演示会话生成，不包含真实服务器凭据。当前版本：`v0.2.61`。
+> 截图使用本地演示会话生成，不包含真实服务器凭据。当前源码版本：`v0.2.62`（已完成本地验证，尚未发布；已发布版本以 Releases 为准）。
+
+本轮的采样频率、安全措施和已知边界见 [性能与安全说明](docs/PERFORMANCE_AND_SAFETY.md)。
 
 ## 为什么选择玄壳
 
@@ -101,15 +103,15 @@
 
 | 系统 | 安装包 | 适用设备 |
 | --- | --- | --- |
-| macOS | [Apple Silicon DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.61/NoxShell-v0.2.61-macOS-arm64.dmg) | M1、M2、M3、M4 等 Apple 芯片 Mac |
-| macOS | [Intel DMG](https://github.com/abcxi/NoxShell/releases/download/v0.2.61/NoxShell-v0.2.61-macOS-x86_64.dmg) | Intel 芯片 Mac |
-| Windows | [安装版 EXE](https://github.com/abcxi/NoxShell/releases/download/v0.2.61/NoxShell-v0.2.61-Windows-x64.exe) | 64 位 Windows，推荐使用 |
-| Windows | [便携版 ZIP](https://github.com/abcxi/NoxShell/releases/download/v0.2.61/NoxShell-v0.2.61-Windows-x64.zip) | 64 位 Windows，解压即用 |
-| 校验文件 | [SHA256SUMS.txt](https://github.com/abcxi/NoxShell/releases/download/v0.2.61/SHA256SUMS.txt) | 验证下载文件完整性 |
+| macOS | Apple Silicon DMG（arm64） | M1、M2、M3、M4 等 Apple 芯片 Mac |
+| macOS | Intel DMG（x86_64） | Intel 芯片 Mac |
+| Windows | 安装版 EXE（x64） | 64 位 Windows，推荐使用 |
+| Windows | 便携版 ZIP（x64） | 64 位 Windows，解压即用 |
+| 校验文件 | SHA256SUMS.txt | 验证下载文件完整性 |
 
 > 安装包会在推送对应版本标签且 GitHub Actions 构建成功后出现。当前 macOS 包使用临时签名，尚未进行 Apple Developer ID 签名和公证；首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
 
-macOS DMG 内提供“一键修复玄壳.command”。如果系统提示应用已损坏或无法验证，请先将“玄壳.app”拖入 Applications，再双击该入口；它只会清除 `/Applications/玄壳.app` 的 `com.apple.quarantine` 属性，不会处理其他应用。正式公开分发仍建议使用 Developer ID 签名并完成 Apple 公证。
+请在上方 Releases 页选择对应系统的附件。macOS DMG 内提供“一键修复玄壳.command”：先将可信来源的“玄壳.app”拖入 Applications，再按需运行。它先验证代码完整性，仅在签名有效时清除 `/Applications/玄壳.app` 的隔离属性，不处理其他应用；无效签名必须重新下载完整安装包，清除隔离属性不能修复。正式公开分发仍需 Developer ID 签名及 Apple 公证。
 
 ## 开源许可
 

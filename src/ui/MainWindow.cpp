@@ -265,6 +265,7 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
         }
     });
     m_metricTimer = new QTimer(this);
+    m_metricTimer->setTimerType(Qt::PreciseTimer);
     m_metricTimer->setInterval(1000);
     connect(m_metricTimer, &QTimer::timeout, this, &MainWindow::requestMetrics);
     m_metricTimer->start();
@@ -389,6 +390,9 @@ QToolBar *MainWindow::createWindowToolbar()
 void MainWindow::changeEvent(QEvent *event)
 {
     QMainWindow::changeEvent(event);
+    if (m_metricTimer && (event->type() == QEvent::ActivationChange || event->type() == QEvent::WindowStateChange)) {
+        requestMetrics();
+    }
     if (event->type() != QEvent::WindowStateChange || !m_maximizeWindowButton) return;
     const bool maximized = isMaximized();
     m_maximizeWindowButton->setText(maximized ? QStringLiteral("❐") : QStringLiteral("□"));
@@ -798,7 +802,10 @@ void MainWindow::activateTerminalSession(const ServerProfile &profile, SshSessio
     bindSession(session);
     m_session = session;
     showFilePanel(profile, session);
-    if (session->isConnected()) requestMetrics();
+    if (session->isConnected()) {
+        if (const auto cached = session->lastMetricSample()) displayMetrics(*cached);
+        requestMetrics();
+    }
 }
 
 void MainWindow::bindSession(SshSession *session)
@@ -1139,8 +1146,10 @@ void MainWindow::updateConnectionPresentation(const QString &serverId, bool conn
 
 void MainWindow::requestMetrics()
 {
+    // Keep background/minimized windows inexpensive without disconnecting SSH.
+    const int interval = isMinimized() || !isActiveWindow() || !m_monitorRail->isVisible() ? 5000 : 1000;
+    if (m_metricTimer->interval() != interval) m_metricTimer->setInterval(interval);
     if (!m_session || !m_session->isConnected()) return;
-    if (m_sampleStatus) m_sampleStatus->setText(QStringLiteral("正在采样…    传输任务 0"));
     m_session->requestMetrics();
 }
 
@@ -1168,8 +1177,9 @@ void MainWindow::displayMetrics(const MetricSample &sample)
         QStringLiteral("1m / %1 核 · 5m %2").arg(sample.cpuCoreCount).arg(sample.load5, 0, 'f', 2), loadProgress);
 
     if (m_sampleStatus) {
-        m_sampleStatus->setText(QStringLiteral("采样 %1    周期 1.0 s")
-                                    .arg(sample.capturedAt.toString(QStringLiteral("HH:mm:ss"))));
+        m_sampleStatus->setText(QStringLiteral("采样 %1    基础 %2 s · 进程 5 s · 本地磁盘 30 s")
+            .arg(sample.capturedAt.toString(QStringLiteral("HH:mm:ss")))
+            .arg(m_metricTimer->interval() / 1000));
     }
 }
 

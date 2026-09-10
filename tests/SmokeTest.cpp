@@ -3,6 +3,7 @@
 #include "../src/core/CredentialStore.h"
 #include "../src/core/FileTransferTask.h"
 #include "../src/core/MetricHistory.h"
+#include "../src/core/MetricsCollectionPolicy.h"
 #include "../src/core/RdpLauncher.h"
 #include "../src/core/RemoteDirectoryFallback.h"
 #include "../src/core/SshSession.h"
@@ -33,6 +34,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QDoubleSpinBox>
+#include <QDir>
 #include <QFile>
 #include <QFontComboBox>
 #include <QHBoxLayout>
@@ -48,14 +50,17 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QProgressDialog>
+#include <QProcess>
 #include <QRadioButton>
 #include <QScrollBar>
+#include <QScopeGuard>
 #include <QSettings>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSplitter>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStandardPaths>
 #include <QPushButton>
 #include <QTabBar>
 #include <QTemporaryDir>
@@ -65,6 +70,7 @@
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
 #include <QUrl>
+#include <QUuid>
 #include <QtTest>
 
 #include <algorithm>
@@ -106,6 +112,188 @@ class SmokeTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void monitoringScheduleReducesExpensiveRemoteQueries()
+    {
+        noxshell::MetricsCollectionPolicy policy;
+        int processQueries = 0;
+        int diskQueries = 0;
+        for (int second = 0; second < 60; ++second) {
+            const auto command = policy.command(second * 1000);
+            QVERIFY(command.contains("/proc/stat"));
+            QVERIFY(command.contains("command -v awk"));
+            QVERIFY(!command.contains("getconf"));
+            QVERIFY(!command.contains("sudo"));
+            processQueries += command.contains("ps -eo");
+            diskQueries += command.contains("df -Pkl");
+        }
+        QCOMPARE(processQueries, 12);
+        QCOMPARE(diskQueries, 2);
+        // An immediate second request must not repeat the expensive queries.
+        QVERIFY(!policy.command(59001).contains("ps -eo"));
+        policy = {};
+        QVERIFY(policy.command(0).contains("df -Pkl"));
+    }
+
+    void partialMetricsKeepSlowSectionsWithoutStaleCpuCounters()
+    {
+        const QByteArray base = "__CPU__\ncpu 10 0 2 50 0 0 0 0\ncpu0 10 0 2 50 0 0 0 0\n"
+            "__MEM__\nMemTotal: 1024 kB\nMemAvailable: 512 kB\n__LOAD__\n0.1 0.2 0.3 1/10 22\n";
+        noxshell::LinuxMetricsSnapshot previous, current;
+        QString error;
+        QVERIFY2(noxshell::LinuxMetricsParser::parse(base + "__DISK__\n/dev/test 100 20 80 20% /\n"
+            "__PROC__\n42 user 1.0 2.0 10 sh\n", previous, &error), qPrintable(error));
+        QCOMPARE(previous.cpuCoreCount, 1); // Derived from /proc/stat, no getconf/nproc process.
+        QVERIFY(noxshell::LinuxMetricsParser::parse(base, current));
+        current.cpu.user = 25;
+        noxshell::LinuxMetricsParser::retainSlowMetrics(current, previous);
+        QCOMPARE(current.cpu.user, quint64(25));
+        QCOMPARE(current.disks.size(), 1);
+        QCOMPARE(current.processes.size(), 1);
+        QVERIFY(noxshell::LinuxMetricsParser::parse(base + "__DISK__\n__PROC__\n", current));
+        noxshell::LinuxMetricsParser::retainSlowMetrics(current, previous);
+        QVERIFY(current.disks.isEmpty());
+        QVERIFY(current.processes.isEmpty());
+    }
+
+    void lightweightAwkCollectorParsesSyntheticProcFiles()
+    {
+        const auto awk = QStandardPaths::findExecutable(QStringLiteral("awk"));
+        if (awk.isEmpty()) QSKIP("Local awk unavailable; remote command has a grep/cat fallback");
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QVERIFY(QDir().mkpath(directory.filePath(QStringLiteral("net"))));
+        const QList<QPair<QString, QByteArray>> files{
+            {"stat", "cpu 10 0 2 50 0 0 0 0\ncpu0 10 0 2 50 0 0 0 0\nintr 123456\n"},
+            {"meminfo", "MemTotal: 1024 kB\nMemAvailable: 512 kB\n"},
+            {"loadavg", "0.1 0.2 0.3 1/10 22\n"},
+            {"uptime", "42.5 30.0\n"},
+            {"net/dev", "eth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0\n"},
+        };
+        QStringList paths;
+        for (const auto &item : files) {
+            const auto path = directory.filePath(item.first);
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            QCOMPARE(file.write(item.second), item.second.size());
+            paths.append(path);
+        }
+        noxshell::MetricsCollectionPolicy policy;
+        const auto command = policy.command(0);
+        const auto start = command.indexOf("awk '") + 5;
+        const auto end = command.indexOf("' /proc/stat", start);
+        QVERIFY(start >= 5 && end > start);
+        auto program = command.mid(start, end - start);
+        auto prefix = directory.path().toUtf8();
+        prefix.replace("\\", "\\\\").replace("\"", "\\\"");
+        program.replace("/proc", prefix);
+        QProcess process;
+        process.start(awk, QStringList{QString::fromUtf8(program)} + paths);
+        QVERIFY(process.waitForFinished(5000));
+        QCOMPARE(process.exitCode(), 0);
+        const auto payload = process.readAllStandardOutput();
+        QVERIFY(!payload.contains("intr 123456"));
+        noxshell::LinuxMetricsSnapshot snapshot;
+        QString error;
+        QVERIFY2(noxshell::LinuxMetricsParser::parse(payload, snapshot, &error), qPrintable(error));
+        QCOMPARE(snapshot.cpuCoreCount, 1);
+        QCOMPARE(snapshot.uptimeSeconds, quint64(42));
+        QCOMPARE(snapshot.networks.size(), 1);
+        QCOMPARE(snapshot.networks.first().transmittedBytes, quint64(200));
+    }
+
+    void duplicateDirectoryAndMetricsRequestsAreCoalesced()
+    {
+        noxshell::SshSession session;
+        noxshell::ServerProfile profile;
+        profile.name = QStringLiteral("synthetic-request-test");
+        profile.host = QStringLiteral("example.invalid");
+        profile.user = QStringLiteral("test");
+        profile.password = QStringLiteral("synthetic-secret");
+        profile.keyPassphrase = QStringLiteral("synthetic-passphrase");
+        session.connectTo(profile);
+        QTRY_VERIFY(session.isConnected());
+        QVERIFY(session.profile().password.isEmpty());
+        QVERIFY(session.profile().keyPassphrase.isEmpty());
+        QSignalSpy directories(&session, &noxshell::SshSession::directoryListed);
+        session.listDirectory(QStringLiteral("/tmp"));
+        session.listDirectory(QStringLiteral("/tmp/"));
+        QTRY_COMPARE(directories.size(), 1);
+        session.listDirectory(QStringLiteral("/tmp"));
+        QTRY_COMPARE(directories.size(), 2); // Explicit refresh after completion still works.
+        QSignalSpy samples(&session, &noxshell::SshSession::metricSampleReceived);
+        session.requestMetrics();
+        QTRY_COMPARE(samples.size(), 1);
+        QVERIFY(session.lastMetricSample().has_value());
+        QCOMPARE(session.lastMetricSample()->capturedAt,
+            qvariant_cast<noxshell::MetricSample>(samples.first().first()).capturedAt);
+        session.requestMetrics();
+        QTest::qWait(30);
+        QCOMPARE(samples.size(), 1);
+        session.listDirectory(QStringLiteral("/old-host"));
+        session.disconnectFromHost();
+        QVERIFY(!session.lastMetricSample().has_value());
+        QTest::qWait(50);
+        QCOMPARE(directories.size(), 2);
+    }
+
+    void streamedTerminalSearchRefreshesInBatches()
+    {
+        noxshell::ui::TerminalView view;
+        view.resize(800, 400);
+        view.show();
+        view.showSearch();
+        auto *input = view.findChild<QLineEdit *>(QStringLiteral("terminalSearchInput"));
+        auto *timer = view.findChild<QTimer *>(QStringLiteral("terminalSearchRefreshTimer"));
+        QVERIFY(input);
+        QVERIFY(timer);
+        input->setText(QStringLiteral("needle"));
+        QSignalSpy refreshes(timer, &QTimer::timeout);
+        for (int index = 0; index < 200; ++index) view.feedData("needle\r\n");
+        QCOMPARE(refreshes.size(), 0);
+        QCOMPARE(view.searchMatchCount(), 0);
+        QTRY_COMPARE(view.searchMatchCount(), 200);
+        QCOMPARE(refreshes.size(), 1);
+        view.feedData("needle\r\n");
+        view.findNext(); // Navigation must flush pending matches immediately.
+        QCOMPARE(view.searchMatchCount(), 201);
+        QVERIFY(!timer->isActive());
+        view.feedData("needle\r\n");
+        view.hideSearch();
+        QVERIFY(!timer->isActive());
+        QCOMPARE(view.searchMatchCount(), 0);
+    }
+
+    void nativeCredentialRoundTripWithSyntheticEntryOnly()
+    {
+#ifdef Q_OS_MACOS
+        if (!qEnvironmentVariableIsSet("NOXSHELL_TEST_NATIVE_KEYCHAIN")) {
+            QSKIP("Native Keychain test is opt-in and uses one unique synthetic entry only");
+        }
+        noxshell::CredentialStore store;
+        const auto reference = QStringLiteral("noxshell-test-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        struct Cleanup {
+            noxshell::CredentialStore &store;
+            QString reference;
+            ~Cleanup() { store.remove(reference); }
+        } cleanup{store, reference};
+        noxshell::CredentialSecret secret;
+        secret.password = QStringLiteral(" synthetic \"你好\" $(); ");
+        secret.keyPassphrase = QStringLiteral("synthetic-passphrase");
+        QVERIFY2(store.save(reference, secret), qPrintable(store.lastError()));
+        auto loaded = store.load(reference);
+        QVERIFY2(store.lastError().isEmpty(), qPrintable(store.lastError()));
+        QCOMPARE(loaded.password, secret.password);
+        QCOMPARE(loaded.keyPassphrase, secret.keyPassphrase);
+        secret.password = QStringLiteral("updated-synthetic-only");
+        QVERIFY2(store.save(reference, secret), qPrintable(store.lastError()));
+        QCOMPARE(store.load(reference).password, secret.password);
+        QVERIFY(store.remove(reference));
+        QVERIFY(store.remove(reference));
+#else
+        QSKIP("macOS-only native Keychain backend");
+#endif
+    }
+
     void applicationBrandIsNoxShell()
     {
         QCOMPARE(QApplication::applicationName(), QStringLiteral("玄壳"));
@@ -143,6 +331,87 @@ private slots:
             "QTreeWidget#remoteDirectoryTree {\n            color:#D5E0EB; background:#151D25;")));
         QVERIFY(darkStyle.contains(QStringLiteral(
             "QTreeWidget#remoteDirectoryTree::item:selected {\n            color:#FFFFFF; background:#174E78;")));
+    }
+
+    void numericEditorsRenderAcrossThemeChanges()
+    {
+        using namespace noxshell::ui;
+        const auto restoreTheme = qScopeGuard([] { applyApplicationTheme(ThemeMode::Light); });
+        applyApplicationTheme(ThemeMode::System);
+        const bool systemWasDark = isApplicationDarkTheme();
+        ServerDialog ssh;
+        ssh.setObjectName(QStringLiteral("sshServerDialog"));
+        RdpDialog rdp;
+        TerminalSettingsDialog terminal(TerminalAppearance{});
+        const QList<QDialog *> dialogs{&ssh, &rdp, &terminal};
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_THEME_CAPTURE_DIR");
+        if (!captureDir.isEmpty()) QVERIFY(QDir().mkpath(captureDir));
+        QHash<QWidget *, QSize> sizes;
+        // Exercise existing controls as well as controls created after a theme change.
+        for (const auto mode : {ThemeMode::Light, ThemeMode::Dark, ThemeMode::Light,
+                 ThemeMode::Dark, ThemeMode::System}) {
+            applyApplicationTheme(mode);
+            if (mode == ThemeMode::System) QCOMPARE(isApplicationDarkTheme(), systemWasDark);
+            for (auto *dialog : dialogs) {
+                dialog->show();
+                QTest::qWait(30);
+                if (!captureDir.isEmpty()) {
+                    QVERIFY(dialog->grab().save(captureDir + QLatin1Char('/')
+                        + dialog->objectName() + QLatin1Char('-') + themeModeSettingValue(mode)
+                        + QStringLiteral(".png")));
+                }
+                const bool dark = isApplicationDarkTheme();
+                for (auto *spin : dialog->findChildren<QAbstractSpinBox *>()) {
+                    const auto label = spin->objectName().toUtf8();
+                    auto *editor = spin->findChild<QLineEdit *>();
+                    QVERIFY2(editor, label.constData());
+                    QVERIFY2(editor->height() >= editor->fontMetrics().height(), label.constData());
+                    if (sizes.contains(spin)) QCOMPARE(spin->size(), sizes.value(spin));
+                    sizes.insert(spin, spin->size());
+                    // Inspect actual pixels: macOS can paint a native white bezel even
+                    // when the widget's palette reports a dark Base color.
+                    const auto pixels = spin->grab().toImage();
+                    int bright = 0;
+                    for (int y = 2; y < pixels.height() - 2; ++y) {
+                        for (int x = 2; x < pixels.width() - 2; ++x) {
+                            if (pixels.pixelColor(x, y).lightness() > 230) ++bright;
+                        }
+                    }
+                    const double brightRatio = double(bright)
+                        / ((pixels.width() - 4) * (pixels.height() - 4));
+                    QVERIFY2(dark ? brightRatio < 0.1 : brightRatio > 0.5, label.constData());
+                    QVERIFY2(dark ? editor->palette().color(QPalette::Text).lightness() > 180
+                                  : editor->palette().color(QPalette::Text).lightness() < 100, label.constData());
+                }
+                dialog->hide();
+            }
+            QDoubleSpinBox fresh;
+            fresh.setSuffix(QStringLiteral(" %"));
+            fresh.ensurePolished();
+            QCOMPARE(fresh.palette().color(QPalette::Base).lightness() < 128,
+                isApplicationDarkTheme());
+        }
+        auto *port = ssh.findChild<QSpinBox *>(QStringLiteral("portEditor"));
+        QVERIFY(port);
+        ssh.show();
+        port->setValue(22);
+        QTest::mouseClick(port, Qt::LeftButton, Qt::NoModifier, QPoint(port->width() - 10, 8));
+        QCOMPARE(port->value(), 23);
+        QTest::mouseClick(port, Qt::LeftButton, Qt::NoModifier,
+            QPoint(port->width() - 10, port->height() - 8));
+        QCOMPARE(port->value(), 22);
+        port->setFocus();
+        port->selectAll();
+        QTest::keyClicks(port, "65535");
+        QTest::keyClick(port, Qt::Key_Tab);
+        QCOMPARE(port->value(), 65535);
+        port->stepUp();
+        QCOMPARE(port->value(), 65535);
+        port->stepDown();
+        QCOMPARE(port->value(), 65534);
+        port->setValue(1);
+        port->stepDown();
+        QCOMPARE(port->value(), 1);
     }
 
     void ubuntuDirectoryFallbackQuotesPathsAndParsesFindOutput()

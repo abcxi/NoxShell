@@ -88,6 +88,14 @@ NSWindow *nativeWindow(QMainWindow *window)
 
 namespace noxshell::ui {
 
+void applyMacApplicationAppearance(int themeMode)
+{
+    NSAppearance *appearance = themeMode == 1
+        ? [NSAppearance appearanceNamed:NSAppearanceNameAqua]
+        : themeMode == 2 ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : nil;
+    if (NSApp.appearance != appearance) NSApp.appearance = appearance;
+}
+
 bool installMacTitleBarControls(QMainWindow *window,
     std::function<void()> toggleSidebar,
     std::function<void()> toggleMonitor,

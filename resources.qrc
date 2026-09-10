@@ -18,5 +18,7 @@
         <file>assets/eye.svg</file>
         <file>assets/eye-off.svg</file>
         <file>assets/chevron-down.svg</file>
+        <file>assets/spin-up.svg</file>
+        <file>assets/spin-down.svg</file>
   </qresource>
 </RCC>

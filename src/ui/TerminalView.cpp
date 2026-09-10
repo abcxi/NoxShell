@@ -27,6 +27,7 @@
 #include <QWheelEvent>
 
 #include <utility>
+#include <algorithm>
 
 namespace noxshell::ui {
 
@@ -82,6 +83,7 @@ TerminalView::TerminalView(QWidget *parent)
         update();
     });
     connect(m_scrollBar, &SearchMarkerScrollBar::searchMarkerActivated, this, [this](int index) {
+        if (m_searchRefreshTimer->isActive()) rebuildSearchMatches(true, false);
         if (index < 0 || index >= m_searchMatches.size()) return;
         m_currentSearchMatch = index;
         updateSearchCounter();
@@ -180,6 +182,13 @@ TerminalView::TerminalView(QWidget *parent)
     m_commandBlockTools->setFixedSize(62, 30);
     m_commandBlockTools->hide();
 
+    m_searchRefreshTimer = new QTimer(this);
+    m_searchRefreshTimer->setObjectName(QStringLiteral("terminalSearchRefreshTimer"));
+    m_searchRefreshTimer->setSingleShot(true);
+    m_searchRefreshTimer->setInterval(100);
+    connect(m_searchRefreshTimer, &QTimer::timeout, this, [this] {
+        rebuildSearchMatches(true, false);
+    });
     connect(m_searchInput, &QLineEdit::textChanged, this, [this] {
         rebuildSearchMatches(false, true);
     });
@@ -244,7 +253,9 @@ void TerminalView::feedText(const QString &text)
     m_model.feed(text);
     updateScrollBar(followBottom);
     if (m_searchBar->isVisible() && !m_searchInput->text().isEmpty()) {
-        rebuildSearchMatches(true, false);
+        // Throttle (do not restart the timer): continuous output still gets
+        // updated highlights, without rescanning all scrollback every packet.
+        if (!m_searchRefreshTimer->isActive()) m_searchRefreshTimer->start();
     }
     if (m_lastMousePosition.x() >= 0) updateHoveredCommandBlock(m_lastMousePosition);
     update();
@@ -338,11 +349,8 @@ void TerminalView::paintEvent(QPaintEvent *event)
     painter.setRenderHint(QPainter::TextAntialiasing);
 
     const int firstLine = m_scrollBar->value();
-    int visibleMatchIndex = 0;
-    while (visibleMatchIndex < m_searchMatches.size()
-        && m_searchMatches.at(visibleMatchIndex).line < firstLine) {
-        ++visibleMatchIndex;
-    }
+    int visibleMatchIndex = static_cast<int>(std::lower_bound(m_searchMatches.cbegin(), m_searchMatches.cend(),
+        firstLine, [](const SearchMatch &match, int line) { return match.line < line; }) - m_searchMatches.cbegin());
     for (int row = 0; row < m_model.rows(); ++row) {
         const int documentLine = firstLine + row;
         int rowMatchIndex = visibleMatchIndex;
@@ -427,6 +435,7 @@ void TerminalView::showSearch()
 void TerminalView::hideSearch()
 {
     if (!m_searchBar) return;
+    m_searchRefreshTimer->stop();
     m_searchBar->hide();
     m_searchMatches.clear();
     m_currentSearchMatch = -1;
@@ -454,6 +463,7 @@ int TerminalView::columnForTextOffset(int line, int offset) const
 
 void TerminalView::rebuildSearchMatches(bool preserveCurrent, bool revealCurrent)
 {
+    if (m_searchRefreshTimer) m_searchRefreshTimer->stop();
     SearchMatch previous;
     const bool hadPrevious = preserveCurrent && m_currentSearchMatch >= 0
         && m_currentSearchMatch < m_searchMatches.size();
@@ -545,7 +555,7 @@ void TerminalView::findNext()
         showSearch();
         return;
     }
-    if (m_searchMatches.isEmpty()) rebuildSearchMatches(false, false);
+    if (m_searchRefreshTimer->isActive() || m_searchMatches.isEmpty()) rebuildSearchMatches(true, false);
     if (m_searchMatches.isEmpty()) return;
     m_currentSearchMatch = (m_currentSearchMatch + 1) % m_searchMatches.size();
     updateSearchCounter();
@@ -559,7 +569,7 @@ void TerminalView::findPrevious()
         showSearch();
         return;
     }
-    if (m_searchMatches.isEmpty()) rebuildSearchMatches(false, false);
+    if (m_searchRefreshTimer->isActive() || m_searchMatches.isEmpty()) rebuildSearchMatches(true, false);
     if (m_searchMatches.isEmpty()) return;
     m_currentSearchMatch = (m_currentSearchMatch - 1 + m_searchMatches.size()) % m_searchMatches.size();
     updateSearchCounter();

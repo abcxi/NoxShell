@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.61 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.62 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -57,6 +57,7 @@ set(NOXSHELL_CORE_SOURCES
     src/core/LinuxMetrics.h
     src/core/MetricHistory.cpp
     src/core/MetricHistory.h
+    src/core/MetricsCollectionPolicy.h
     src/core/MonitoringData.h
     src/core/RemoteFileEntry.h
     src/core/RemoteDirectoryFallback.cpp
@@ -121,7 +122,7 @@ if(WIN32)
     target_link_libraries(NoxShell PRIVATE Advapi32 Ws2_32)
 endif()
 if(APPLE)
-    target_link_libraries(NoxShell PRIVATE "-framework Cocoa")
+    target_link_libraries(NoxShell PRIVATE "-framework Cocoa" "-framework Security")
 endif()
 
 include(CTest)
@@ -190,7 +191,7 @@ if(BUILD_TESTING)
         set_target_properties(NoxShellSmokeTest PROPERTIES WIN32_EXECUTABLE FALSE)
     endif()
     if(APPLE)
-        target_link_libraries(NoxShellSmokeTest PRIVATE "-framework Cocoa")
+        target_link_libraries(NoxShellSmokeTest PRIVATE "-framework Cocoa" "-framework Security")
     endif()
     add_test(NAME ui_smoke COMMAND NoxShellSmokeTest -v1)
     set_tests_properties(ui_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

@@ -85,10 +85,6 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_group->setEditable(false);
     m_group->setMaxVisibleItems(12);
     m_group->addItem(kNoGroupLabel, QString{});
-    m_group->setStyleSheet(QStringLiteral(
-        "QComboBox{padding-right:30px;}"
-        "QComboBox::drop-down{width:30px;border-left:1px solid #E1E7EF;}"
-        "QComboBox::down-arrow{image:url(:/assets/chevron-down.svg);width:12px;height:12px;}"));
     m_os = new QLineEdit(QStringLiteral("linux"));
     m_authentication = new QComboBox;
     m_authentication->setObjectName(QStringLiteral("authenticationEditor"));

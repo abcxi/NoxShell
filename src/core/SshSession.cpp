@@ -69,17 +69,24 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
             LinuxMetricsSnapshot snapshot;
             QString error;
             if (!LinuxMetricsParser::parse(payload, snapshot, &error)) {
+                m_metricsRetryMs = qMin(30000, m_metricsRetryMs * 2);
+                m_metricsCooldown.start();
                 emit metricsCollectionFailed(error);
                 return;
             }
+            m_metricsRetryMs = 1000;
+            if (m_previousMetrics) LinuxMetricsParser::retainSlowMetrics(snapshot, *m_previousMetrics);
             const auto sample = LinuxMetricsParser::calculate(snapshot, m_previousMetrics ? &*m_previousMetrics : nullptr);
             m_previousMetrics = std::move(snapshot);
+            m_lastMetricSample = sample;
             emit metricSampleReceived(sample);
         });
     connect(m_worker, &Libssh2Worker::metricsCollectionFailed, this,
         [this](quint64 requestId, const QString &message) {
             if (requestId != m_metricRequestId) return;
             m_metricsInFlight = false;
+            m_metricsRetryMs = qMin(30000, m_metricsRetryMs * 2);
+            m_metricsCooldown.start();
             emit metricsCollectionFailed(message);
         });
     connect(m_worker, &Libssh2Worker::homeDirectoryResolved, this,
@@ -95,11 +102,15 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     connect(m_worker, &Libssh2Worker::directoryListed, this,
         [this](quint64 requestId, const QString &path, const RemoteFileEntries &entries) {
             if (static_cast<quint32>(requestId >> 32) != m_directoryGeneration) return;
+            if (m_pendingDirectories.value(path) != requestId) return;
+            m_pendingDirectories.remove(path);
             emit directoryListed(path, entries);
         });
     connect(m_worker, &Libssh2Worker::directoryListingFailed, this,
         [this](quint64 requestId, const QString &path, const QString &message) {
             if (static_cast<quint32>(requestId >> 32) != m_directoryGeneration) return;
+            if (m_pendingDirectories.value(path) != requestId) return;
+            m_pendingDirectories.remove(path);
             emit directoryListingFailed(path, message);
         });
     connect(m_worker, &Libssh2Worker::fileOperationProgress, this,
@@ -153,6 +164,7 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
 SshSession::~SshSession()
 {
     if (m_workerThread.isRunning()) {
+        if (m_activeTransferTaskId) m_worker->cancelTransfer(m_activeTransferTaskId);
         m_worker->cancelConnection();
         QMetaObject::invokeMethod(m_worker, "disconnectFromHost", Qt::BlockingQueuedConnection);
         m_workerThread.quit();
@@ -164,6 +176,9 @@ void SshSession::connectTo(const ServerProfile &profile)
 {
     disconnectFromHost();
     m_profile = profile;
+    // Public/session metadata must not retain copies of connection credentials.
+    m_profile.password.clear();
+    m_profile.keyPassphrase.clear();
     m_demo = profile.connectionMode == ConnectionMode::Demo;
     m_connected = false;
     m_metricsInFlight = false;
@@ -209,6 +224,12 @@ void SshSession::connectTo(const ServerProfile &profile)
 
 void SshSession::disconnectFromHost()
 {
+    m_metricsInFlight = false;
+    ++m_metricRequestId;
+    m_metricsCooldown.invalidate();
+    m_metricsRetryMs = 1000;
+    m_lastMetricSample.reset();
+    m_pendingDirectories.clear();
     if (m_activeTransferTaskId) m_worker->cancelTransfer(m_activeTransferTaskId);
     for (auto &task : m_transferQueue) {
         if (task.state == TransferState::Queued || task.state == TransferState::Running) {
@@ -281,12 +302,14 @@ void SshSession::resizeTerminal(int columns, int rows, int pixelWidth, int pixel
 void SshSession::requestMetrics()
 {
     if (m_metricsInFlight) return;
+    if (m_metricsCooldown.isValid() && m_metricsCooldown.elapsed() < m_metricsRetryMs) return;
     if (!m_connected) {
         emit metricsCollectionFailed(QStringLiteral("SSH 会话未连接"));
         return;
     }
 
     m_metricsInFlight = true;
+    m_metricsCooldown.start();
     const auto requestId = ++m_metricRequestId;
     if (!m_demo) {
         emit collectMetricsRequested(requestId);
@@ -334,6 +357,7 @@ void SshSession::requestMetrics()
             {2014, QStringLiteral("www"), 5.7, 2.3, 376ULL * 1024 * 1024, QStringLiteral("nginx")},
             {770, QStringLiteral("root"), 1.2, 0.8, 128ULL * 1024 * 1024, QStringLiteral("sshd")},
         };
+        m_lastMetricSample = sample;
         emit metricSampleReceived(sample);
     });
 }
@@ -341,17 +365,20 @@ void SshSession::requestMetrics()
 void SshSession::listDirectory(const QString &path)
 {
     const auto normalized = QDir::cleanPath(path.trimmed().isEmpty() ? QStringLiteral("/") : path.trimmed());
+    if (m_pendingDirectories.contains(normalized)) return;
     const auto requestId = (static_cast<quint64>(m_directoryGeneration) << 32) | ++m_directoryRequestSerial;
     if (!m_connected) {
         emit directoryListingFailed(normalized, QStringLiteral("SSH 会话未连接"));
         return;
     }
+    m_pendingDirectories.insert(normalized, requestId);
     if (!m_demo) {
         emit listDirectoryRequested(requestId, normalized);
         return;
     }
     QTimer::singleShot(25, this, [this, requestId, normalized] {
         if (static_cast<quint32>(requestId >> 32) != m_directoryGeneration || !m_demo || !m_connected) return;
+        m_pendingDirectories.remove(normalized);
         emit directoryListed(normalized, demoEntriesFor(normalized));
     });
 }

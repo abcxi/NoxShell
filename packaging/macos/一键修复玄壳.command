@@ -28,6 +28,13 @@ if [[ ! -d "${APP_PATH}" ]]; then
     exit 1
 fi
 
+# Removing quarantine cannot repair invalid Mach-O code signatures. Never
+# announce success or remove quarantine from an integrity-damaged package.
+if ! /usr/bin/codesign --verify --deep --strict "${APP_PATH}" >/dev/null 2>&1; then
+    show_message "应用签名校验失败" "此应用的代码签名无效或文件已损坏，清除隔离属性无法修复。请重新下载签名完整的新版本，再替换 Applications 中的玄壳。"
+    exit 1
+fi
+
 /usr/bin/xattr -dr com.apple.quarantine "${APP_PATH}" 2>/dev/null || true
 
 # A normal Finder installation is owned by the current user. If permissions are

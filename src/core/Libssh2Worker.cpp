@@ -80,19 +80,6 @@ LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC(keyboardInteractiveResponse)
     }
 }
 
-constexpr auto kMetricsCommand =
-    "export LC_ALL=C; "
-    "printf '__CPU__\\n'; grep -E '^cpu([0-9]+)? ' /proc/stat; "
-    "printf '__MEM__\\n'; cat /proc/meminfo; "
-    "printf '__LOAD__\\n'; cat /proc/loadavg; "
-    "printf '__CORES__\\n'; (getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf '1\\n'); "
-    "printf '__DISK__\\n'; (df -Pk 2>/dev/null); "
-    "printf '__UPTIME__\\n'; cat /proc/uptime 2>/dev/null; "
-    "printf '__NET__\\n'; cat /proc/net/dev 2>/dev/null; "
-    "printf '__PROC__\\n'; "
-    "(ps -eo pid=,user=,pcpu=,pmem=,rss=,comm= --sort=-pcpu 2>/dev/null | head -n 12; "
-    "ps -eo pid=,user=,pcpu=,pmem=,rss=,comm= --sort=-pmem 2>/dev/null | head -n 12; true)";
-
 QString nativePath(const QString &path)
 {
     if (path.startsWith(QStringLiteral("~/"))) {
@@ -235,6 +222,8 @@ void Libssh2Worker::connectTo(const ServerProfile &profile, quint64 requestGener
     m_connectionFailure.clear();
     m_readTimer->setParent(this);
     m_profile = profile;
+    m_metricsClock.start();
+    m_metricsPolicy = {};
     emit connectionChanged(false, QStringLiteral("TCP 连接 %1:%2…").arg(profile.host).arg(profile.port));
 
     QString socketError;
@@ -358,6 +347,8 @@ void Libssh2Worker::continueAuthentication()
         fail(QStringLiteral("SSH 认证"), detail);
         return;
     }
+    m_profile.password.clear();
+    m_profile.keyPassphrase.clear();
     if (!openShell()) {
         fail(QStringLiteral("PTY/Shell"), connectionOperationError());
         return;
@@ -551,6 +542,9 @@ void Libssh2Worker::collectMetrics(quint64 requestId)
     libssh2_session_set_blocking(m_session, 1);
     libssh2_session_set_timeout(m_session, kMetricsTimeoutMs);
 
+    const auto command = m_metricsPolicy.command(m_metricsClock.elapsed());
+    QElapsedTimer collectionTime;
+    collectionTime.start();
     LIBSSH2_CHANNEL *metricsChannel = libssh2_channel_open_session(m_session);
     QByteArray output;
     QByteArray errorOutput;
@@ -558,14 +552,24 @@ void Libssh2Worker::collectMetrics(quint64 requestId)
 
     if (!metricsChannel) {
         failure = QStringLiteral("无法打开指标采集通道：%1").arg(lastSessionError());
-    } else if (libssh2_channel_exec(metricsChannel, kMetricsCommand) != 0) {
+    } else if (libssh2_channel_exec(metricsChannel, command.constData()) != 0) {
         failure = QStringLiteral("无法执行指标采集命令：%1").arg(lastSessionError());
     } else {
         std::array<char, 8192> buffer{};
         auto readStream = [&](int stream, QByteArray &target) {
             for (;;) {
+                if (!failure.isEmpty()) break;
+                if (connectionCanceled() || collectionTime.elapsed() >= kMetricsTimeoutMs) {
+                    failure = QStringLiteral("指标采集已取消或超时");
+                    break;
+                }
+                libssh2_session_set_timeout(m_session, qMax<qint64>(1, kMetricsTimeoutMs - collectionTime.elapsed()));
                 const auto received = libssh2_channel_read_ex(metricsChannel, stream, buffer.data(), buffer.size());
                 if (received > 0) {
+                    if (output.size() + errorOutput.size() + received > 512 * 1024) {
+                        failure = QStringLiteral("指标数据超出 512 KiB 安全上限，已停止本次采集");
+                        break;
+                    }
                     target.append(buffer.data(), static_cast<qsizetype>(received));
                     continue;
                 }
@@ -592,10 +596,12 @@ void Libssh2Worker::collectMetrics(quint64 requestId)
     }
 
     if (!failure.isEmpty()) {
+        m_metricsPolicy = {};
         emit metricsCollectionFailed(requestId, failure);
         return;
     }
     if (output.isEmpty()) {
+        m_metricsPolicy = {};
         const auto detail = QString::fromUtf8(errorOutput).trimmed();
         emit metricsCollectionFailed(requestId, detail.isEmpty() ? QStringLiteral("远端未返回指标数据") : detail);
         return;
@@ -909,7 +915,7 @@ void Libssh2Worker::uploadFile(quint64 requestId, const QString &localPath, cons
     } else {
         QByteArray buffer(64 * 1024, Qt::Uninitialized);
         while (!local.atEnd() && failure.isEmpty()) {
-            if (m_cancelTransferId.load(std::memory_order_relaxed) == requestId) {
+            if (connectionCanceled() || m_cancelTransferId.load(std::memory_order_relaxed) == requestId) {
                 failure = QStringLiteral("__CANCELED__");
                 break;
             }
@@ -920,7 +926,7 @@ void Libssh2Worker::uploadFile(quint64 requestId, const QString &localPath, cons
             }
             qsizetype offset = 0;
             while (offset < read) {
-                if (m_cancelTransferId.load(std::memory_order_relaxed) == requestId) {
+                if (connectionCanceled() || m_cancelTransferId.load(std::memory_order_relaxed) == requestId) {
                     failure = QStringLiteral("__CANCELED__");
                     break;
                 }
@@ -997,7 +1003,7 @@ void Libssh2Worker::downloadFile(quint64 requestId, const QString &remotePath, c
     if (failure.isEmpty()) {
         std::array<char, 64 * 1024> buffer{};
         for (;;) {
-            if (m_cancelTransferId.load(std::memory_order_relaxed) == requestId) {
+            if (connectionCanceled() || m_cancelTransferId.load(std::memory_order_relaxed) == requestId) {
                 failure = QStringLiteral("__CANCELED__");
                 break;
             }
@@ -1083,6 +1089,10 @@ void Libssh2Worker::readFile(quint64 requestId, const QString &remotePath, quint
         }
         std::array<char, 64 * 1024> buffer{};
         while (failure.isEmpty()) {
+            if (connectionCanceled()) {
+                failure = QStringLiteral("文件读取已取消");
+                break;
+            }
             const auto received = libssh2_sftp_read(remote, buffer.data(), buffer.size());
             if (received == 0) break;
             if (received < 0) {
@@ -1142,6 +1152,10 @@ void Libssh2Worker::writeFile(quint64 requestId, const QString &remotePath, cons
     }
     qsizetype offset = 0;
     while (remote && offset < data.size() && failure.isEmpty()) {
+        if (connectionCanceled()) {
+            failure = QStringLiteral("文件保存已取消");
+            break;
+        }
         const auto written = libssh2_sftp_write(remote, data.constData() + offset, static_cast<size_t>(data.size() - offset));
         if (written <= 0) {
             failure = QStringLiteral("写入远端文件失败（SFTP %1）").arg(libssh2_sftp_last_error(sftp));
@@ -1355,6 +1369,8 @@ void Libssh2Worker::disconnectFromHost()
 
 void Libssh2Worker::cleanup()
 {
+    m_profile.password.clear();
+    m_profile.keyPassphrase.clear();
     m_readTimer->stop();
     m_waitingForHostKey = false;
     m_connected = false;

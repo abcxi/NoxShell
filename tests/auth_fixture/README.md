@@ -36,6 +36,9 @@ and ignoring obsolete connection requests. It additionally covers:
   disconnecting without replaying partially delivered input.
 - Continuous stdout without starving stderr or queued resize/disconnect operations.
 - Complete buffered output at EOF and recovery after an abrupt TCP reset.
+- Lightweight versus full metrics commands and continuing shell interaction after
+  normal or oversized metrics output. `-metrics-mode` returns synthetic data;
+  received command strings are never executed by the fixture.
 
 Known limitation: when the server closes the TCP connection immediately after
 sending a large final burst, libssh2 1.11.1 can report a transport error before

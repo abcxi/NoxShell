@@ -15,6 +15,7 @@ class QLabel;
 class QLineEdit;
 class QMenu;
 class QToolButton;
+class QTimer;
 
 namespace noxshell::ui {
 
@@ -144,6 +145,7 @@ private:
     QAction *m_pasteAction{};
     QAction *m_selectAllAction{};
     QFrame *m_searchBar{};
+    QTimer *m_searchRefreshTimer{};
     QLineEdit *m_searchInput{};
     QLabel *m_searchCounter{};
     QToolButton *m_searchPrevious{};

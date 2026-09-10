@@ -5,6 +5,10 @@
 #include <QProcess>
 #include <QStandardPaths>
 
+#ifdef Q_OS_MACOS
+#include <Security/Security.h>
+#endif
+
 #ifdef Q_OS_WIN
 #define NOMINMAX
 #include <windows.h>
@@ -48,18 +52,48 @@ QString processFailure(QProcess &process)
 #endif
 
 #ifdef Q_OS_MACOS
+struct MacCredentialQuery {
+    CFMutableDictionaryRef value = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+    MacCredentialQuery(const char *service, const QString &reference)
+    {
+        const auto accountBytes = reference.toUtf8();
+        const auto account = CFStringCreateWithBytes(kCFAllocatorDefault,
+            reinterpret_cast<const UInt8 *>(accountBytes.constData()), accountBytes.size(), kCFStringEncodingUTF8, false);
+        const auto serviceName = CFStringCreateWithCString(kCFAllocatorDefault, service, kCFStringEncodingUTF8);
+        CFDictionarySetValue(value, kSecClass, kSecClassGenericPassword);
+        CFDictionarySetValue(value, kSecAttrService, serviceName);
+        CFDictionarySetValue(value, kSecAttrAccount, account);
+        CFRelease(serviceName);
+        CFRelease(account);
+    }
+    ~MacCredentialQuery() { CFRelease(value); }
+    MacCredentialQuery(const MacCredentialQuery &) = delete;
+    MacCredentialQuery &operator=(const MacCredentialQuery &) = delete;
+};
+
+QString macCredentialError(OSStatus status)
+{
+    // Use the OS status only: never include encoded credential data in errors.
+    return QStringLiteral("系统凭据库错误 %1；如系统询问访问权限，请确认是玄壳后再授权").arg(status);
+}
+
 bool readMacCredential(const char *service, const QString &reference, QByteArray &payload, QString &error)
 {
-    QProcess process;
-    process.start(QStringLiteral("/usr/bin/security"), {
-        QStringLiteral("find-generic-password"), QStringLiteral("-s"), QString::fromLatin1(service),
-        QStringLiteral("-a"), reference, QStringLiteral("-w"),
-    });
-    if (!process.waitForFinished(10000) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        error = QString::fromUtf8(process.readAllStandardError()).trimmed();
+    MacCredentialQuery query(service, reference);
+    CFDictionarySetValue(query.value, kSecReturnData, kCFBooleanTrue);
+    CFDictionarySetValue(query.value, kSecMatchLimit, kSecMatchLimitOne);
+    CFTypeRef result = nullptr;
+    const auto status = SecItemCopyMatching(query.value, &result);
+    if (status != errSecSuccess || !result || CFGetTypeID(result) != CFDataGetTypeID()) {
+        if (result) CFRelease(result);
+        error = macCredentialError(status == errSecSuccess ? errSecDecode : status);
         return false;
     }
-    payload = process.readAllStandardOutput();
+    const auto data = static_cast<CFDataRef>(result);
+    payload = QByteArray(reinterpret_cast<const char *>(CFDataGetBytePtr(data)), CFDataGetLength(data));
+    CFRelease(result);
     return true;
 }
 #elif defined(Q_OS_WIN)
@@ -106,16 +140,25 @@ bool CredentialStore::save(const QString &reference, const CredentialSecret &sec
         return false;
     }
 #ifdef Q_OS_MACOS
-    QProcess process;
-    const auto value = QString::fromLatin1(encodeSecret(secret));
-    process.start(QStringLiteral("/usr/bin/security"), {
-        QStringLiteral("add-generic-password"), QStringLiteral("-U"),
-        QStringLiteral("-s"), QString::fromLatin1(kServiceName),
-        QStringLiteral("-a"), reference,
-        QStringLiteral("-w"), value,
-    });
-    if (!process.waitForFinished(10000) || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        m_lastError = QStringLiteral("写入 macOS Keychain 失败：%1").arg(QString::fromUtf8(process.readAllStandardError()).trimmed());
+    // Keep the existing service/account and payload format; do not migrate,
+    // delete or weaken ACLs. Never pass secrets in process arguments.
+    MacCredentialQuery query(kServiceName, reference);
+    const auto payload = encodeSecret(secret);
+    const auto data = CFDataCreate(kCFAllocatorDefault,
+        reinterpret_cast<const UInt8 *>(payload.constData()), payload.size());
+    const void *keys[] = {kSecValueData};
+    const void *values[] = {data};
+    const auto attributes = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    auto status = SecItemUpdate(query.value, attributes);
+    if (status == errSecItemNotFound) {
+        CFDictionarySetValue(query.value, kSecValueData, data);
+        status = SecItemAdd(query.value, nullptr);
+    }
+    CFRelease(attributes);
+    CFRelease(data);
+    if (status != errSecSuccess) {
+        m_lastError = QStringLiteral("写入 macOS Keychain 失败：%1").arg(macCredentialError(status));
         return false;
     }
     return true;
@@ -210,18 +253,10 @@ bool CredentialStore::remove(const QString &reference)
     m_lastError.clear();
     if (reference.trimmed().isEmpty()) return true;
 #ifdef Q_OS_MACOS
-    QProcess process;
-    process.start(QStringLiteral("/usr/bin/security"), {
-        QStringLiteral("delete-generic-password"), QStringLiteral("-s"), QString::fromLatin1(kServiceName),
-        QStringLiteral("-a"), reference,
-    });
-    if (!process.waitForFinished(10000) || process.exitStatus() != QProcess::NormalExit) {
-        m_lastError = QStringLiteral("删除 macOS Keychain 凭据失败：%1").arg(process.errorString());
-        return false;
-    }
-    if (process.exitCode() != 0 && process.exitCode() != 44) {
-        m_lastError = QStringLiteral("删除 macOS Keychain 凭据失败：%1")
-                          .arg(QString::fromUtf8(process.readAllStandardError()).trimmed());
+    MacCredentialQuery query(kServiceName, reference);
+    const auto status = SecItemDelete(query.value);
+    if (status != errSecSuccess && status != errSecItemNotFound) {
+        m_lastError = QStringLiteral("删除 macOS Keychain 凭据失败：%1").arg(macCredentialError(status));
         return false;
     }
     return true;
