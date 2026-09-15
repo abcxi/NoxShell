@@ -28,6 +28,10 @@ authentication response slower than the former 8-second deadline, discovery
 timeout, password-response timeout, an incorrect password, prompt cancellation,
 and ignoring obsolete connection requests. It additionally covers:
 
+- A fixed Unicode/special-character password with leading/trailing whitespace,
+  through ordinary and keyboard-interactive authentication. The UI smoke suite
+  also uses this fixture (when enabled) to verify terminal password entry through
+  SshSession and the real worker, without reading actual Keychain credentials.
 - Ed25519/curve25519/AES-128-GCM, ECDSA/P-256/AES-256-CTR,
   RSA-SHA256/group14-SHA256/AES-128-CTR and RSA-SHA512/curve25519/AES-256-GCM.
 - Rejecting a changed host fingerprint before sending credentials.

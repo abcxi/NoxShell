@@ -68,16 +68,16 @@ QString applicationStyleSheet(bool dark)
         QToolBar#windowControlsToolbar {
             background: transparent; border: 0; spacing: 3px; padding: 1px 6px;
         }
-        QToolButton#sidebarToggleButton, QToolButton#monitorToggleButton,
+        QToolButton#monitorToggleButton,
         QToolButton#terminalSettingsButton, QToolButton#themeModeButton {
             background: transparent; border: 1px solid transparent; border-radius: 5px;
         }
         QToolButton#themeModeButton { font-size:16px; font-family:"Helvetica Neue", Arial; }
-        QToolButton#sidebarToggleButton:hover, QToolButton#monitorToggleButton:hover,
+        QToolButton#monitorToggleButton:hover,
         QToolButton#terminalSettingsButton:hover, QToolButton#themeModeButton:hover {
             background: #E8EDF3; border-color: #CCD7E3;
         }
-        QToolButton#sidebarToggleButton:pressed, QToolButton#monitorToggleButton:pressed,
+        QToolButton#monitorToggleButton:pressed,
         QToolButton#terminalSettingsButton:pressed, QToolButton#themeModeButton:pressed { background: #DCE5EE; }
         QLabel#windowToolbarTitle { color: #46566A; font-size: 12px; font-weight: 650; }
         QToolButton#windowMinimizeButton, QToolButton#windowMaximizeButton,
@@ -151,7 +151,7 @@ QString applicationStyleSheet(bool dark)
         QPushButton:pressed { background: #E8F3FF; }
         QPushButton#primaryButton { background: #006EFF; border-color: #006EFF; color: white; }
         QPushButton#primaryButton:hover { background: #005FE5; }
-        QPushButton#hostAddButton { min-width: 30px; max-width: 30px; padding: 0; font-size: 18px; }
+        QPushButton#hostAddButton { min-width: 100px; padding: 0 12px; }
         QFrame#hostSidebar, QFrame#statusBar, QFrame#monitorIdentity { background: white; }
         QFrame#hostSidebar { border-right: 1px solid #DFE6EF; }
         QFrame#monitorIdentity { border-bottom: 1px solid #E4EAF1; }
@@ -335,6 +335,40 @@ QString applicationStyleSheet(bool dark)
             color: #8EA3B7; background: #132235; border: 0; border-bottom: 1px solid #22364C;
             min-height: 30px; padding: 0 8px;
         }
+        QTabWidget#connectionHomeTabs::pane { border: 0; background: #0C1825; }
+        QTabBar#connectionHomeTabBar { background: #0C1825; }
+        QTabBar#connectionHomeTabBar::tab {
+            color: #91A6BA; background: transparent; border: 0;
+            border-bottom: 2px solid transparent; padding: 10px 18px; font-size: 14px;
+        }
+        QTabBar#connectionHomeTabBar::tab:selected {
+            color: #EFF6FC; border-bottom-color: #00A9E8; font-weight: 650;
+        }
+        QTabBar#connectionHomeTabBar::tab:hover { color: #EFF6FC; background: #132235; }
+        QTabWidget#connectionHomeTabs QFrame#hostSidebar { background: #0C1825; border: 0; }
+        QTabWidget#connectionHomeTabs QLabel#hostManagementHint { color: #7F95AA; font-size: 12px; }
+        QTabWidget#connectionHomeTabs QLineEdit#hostSearch {
+            color: #D8E4EF; background: #101E2D; border: 1px solid #32495E;
+        }
+        QTabWidget#connectionHomeTabs QLineEdit#hostSearch:focus { border-color: #00A9E8; }
+        QTabWidget#connectionHomeTabs QPushButton#hostAddButton {
+            color: #EFF6FC; background: #17466F; border: 1px solid #2A6085;
+        }
+        QTabWidget#connectionHomeTabs QPushButton#hostAddButton:hover { background: #205B85; }
+        QTabWidget#connectionHomeTabs QTreeWidget#hostList {
+            color: #D8E4EF; background: #101E2D; alternate-background-color: #132235;
+            border: 1px solid #22364C; border-radius: 5px; outline: 0; padding: 0;
+        }
+        QTabWidget#connectionHomeTabs QTreeWidget::item {
+            min-height: 34px; padding: 0 8px; border: 0; border-radius: 0;
+        }
+        QTabWidget#connectionHomeTabs QTreeWidget::item:selected { color: white; background: #17466F; }
+        QTabWidget#connectionHomeTabs QTreeWidget::branch { background: transparent; }
+        QTabWidget#connectionHomeTabs QTreeWidget::branch:selected { background: #17466F; }
+        QTabWidget#connectionHomeTabs QTreeWidget QHeaderView::section {
+            color: #8EA3B7; background: #132235; border: 0; border-bottom: 1px solid #22364C;
+            min-height: 30px; padding: 0 8px;
+        }
         QLineEdit#terminalInput {
             background: #101E2D; border: 0; border-top: 1px solid #22364C;
             border-radius: 0; color: #F2F6FA; font-family: Menlo, Monaco, Consolas, monospace;
@@ -405,6 +439,17 @@ QString applicationStyleSheet(bool dark)
         }
         QLabel#terminalLoadingTitle { color: #F1F6FA; font-size: 15px; font-weight: 650; }
         QLabel#terminalLoadingDetail { color: #9FB1C2; font-size: 12px; }
+        QLineEdit#terminalConnectionPassword {
+            background: #071B2A; color: #E3EDF5; border: 1px solid #3A647E;
+            border-radius: 4px; padding: 7px; selection-background-color: #007DB8;
+        }
+        QCheckBox#terminalRememberPassword { color: #B9CCD9; background: transparent; }
+        QPushButton#terminalPasswordConnectButton {
+            background: #007DB8; color: white; border: 1px solid #168FC3;
+            border-radius: 4px; padding: 6px 10px;
+        }
+        QPushButton#terminalPasswordConnectButton:hover { background: #168DC3; }
+        QPushButton#terminalPasswordConnectButton:disabled { background: #23465D; color: #9FB1C2; }
         QProgressBar#terminalLoadingProgress { border: 0; border-radius: 2px; background: #263C50; }
         QProgressBar#terminalLoadingProgress::chunk { background: #1684FF; border-radius: 2px; }
         QTreeWidget {
@@ -468,11 +513,11 @@ QString applicationStyleSheet(bool dark)
             background: #111820;
         }
         QToolBar#windowControlsToolbar { background: #171F29; border-bottom: 1px solid #2A3542; }
-        QToolButton#sidebarToggleButton:hover, QToolButton#monitorToggleButton:hover,
+        QToolButton#monitorToggleButton:hover,
         QToolButton#terminalSettingsButton:hover, QToolButton#themeModeButton:hover {
             background: #263241; border-color: #3A495A;
         }
-        QToolButton#sidebarToggleButton:pressed, QToolButton#monitorToggleButton:pressed,
+        QToolButton#monitorToggleButton:pressed,
         QToolButton#terminalSettingsButton:pressed, QToolButton#themeModeButton:pressed {
             background: #303E4E;
         }

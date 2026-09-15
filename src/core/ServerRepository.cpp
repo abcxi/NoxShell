@@ -359,6 +359,32 @@ bool ServerRepository::saveServer(ServerProfile &profile)
     return true;
 }
 
+bool ServerRepository::replaceCredentialReference(const ServerProfile &expected, const QString &reference)
+{
+    // Compare-and-swap only the reference. Never resurrect a deleted host or
+    // overwrite a concurrent host/credential edit after an SSH login succeeds.
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("UPDATE servers SET credential_ref=?,updated_at=? WHERE id=? AND host=? "
+        "AND port=? AND user_name=? AND connection_mode=? AND authentication=? "
+        "AND private_key_path=? AND public_key_path=? AND credential_ref=?"));
+    query.addBindValue(reference);
+    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    query.addBindValue(expected.id);
+    query.addBindValue(nonNullText(expected.host));
+    query.addBindValue(expected.port);
+    query.addBindValue(nonNullText(expected.user));
+    query.addBindValue(static_cast<int>(expected.connectionMode));
+    query.addBindValue(static_cast<int>(expected.authentication));
+    query.addBindValue(nonNullText(expected.privateKeyPath));
+    query.addBindValue(nonNullText(expected.publicKeyPath));
+    query.addBindValue(nonNullText(expected.credentialRef));
+    if (!query.exec()) {
+        setError(QStringLiteral("保存凭据引用"), query.lastError().text());
+        return false;
+    }
+    return query.numRowsAffected() == 1;
+}
+
 bool ServerRepository::saveServerGroup(const QString &name)
 {
     const auto normalized = name.trimmed();

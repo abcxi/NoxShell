@@ -17,6 +17,7 @@
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QTabBar>
+#include <QTabWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -166,10 +167,17 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     m_emptyPage = new QWidget;
     m_emptyPage->setObjectName(QStringLiteral("terminalRecentPage"));
     auto *emptyLayout = new QVBoxLayout(m_emptyPage);
-    emptyLayout->setContentsMargins(34, 26, 34, 28);
-    emptyLayout->setSpacing(8);
-    auto *recentTitle = new QLabel(QStringLiteral("最近登录"));
-    recentTitle->setObjectName(QStringLiteral("recentLoginTitle"));
+    emptyLayout->setContentsMargins(22, 14, 22, 20);
+    m_homeTabs = new QTabWidget;
+    m_homeTabs->setObjectName(QStringLiteral("connectionHomeTabs"));
+    m_homeTabs->setDocumentMode(true);
+    m_homeTabs->tabBar()->setObjectName(QStringLiteral("connectionHomeTabBar"));
+    m_homeTabs->tabBar()->setExpanding(false);
+    m_homeTabs->tabBar()->setDrawBase(false);
+    auto *historyPage = new QWidget;
+    auto *historyLayout = new QVBoxLayout(historyPage);
+    historyLayout->setContentsMargins(0, 16, 0, 0);
+    historyLayout->setSpacing(12);
     auto *recentHint = new QLabel(QStringLiteral("双击最近登录记录可打开或返回 SSH 会话"));
     recentHint->setObjectName(QStringLiteral("recentLoginHint"));
     m_recentLogins = new QTreeWidget;
@@ -186,14 +194,21 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     m_recentLogins->header()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_recentLogins->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_recentLogins->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    m_recentEmptyLabel = new QLabel(QStringLiteral("暂无成功登录记录\n双击左侧主机即可开始连接"));
+    m_recentEmptyLabel = new QLabel(QStringLiteral("暂无成功登录记录\n在“服务器管理”中添加或双击服务器即可连接"));
     m_recentEmptyLabel->setObjectName(QStringLiteral("recentLoginEmpty"));
     m_recentEmptyLabel->setAlignment(Qt::AlignCenter);
-    emptyLayout->addWidget(recentTitle);
-    emptyLayout->addWidget(recentHint);
-    emptyLayout->addSpacing(6);
-    emptyLayout->addWidget(m_recentLogins, 1);
-    emptyLayout->addWidget(m_recentEmptyLabel, 1);
+    historyLayout->addWidget(recentHint);
+    historyLayout->addWidget(m_recentLogins, 1);
+    historyLayout->addWidget(m_recentEmptyLabel, 1);
+    m_serverManagerPage = new QWidget;
+    auto *managerLayout = new QVBoxLayout(m_serverManagerPage);
+    managerLayout->setContentsMargins(0, 16, 0, 0);
+    m_homeTabs->addTab(historyPage, QStringLiteral("访问历史"));
+    m_homeTabs->addTab(m_serverManagerPage, QStringLiteral("服务器管理"));
+    emptyLayout->addWidget(m_homeTabs);
+    connect(m_homeTabs, &QTabWidget::currentChanged, this, [this](int index) {
+        if (index == 0) refreshRecentLogins();
+    });
 
     m_sessionsPage = new QWidget;
     m_sessionsPage->setObjectName(QStringLiteral("terminalSessionsPage"));
@@ -243,7 +258,8 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     auto *newTabButton = new QToolButton(toolbar);
     newTabButton->setObjectName(QStringLiteral("terminalNewTabButton"));
     newTabButton->setText(QStringLiteral("+"));
-    newTabButton->setToolTip(QStringLiteral("打开起始页"));
+    newTabButton->setToolTip(QStringLiteral("服务器管理 / 新建连接"));
+    newTabButton->setAccessibleName(QStringLiteral("打开服务器管理"));
     newTabButton->setFixedSize(28, 28);
     toolbar->setControls(m_tabs, newTabButton);
 
@@ -252,6 +268,9 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     sessionsLayout->addWidget(m_stack, 1);
     m_viewStack->addWidget(m_emptyPage);
     m_viewStack->addWidget(m_sessionsPage);
+    connect(m_viewStack, &QStackedWidget::currentChanged, this, [this] {
+        emit homePageVisibilityChanged(isHomePageVisible());
+    });
     layout->addWidget(toolbar);
     layout->addWidget(m_viewStack, 1);
 
@@ -268,11 +287,7 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
         m_viewStack->setCurrentWidget(m_sessionsPage);
         publishActiveSession();
     });
-    connect(newTabButton, &QToolButton::clicked, this, [this] {
-        refreshRecentLogins();
-        m_viewStack->setCurrentWidget(m_emptyPage);
-        emit hostSidebarVisibilityRequested(true);
-    });
+    connect(newTabButton, &QToolButton::clicked, this, &TerminalWorkspace::showServerManager);
     connect(m_tabs, &QTabBar::tabCloseRequested, this, &TerminalWorkspace::closeSession);
     connect(m_tabs, &QTabBar::customContextMenuRequested, this,
         [this](const QPoint &position) {
@@ -290,9 +305,15 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     connect(m_connectAction, &QAction::triggered, this, [this] {
         if (m_tabContextIndex < 0 || m_tabContextIndex >= m_stack->count()) return;
         auto *page = m_stack->widget(m_tabContextIndex);
-        const auto profile = page->property("serverProfile").value<ServerProfile>();
+        const auto next = page->property("nextConnectionProfile");
+        const auto profile = (next.isValid() ? next : page->property("serverProfile")).value<ServerProfile>();
         if (profile.id.isEmpty()) return;
+        page->setProperty("serverProfile", QVariant::fromValue(profile));
+        page->setProperty("nextConnectionProfile", {});
+        page->setProperty("serverConfigurationCurrent", true);
+        m_tabs->setTabText(m_tabContextIndex, compactTabTitle(profile.name));
         if (auto *panel = page->findChild<TerminalPanel *>()) panel->connectToServer(profile);
+        publishActiveSession();
     });
     connect(m_disconnectAction, &QAction::triggered, this, [this] {
         if (m_tabContextIndex < 0 || m_tabContextIndex >= m_stack->count()) return;
@@ -319,12 +340,29 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
         });
         if (found != servers.cend()) {
             openOrActivate(*found, true);
-            emit hostSidebarVisibilityRequested(false);
         }
     });
 
     refreshRecentLogins();
     updateWorkspaceState();
+}
+
+void TerminalWorkspace::setServerManager(QWidget *manager)
+{
+    if (manager) m_serverManagerPage->layout()->addWidget(manager);
+}
+
+void TerminalWorkspace::showServerManager()
+{
+    // Only switch the view. Existing SSH channels, monitor sampling and SFTP
+    // state belong to the session tabs and must remain untouched.
+    m_homeTabs->setCurrentIndex(1);
+    m_viewStack->setCurrentWidget(m_emptyPage);
+}
+
+bool TerminalWorkspace::isHomePageVisible() const
+{
+    return m_viewStack->currentWidget() == m_emptyPage;
 }
 
 bool TerminalWorkspace::prepareTabContextMenu(int index)
@@ -352,6 +390,16 @@ bool TerminalWorkspace::hasConnectedSession(const QString &serverId) const
         if (const auto *panel = m_stack->widget(index)->findChild<TerminalPanel *>(); panel && panel->isConnected()) {
             return true;
         }
+    }
+    return false;
+}
+
+bool TerminalWorkspace::hasConnectingSession(const QString &serverId) const
+{
+    for (int index = 0; index < m_tabs->count(); ++index) {
+        if (m_tabs->tabData(index).toString() != serverId) continue;
+        const auto *session = m_stack->widget(index)->findChild<SshSession *>();
+        if (session && session->isConnecting()) return true;
     }
     return false;
 }
@@ -400,7 +448,9 @@ void TerminalWorkspace::duplicateSession(const ServerProfile &profile)
 void TerminalWorkspace::duplicateSessionAt(int index)
 {
     if (index < 0 || index >= m_stack->count()) return;
-    const auto profile = m_stack->widget(index)->property("serverProfile").value<ServerProfile>();
+    const auto *page = m_stack->widget(index);
+    const auto next = page->property("nextConnectionProfile");
+    const auto profile = (next.isValid() ? next : page->property("serverProfile")).value<ServerProfile>();
     if (!profile.id.isEmpty()) duplicateSession(profile);
 }
 
@@ -410,9 +460,13 @@ void TerminalWorkspace::updateServer(const ServerProfile &profile)
         if (m_tabs->tabData(index).toString() != profile.id) continue;
         // A running terminal is an immutable connection snapshot. Editing the
         // saved host must not rewrite, clear or reconnect that existing SSH
-        // channel. The next explicit Connect action creates a new tab using
-        // the newly saved profile.
+        // channel. Keep the next-connection configuration separate so a tab
+        // reconnect/duplicate cannot accidentally reuse the previous password.
         auto *page = m_stack->widget(index);
+        auto next = profile;
+        next.password.clear();
+        next.keyPassphrase.clear();
+        page->setProperty("nextConnectionProfile", QVariant::fromValue(next));
         page->setProperty("serverConfigurationCurrent", false);
     }
 }
@@ -453,6 +507,11 @@ void TerminalWorkspace::addSession(const ServerProfile &profile, bool activate, 
     });
     connect(panel, &TerminalPanel::fileWorkspaceToggleRequested,
         this, &TerminalWorkspace::fileWorkspaceToggleRequested);
+    connect(session, &SshSession::credentialReferenceChanged, this, [page](const ServerProfile &saved) {
+        auto profile = page->property("serverProfile").value<ServerProfile>();
+        profile.credentialRef = saved.credentialRef;
+        page->setProperty("serverProfile", QVariant::fromValue(profile));
+    });
     connect(session, &SshSession::connectionChanged, this, [this, page](bool connected, const QString &message) {
         const auto profile = page->property("serverProfile").value<ServerProfile>();
         const auto phase = connected ? TabConnectionPhase::Connected
@@ -500,10 +559,11 @@ void TerminalWorkspace::addSession(const ServerProfile &profile, bool activate, 
         m_stack->setCurrentIndex(m_tabs->currentIndex());
         publishActiveSession();
     }
-    if (connectNow) panel->connectToServer(profile);
     updateWorkspaceState();
     emit sessionCountChanged(m_tabs->count());
     if (persist) persistState();
+    // Finish exposing the tab before a native credential dialog can block.
+    if (connectNow) panel->connectToServer(profile);
 }
 
 void TerminalWorkspace::installCloseButton(int index)
@@ -545,7 +605,10 @@ void TerminalWorkspace::closeSession(int index)
         m_stack->removeWidget(page);
     }
     if (!profile.id.isEmpty()) emit sessionConnectionChanged(profile.id, false, QStringLiteral("SSH 标签已关闭"));
-    if (session) emit sessionClosed(session);
+    if (session) {
+        session->disconnectFromHost();
+        emit sessionClosed(session);
+    }
     page->deleteLater();
     if (m_tabs->currentIndex() >= 0 && m_tabs->currentIndex() < m_stack->count()) {
         m_stack->setCurrentIndex(m_tabs->currentIndex());

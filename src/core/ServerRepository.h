@@ -50,6 +50,7 @@ public:
     [[nodiscard]] QVector<ServerProfile> loadServers();
     [[nodiscard]] QStringList loadServerGroups();
     bool saveServer(ServerProfile &profile);
+    bool replaceCredentialReference(const ServerProfile &expected, const QString &reference);
     bool saveServerGroup(const QString &name);
     bool renameServerGroup(const QString &oldName, const QString &newName);
     bool deleteServerGroup(const QString &name);

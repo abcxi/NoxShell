@@ -1,4 +1,5 @@
 #include "TerminalPanel.h"
+#include <QCheckBox>
 
 #include "../core/SshSession.h"
 #include "../core/ServerRepository.h"
@@ -11,6 +12,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QProgressBar>
+#include <QPushButton>
 #include <QShortcut>
 #include <QStackedLayout>
 #include <QToolButton>
@@ -67,6 +69,7 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
     m_loadingDetail->setObjectName(QStringLiteral("terminalLoadingDetail"));
     m_loadingDetail->setAlignment(Qt::AlignCenter);
     m_loadingDetail->setWordWrap(true);
+    m_loadingDetail->setTextFormat(Qt::PlainText);
     auto *loadingProgress = new QProgressBar;
     loadingProgress->setObjectName(QStringLiteral("terminalLoadingProgress"));
     loadingProgress->setRange(0, 0);
@@ -75,6 +78,56 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
     loadingLayout->addWidget(loadingTitle, 0, Qt::AlignCenter);
     loadingLayout->addWidget(m_loadingDetail);
     loadingLayout->addWidget(loadingProgress);
+    m_passwordForm = new QWidget;
+    auto *passwordLayout = new QVBoxLayout(m_passwordForm);
+    passwordLayout->setContentsMargins(0, 0, 0, 0);
+    m_connectionPassword = new QLineEdit;
+    m_connectionPassword->setObjectName(QStringLiteral("terminalConnectionPassword"));
+    m_connectionPassword->setEchoMode(QLineEdit::Password);
+    m_connectionPassword->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
+        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
+    m_rememberPassword = new QCheckBox(QStringLiteral("记住密码（系统加密保存）"));
+    m_rememberPassword->setObjectName(QStringLiteral("terminalRememberPassword"));
+    m_rememberPassword->setChecked(true);
+    m_passwordConnectButton = new QPushButton(QStringLiteral("连接"));
+    m_passwordConnectButton->setObjectName(QStringLiteral("terminalPasswordConnectButton"));
+    passwordLayout->addWidget(m_connectionPassword);
+    passwordLayout->addWidget(m_rememberPassword);
+    passwordLayout->addWidget(m_passwordConnectButton);
+    m_passwordForm->hide();
+    loadingLayout->addWidget(m_passwordForm);
+    connect(m_passwordConnectButton, &QPushButton::clicked, this, [this] {
+        if (m_session->profile().authentication == AuthenticationMethod::Password
+            && m_connectionPassword->text().isEmpty()) {
+            m_connectionPassword->setFocus();
+            return;
+        }
+        const auto password = m_connectionPassword->text();
+        m_connectionPassword->clear();
+        m_session->connectWithPassword(password, m_rememberPassword->isChecked());
+    });
+    connect(m_connectionPassword, &QLineEdit::returnPressed, m_passwordConnectButton, &QPushButton::click);
+    connect(m_session, &SshSession::passwordRequired, this,
+        [this, loadingTitle, loadingProgress](const QString &reason) {
+            const auto profile = m_session->profile();
+            const bool privateKey = profile.authentication == AuthenticationMethod::PrivateKey;
+            loadingTitle->setText(privateKey ? QStringLiteral("输入 SSH 私钥口令") : QStringLiteral("输入 SSH 密码"));
+            m_loadingDetail->setText(QStringLiteral("%1@%2:%3\n%4")
+                .arg(profile.user, profile.host).arg(profile.port).arg(reason));
+            m_connectionPassword->setPlaceholderText(privateKey ? QStringLiteral("私钥口令（无口令可留空）") : QStringLiteral("服务器的 SSH 密码"));
+            loadingProgress->hide();
+            m_passwordForm->show();
+            m_loadingOverlay->show();
+            m_loadingOverlay->raise();
+            m_connectionPassword->setFocus();
+        });
+    connect(m_session, &SshSession::connectionChanged, this,
+        [this, loadingTitle, loadingProgress](bool, const QString &) {
+            m_passwordForm->hide();
+            m_connectionPassword->clear();
+            loadingTitle->setText(QStringLiteral("正在建立 SSH 连接"));
+            loadingProgress->show();
+        });
     centerRow->addWidget(loadingCard);
     centerRow->addStretch();
     overlayLayout->addLayout(centerRow);
@@ -192,6 +245,8 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
 
 void TerminalPanel::setServer(const ServerProfile &profile)
 {
+    m_passwordForm->hide();
+    m_connectionPassword->clear();
     m_profile = profile;
     m_commandHistory->setServerId(profile.id);
     m_output->clear();
@@ -213,7 +268,7 @@ void TerminalPanel::setFileWorkspaceVisible(bool visible)
 
 void TerminalPanel::connectToServer(const ServerProfile &profile)
 {
-    if (m_session->isConnected() && m_session->profile().id == profile.id) {
+    if ((m_session->isConnected() || m_session->isConnecting()) && m_session->profile().id == profile.id) {
         m_output->setFocus();
         return;
     }

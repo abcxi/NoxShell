@@ -7,13 +7,16 @@
 #include <QDateTime>
 #include <QDir>
 #include <QMetaObject>
+#include <QPointer>
 #include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
 #include <QTimer>
+#include <QUuid>
 
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 namespace noxshell {
 
@@ -55,10 +58,8 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     connect(this, &SshSession::removePathRequested, m_worker, &Libssh2Worker::removePath, Qt::QueuedConnection);
     connect(this, &SshSession::changePermissionsRequested, m_worker, &Libssh2Worker::changePermissions, Qt::QueuedConnection);
     connect(this, &SshSession::hostKeyApprovalRequested, m_worker, &Libssh2Worker::approveHostKey, Qt::QueuedConnection);
-    connect(m_worker, &Libssh2Worker::connectionChanged, this, [this](bool connected, const QString &message) {
-        m_connected = connected;
-        emit connectionChanged(connected, message);
-    });
+    connect(m_worker, &Libssh2Worker::connectionChanged, this, &SshSession::handleConnectionChanged);
+    connect(m_worker, &Libssh2Worker::passwordAuthenticationRejected, this, &SshSession::handlePasswordRejected);
     connect(m_worker, &Libssh2Worker::outputReceived, this, &SshSession::outputReceived);
     connect(m_worker, &Libssh2Worker::rawOutputReceived, this, &SshSession::rawOutputReceived);
     connect(m_worker, &Libssh2Worker::promptChanged, this, &SshSession::promptChanged);
@@ -174,13 +175,37 @@ SshSession::~SshSession()
 
 void SshSession::connectTo(const ServerProfile &profile)
 {
+    connectToImpl(profile, false);
+}
+
+void SshSession::connectWithPassword(const QString &password, bool remember)
+{
+    if (!m_waitingForPassword || m_connecting || m_loadingCredentials) return;
+    auto profile = m_profile;
+    if (profile.authentication == AuthenticationMethod::Password) {
+        if (password.isEmpty()) return;
+        profile.password = password;
+    } else {
+        profile.keyPassphrase = password; // Empty is valid for an unencrypted key.
+    }
+    connectToImpl(profile, true, remember);
+}
+
+void SshSession::connectToImpl(const ServerProfile &profile, bool suppliedSecret, bool remember)
+{
+    // A credential provider/callback may reenter. Do not duplicate its read.
+    if (m_loadingCredentials) return;
     disconnectFromHost();
+    const auto attempt = m_connectionAttempt;
+    const QPointer<SshSession> lifetime(this);
+    m_transportGeneration = m_worker->connectionGeneration();
     m_profile = profile;
     // Public/session metadata must not retain copies of connection credentials.
     m_profile.password.clear();
     m_profile.keyPassphrase.clear();
     m_demo = profile.connectionMode == ConnectionMode::Demo;
     m_connected = false;
+    m_connecting = true;
     m_metricsInFlight = false;
     ++m_metricRequestId;
     ++m_directoryGeneration;
@@ -208,22 +233,97 @@ void SshSession::connectTo(const ServerProfile &profile)
     }
     const bool needsStoredSecret = (request.authentication == AuthenticationMethod::Password && request.password.isEmpty())
         || (request.authentication == AuthenticationMethod::PrivateKey && request.keyPassphrase.isEmpty());
-    if (needsStoredSecret && m_credentialStore && !request.credentialRef.isEmpty()) {
+    if (!suppliedSecret && needsStoredSecret && m_credentialStore && !request.credentialRef.isEmpty()) {
+        m_loadingCredentials = true;
+        emit connectionChanged(false, QStringLiteral("正在读取已保存的连接密码…"));
+        if (!lifetime || attempt != m_connectionAttempt) return;
         const auto secret = m_credentialStore->load(request.credentialRef);
+        // Closing/canceling a tab invalidates a credential provider's result.
+        if (!lifetime || attempt != m_connectionAttempt) return;
+        m_loadingCredentials = false;
         if (!m_credentialStore->lastError().isEmpty()) {
-            emit connectionChanged(false, QStringLiteral("SSH 凭据读取失败：%1；请解锁系统凭据库或重新输入凭据")
-                .arg(m_credentialStore->lastError()));
+            m_connecting = false;
+            m_waitingForPassword = true;
+            emit connectionChanged(false, QStringLiteral("已存密码不可读取，请输入此服务器的 SSH 密码"));
+            if (lifetime && attempt == m_connectionAttempt) emit passwordRequired(QStringLiteral("已存密码暂不可读取，请输入服务器凭据。无需 Mac 密码。"));
             return;
         }
         if (request.password.isEmpty()) request.password = secret.password;
         if (request.keyPassphrase.isEmpty()) request.keyPassphrase = secret.keyPassphrase;
     }
+    if (request.authentication == AuthenticationMethod::Password && request.password.isEmpty()) {
+        m_connecting = false;
+        m_waitingForPassword = true;
+        emit connectionChanged(false, QStringLiteral("请输入此服务器的 SSH 密码"));
+        if (lifetime && attempt == m_connectionAttempt) emit passwordRequired(QStringLiteral("请输入服务器的 SSH 密码。无需 Mac 密码。"));
+        return;
+    }
+    if (suppliedSecret && remember) m_credentialToRemember = CredentialSecret{request.password, request.keyPassphrase};
     emit connectionChanged(false, QStringLiteral("正在连接 %1:%2…").arg(request.host).arg(request.port));
-    emit connectRequested(request, m_worker->connectionGeneration());
+    if (!lifetime || attempt != m_connectionAttempt) return;
+    emit connectRequested(request, m_transportGeneration);
+}
+
+void SshSession::handleConnectionChanged(bool connected, const QString &message, quint64 generation)
+{
+    if (generation != m_transportGeneration) return;
+    m_connected = connected;
+    m_connecting = !connected && (message.startsWith(QStringLiteral("正在"))
+        || message.startsWith(QStringLiteral("TCP 连接")) || message.startsWith(QStringLiteral("等待确认")));
+    const QPointer<SshSession> lifetime(this);
+    if (connected) rememberSuccessfulCredential();
+    else if (!m_connecting) m_credentialToRemember.reset();
+    if (lifetime && generation == m_transportGeneration) emit connectionChanged(connected, message);
+}
+
+void SshSession::handlePasswordRejected(quint64 generation)
+{
+    if (generation != m_transportGeneration || m_connected || m_connecting || m_loadingCredentials) return;
+    m_credentialToRemember.reset();
+    m_waitingForPassword = true;
+    emit passwordRequired(QStringLiteral("服务器未完成本次密码认证。请核对上方账号和端口后重试；将直接使用本次输入，不读取旧密码，也不会自动重试。"));
+}
+
+void SshSession::rememberSuccessfulCredential()
+{
+    if (!m_credentialToRemember) return;
+    const auto secret = std::exchange(m_credentialToRemember, std::nullopt).value();
+    // Never overwrite an inaccessible old item. Commit only after authentication
+    // and only if the saved host still matches this attempt (no stale edit/delete).
+    if (!m_repository || !m_credentialStore) return;
+    for (auto saved : m_repository->loadServers()) {
+        if (saved.id != m_profile.id) continue;
+        if (saved.host != m_profile.host || saved.port != m_profile.port || saved.user != m_profile.user
+            || saved.authentication != m_profile.authentication || saved.privateKeyPath != m_profile.privateKeyPath
+            || saved.publicKeyPath != m_profile.publicKeyPath
+            || saved.credentialRef != m_profile.credentialRef || saved.connectionMode != m_profile.connectionMode) return;
+        const auto reference = QStringLiteral("server/%1/%2").arg(saved.id, QUuid::createUuid().toString(QUuid::WithoutBraces));
+        if (!m_credentialStore->save(reference, secret)) {
+            emit credentialSaveNotice(QStringLiteral("已连接；密码仅用于本次连接，系统加密存储当前不可写"));
+            return;
+        }
+        if (!m_repository->replaceCredentialReference(saved, reference)) {
+            m_credentialStore->remove(reference); // Only the new item created by this attempt.
+            emit credentialSaveNotice(QStringLiteral("已连接；密码未记住，主机配置保存失败"));
+            return;
+        }
+        saved.credentialRef = reference;
+        m_profile.credentialRef = reference;
+        emit credentialReferenceChanged(saved);
+        return;
+    }
 }
 
 void SshSession::disconnectFromHost()
 {
+    m_waitingForPassword = false;
+    m_credentialToRemember.reset();
+    const bool wasActive = m_connected || m_connecting;
+    ++m_connectionAttempt;
+    m_transportGeneration = 0;
+    m_connecting = false;
+    m_loadingCredentials = false;
+    m_connected = false;
     m_metricsInFlight = false;
     ++m_metricRequestId;
     m_metricsCooldown.invalidate();
@@ -241,13 +341,8 @@ void SshSession::disconnectFromHost()
     m_activeTransferTaskId = 0;
     ++m_directoryGeneration;
     m_directoryRequestSerial = 0;
-    if (m_demo) {
-        if (m_connected) {
-            m_connected = false;
-            emit connectionChanged(false, QStringLiteral("SSH 已断开"));
-        }
-        return;
-    }
+    if (wasActive) emit connectionChanged(false, QStringLiteral("SSH 已断开"));
+    if (m_demo) return;
     if (m_workerThread.isRunning()) {
         m_worker->cancelConnection();
         emit disconnectRequested();
@@ -869,11 +964,13 @@ void SshSession::approveHostKey(bool approved)
 void SshSession::connectDemo()
 {
     emit connectionChanged(false, QStringLiteral("正在连接演示主机 %1…").arg(m_profile.host));
-    QTimer::singleShot(260, this, [this] {
-        if (!m_demo) {
+    const auto attempt = m_connectionAttempt;
+    QTimer::singleShot(260, this, [this, attempt] {
+        if (!m_demo || attempt != m_connectionAttempt) {
             return;
         }
         m_connected = true;
+        m_connecting = false;
         emit outputReceived(QStringLiteral(
             "Last login: %1 from 10.0.8.17\n"
             "当前为本地演示会话；通过新增/编辑主机并选择“真实 SSH”可建立远端连接。\n")

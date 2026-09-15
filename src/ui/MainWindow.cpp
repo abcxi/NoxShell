@@ -1,5 +1,7 @@
 #include "MainWindow.h"
 
+#include <QPointer>
+
 #include "../core/SshSession.h"
 #include "../core/CredentialStore.h"
 #include "../core/ServerRepository.h"
@@ -156,21 +158,11 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
     auto servers = m_repository->loadServers();
     for (auto &server : servers) server.state = ServerState::Offline;
     m_sidebar = new HostSidebar(std::move(servers), m_repository->loadServerGroups());
-    bodyLayout->addWidget(m_sidebar);
     bodyLayout->addWidget(createWorkspace(), 1);
     rootLayout->addWidget(body, 1);
     rootLayout->addWidget(createStatusBar());
     setCentralWidget(root);
 
-    // 主机列表只在选择新会话时按需展开，启动时为终端和文件区
-    // 保留更多可用空间。
-    setSidebarVisible(false);
-
-    if (m_sidebarToggleButton) {
-        connect(m_sidebarToggleButton, &QToolButton::clicked, this, [this] {
-            setSidebarVisible(m_sidebar->isHidden());
-        });
-    }
     if (m_monitorToggleButton) {
         connect(m_monitorToggleButton, &QToolButton::clicked, this, [this] {
             setMonitorVisible(m_monitorRail->isHidden());
@@ -181,30 +173,26 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
         QTimer::singleShot(0, this, [this] {
             const auto install = [this] {
                 return installMacTitleBarControls(this,
-                    [this] { setSidebarVisible(m_sidebar->isHidden()); },
                     [this] { setMonitorVisible(m_monitorRail->isHidden()); },
                     [this] { showTerminalSettings(); },
                     [this](int mode) { setThemeMode(static_cast<ThemeMode>(mode)); },
                     static_cast<int>(m_themeMode));
             };
             if (install()) {
-                updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
-                    m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
-                qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
+                updateMacTitleBarControls(this, m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
+                qInfo().noquote() << QStringLiteral("macOS 原生标题栏控件已安装");
             } else {
                 QTimer::singleShot(100, this, [this] {
                     const bool installed = installMacTitleBarControls(this,
-                        [this] { setSidebarVisible(m_sidebar->isHidden()); },
                         [this] { setMonitorVisible(m_monitorRail->isHidden()); },
                         [this] { showTerminalSettings(); },
                         [this](int mode) { setThemeMode(static_cast<ThemeMode>(mode)); },
                         static_cast<int>(m_themeMode));
                     if (installed) {
-                        updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
-                            m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
-                        qInfo().noquote() << QStringLiteral("macOS 原生标题栏双栏开关已安装");
+                        updateMacTitleBarControls(this, m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
+                        qInfo().noquote() << QStringLiteral("macOS 原生标题栏控件已安装");
                     }
-                    else qWarning().noquote() << QStringLiteral("macOS 原生标题栏双栏开关安装失败");
+                    else qWarning().noquote() << QStringLiteral("macOS 原生标题栏控件安装失败");
                 });
             }
         });
@@ -212,9 +200,6 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
 #endif
 
     connect(m_sidebar, &HostSidebar::serverConnectRequested, this, &MainWindow::connectToServer);
-    connect(m_sidebar, &HostSidebar::collapseRequested, this, [this] {
-        setSidebarVisible(false);
-    });
     connect(m_sidebar, &HostSidebar::serverEditRequested, this, &MainWindow::selectAndEditServer);
     connect(m_sidebar, &HostSidebar::serverDuplicateRequested, this, &MainWindow::duplicateServer);
     connect(m_sidebar, &HostSidebar::serverDeleteRequested, this, &MainWindow::selectAndDeleteServer);
@@ -292,14 +277,6 @@ QToolBar *MainWindow::createWindowToolbar()
     toolbar->setIconSize(QSize(20, 20));
     toolbar->setFixedHeight(34);
 
-    m_sidebarToggleButton = new QToolButton;
-    m_sidebarToggleButton->setObjectName(QStringLiteral("sidebarToggleButton"));
-    m_sidebarToggleButton->setIcon(QIcon(QStringLiteral(":/assets/sidebar-collapse.svg")));
-    m_sidebarToggleButton->setIconSize(QSize(20, 20));
-    m_sidebarToggleButton->setFixedSize(30, 28);
-    m_sidebarToggleButton->setToolTip(QStringLiteral("隐藏主机列表"));
-    m_sidebarToggleButton->setAccessibleName(QStringLiteral("隐藏主机列表"));
-
     m_monitorToggleButton = new QToolButton;
     m_monitorToggleButton->setObjectName(QStringLiteral("monitorToggleButton"));
     m_monitorToggleButton->setIcon(QIcon(QStringLiteral(":/assets/monitor-collapse.svg")));
@@ -343,7 +320,6 @@ QToolBar *MainWindow::createWindowToolbar()
         setThemeMode(static_cast<ThemeMode>(action->data().toInt()));
     });
 
-    toolbar->addWidget(m_sidebarToggleButton);
     toolbar->addWidget(m_monitorToggleButton);
     toolbar->addWidget(m_settingsButton);
 
@@ -487,27 +463,8 @@ void MainWindow::updateThemePresentation()
     }
 #ifdef Q_OS_MACOS
     if (m_nativeTitleBarControls) {
-        updateMacTitleBarControls(this, m_sidebar && m_sidebar->isVisible(),
-            m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
+        updateMacTitleBarControls(this, m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
     }
-#endif
-}
-
-void MainWindow::setSidebarVisible(bool visible)
-{
-    if (!m_sidebar) return;
-    m_sidebar->setVisible(visible);
-    const auto action = visible ? QStringLiteral("隐藏主机列表") : QStringLiteral("显示主机列表");
-    if (m_sidebarToggleButton) {
-        m_sidebarToggleButton->setIcon(QIcon(visible
-                ? QStringLiteral(":/assets/sidebar-collapse.svg")
-                : QStringLiteral(":/assets/sidebar-expand.svg")));
-        m_sidebarToggleButton->setToolTip(action);
-        m_sidebarToggleButton->setAccessibleName(action);
-    }
-#ifdef Q_OS_MACOS
-    if (m_nativeTitleBarControls) updateMacTitleBarControls(this, visible,
-        m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
 #endif
 }
 
@@ -524,20 +481,39 @@ void MainWindow::setMonitorVisible(bool visible)
         m_monitorToggleButton->setAccessibleName(action);
     }
 #ifdef Q_OS_MACOS
-    if (m_nativeTitleBarControls) updateMacTitleBarControls(this,
-        m_sidebar && m_sidebar->isVisible(), visible, static_cast<int>(m_themeMode));
+    if (m_nativeTitleBarControls) updateMacTitleBarControls(this, visible, static_cast<int>(m_themeMode));
 #endif
 }
 
 void MainWindow::setFileWorkspaceVisible(bool visible)
 {
     m_fileWorkspaceVisible = visible;
-    if (m_fileWorkspacePane) m_fileWorkspacePane->setVisible(visible);
-    if (visible && m_terminalFileSplitter) {
-        const int available = qMax(400, m_terminalFileSplitter->height());
-        m_terminalFileSplitter->setSizes({available * 65 / 100, available * 35 / 100});
-    }
+    updateFileWorkspaceVisibility();
     if (m_terminalWorkspace) m_terminalWorkspace->setFileWorkspaceVisible(visible);
+}
+
+void MainWindow::updateFileWorkspaceVisibility()
+{
+    if (!m_fileWorkspacePane || !m_terminalFileSplitter || !m_terminalWorkspace) return;
+    // The home page uses the whole right-hand workspace. This temporary layout
+    // change must not overwrite the user's file-panel preference or split ratio.
+    const bool visible = m_fileWorkspaceVisible && !m_terminalWorkspace->isHomePageVisible();
+    if (!visible) {
+        if (m_terminalFileSplitSizes.isEmpty() && m_fileWorkspacePane->isVisible()) {
+            const auto sizes = m_terminalFileSplitter->sizes();
+            if (sizes.size() == 2 && sizes.at(0) > 0 && sizes.at(1) > 0)
+                m_terminalFileSplitSizes = sizes;
+        }
+        m_fileWorkspacePane->hide();
+    } else if (m_fileWorkspacePane->isHidden()) {
+        m_fileWorkspacePane->show();
+        if (m_terminalFileSplitSizes.size() == 2) {
+            m_terminalFileSplitter->setSizes(m_terminalFileSplitSizes);
+        } else {
+            const int available = qMax(400, m_terminalFileSplitter->height());
+            m_terminalFileSplitter->setSizes({available * 65 / 100, available * 35 / 100});
+        }
+    }
 }
 
 QWidget *MainWindow::createWorkspace()
@@ -567,6 +543,11 @@ QWidget *MainWindow::createWorkspace()
     terminalFileSplitter->setStretchFactor(0, 65);
     terminalFileSplitter->setStretchFactor(1, 35);
     terminalFileSplitter->setSizes({560, 300});
+    connect(terminalFileSplitter, &QSplitter::splitterMoved, this, [this] {
+        if (m_fileWorkspacePane->isVisible())
+            m_terminalFileSplitSizes = m_terminalFileSplitter->sizes();
+    });
+    updateFileWorkspaceVisibility();
     operationsLayout->addWidget(terminalFileSplitter, 1);
 
     mainSplitter->addWidget(operations);
@@ -684,6 +665,9 @@ QWidget *MainWindow::createTerminalWorkspace()
     layout->setContentsMargins(8, 8, 8, 4);
     layout->setSpacing(0);
     m_terminalWorkspace = new TerminalWorkspace(m_repository, m_credentialStore);
+    m_terminalWorkspace->setServerManager(m_sidebar);
+    connect(m_terminalWorkspace, &TerminalWorkspace::homePageVisibilityChanged,
+        this, &MainWindow::updateFileWorkspaceVisibility);
     layout->addWidget(m_terminalWorkspace);
     connect(m_terminalWorkspace, &TerminalWorkspace::activeSessionChanged,
         this, &MainWindow::activateTerminalSession);
@@ -704,8 +688,6 @@ QWidget *MainWindow::createTerminalWorkspace()
     connect(m_terminalWorkspace, &TerminalWorkspace::fileWorkspaceToggleRequested, this, [this] {
         setFileWorkspaceVisible(!m_fileWorkspaceVisible);
     });
-    connect(m_terminalWorkspace, &TerminalWorkspace::hostSidebarVisibilityRequested,
-        this, &MainWindow::setSidebarVisible);
     return container;
 }
 
@@ -755,6 +737,16 @@ QWidget *MainWindow::createStatusBar()
     layout->addWidget(safe);
     layout->addSpacing(15);
     layout->addWidget(m_sampleStatus);
+    m_rdpCredentialButton = new QPushButton;
+    m_rdpCredentialButton->setObjectName(QStringLiteral("rdpEnterPasswordButton"));
+    m_rdpCredentialButton->hide();
+    layout->addWidget(m_rdpCredentialButton);
+    connect(m_rdpCredentialButton, &QPushButton::clicked, this, [this] {
+        if (m_pendingCredentialProfile.id.isEmpty()) return;
+        const auto profile = m_pendingCredentialProfile;
+        // Reuse the existing remote-password editor, never a system unlock UI.
+        editServer(profile);
+    });
     layout->addStretch();
     layout->addWidget(version);
     return bar;
@@ -787,6 +779,8 @@ void MainWindow::selectServer(const ServerProfile &profile)
         m_currentServer.state = ServerState::Online;
         m_sidebar->setServerState(profile.id, ServerState::Online);
         setConnectionBadge(QStringLiteral("● 在线"), QStringLiteral("#008858"), QStringLiteral("#E8F8F2"));
+    } else if (m_terminalWorkspace && m_terminalWorkspace->hasConnectingSession(profile.id)) {
+        setConnectionBadge(QStringLiteral("◌ 连接中"), QStringLiteral("#006EFF"), QStringLiteral("#E8F3FF"));
     } else {
         m_currentServer.state = ServerState::Offline;
         m_sidebar->setServerState(profile.id, ServerState::Offline);
@@ -812,6 +806,13 @@ void MainWindow::bindSession(SshSession *session)
 {
     if (!session || m_boundSessions.contains(session)) return;
     m_boundSessions.insert(session);
+    connect(session, &SshSession::credentialReferenceChanged, this, [this](const ServerProfile &saved) {
+        m_sidebar->updateServer(saved);
+        if (m_currentServer.id == saved.id) m_currentServer.credentialRef = saved.credentialRef;
+    });
+    connect(session, &SshSession::credentialSaveNotice, this, [this](const QString &message) {
+        if (m_sampleStatus) m_sampleStatus->setText(message);
+    });
     connect(session, &SshSession::metricSampleReceived, this, [this, session](const MetricSample &sample) {
         if (session == m_session) displayMetrics(sample);
     });
@@ -866,12 +867,28 @@ void MainWindow::showFilePanel(const ServerProfile &profile, SshSession *session
 
 void MainWindow::connectToServer(const ServerProfile &profile)
 {
-    if (profile.id.isEmpty()) return;
+    if (profile.id.isEmpty() || m_readingRdpCredentials) return;
+    m_rdpCredentialButton->hide();
+    m_pendingCredentialProfile = {};
     selectServer(profile);
     if (profile.connectionMode == ConnectionMode::Rdp) {
         auto launchProfile = profile;
-        if (!profile.credentialRef.isEmpty()) {
-            launchProfile.password = m_credentialStore->load(profile.credentialRef).password;
+        if (launchProfile.password.isEmpty() && !profile.credentialRef.isEmpty()) {
+            m_readingRdpCredentials = true;
+            const QPointer<MainWindow> lifetime(this);
+            const auto secret = m_credentialStore->load(profile.credentialRef);
+            if (!lifetime) return;
+            m_readingRdpCredentials = false;
+            if (!m_credentialStore->lastError().isEmpty()) {
+                m_sampleStatus->setText(QStringLiteral("RDP 凭据读取未完成；尚未启动远程桌面客户端"));
+                m_pendingCredentialProfile = profile;
+                m_pendingCredentialProfile.password.clear();
+                m_pendingCredentialProfile.keyPassphrase.clear();
+                m_rdpCredentialButton->setText(QStringLiteral("重新填写 %1 的远程桌面密码").arg(profile.name));
+                m_rdpCredentialButton->show();
+                return;
+            }
+            launchProfile.password = secret.password;
         }
 #ifdef Q_OS_MACOS
         const auto copiedPassword = launchProfile.password;
@@ -936,17 +953,9 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
     if (profile.id.isEmpty()) profile.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (profile.connectionMode == ConnectionMode::Rdp) {
         CredentialSecret secret;
-        if (preserveEmptySecret && !profile.credentialRef.isEmpty()) {
-            secret = m_credentialStore->load(profile.credentialRef);
-            if (!m_credentialStore->lastError().isEmpty() && profile.password.isEmpty()) {
-                QMessageBox::critical(this, QStringLiteral("保存 RDP 密码失败"),
-                    QStringLiteral("无法读取原密码，未覆盖已保存凭据：%1").arg(m_credentialStore->lastError()));
-                return false;
-            }
-        }
         if (!profile.password.isEmpty()) secret.password = profile.password;
         if (!secret.password.isEmpty()) {
-            if (profile.credentialRef.isEmpty()) profile.credentialRef = QStringLiteral("rdp/%1").arg(profile.id);
+            profile.credentialRef = QStringLiteral("rdp/%1/%2").arg(profile.id, QUuid::createUuid().toString(QUuid::WithoutBraces));
             if (!m_credentialStore->save(profile.credentialRef, secret)) {
                 QMessageBox::critical(this, QStringLiteral("保存 RDP 密码失败"), m_credentialStore->lastError());
                 return false;
@@ -970,16 +979,16 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
         || (originalProfile && originalProfile->privateKeyPath == profile.privateKeyPath);
     const bool canPreserveSecret = preserveEmptySecret && originalProfile && sameAuthentication && samePrivateKey
         && !originalProfile->credentialRef.isEmpty();
-    if (canPreserveSecret && profile.authentication != AuthenticationMethod::SshAgent) {
-        secret = m_credentialStore->load(originalProfile->credentialRef);
-        const bool needsStoredSecret = (profile.authentication == AuthenticationMethod::Password && profile.password.isEmpty())
-            || (profile.authentication == AuthenticationMethod::PrivateKey && profile.keyPassphrase.isEmpty());
-        if (!m_credentialStore->lastError().isEmpty() && needsStoredSecret) {
-            QMessageBox::critical(this, QStringLiteral("保存凭据失败"),
-                QStringLiteral("无法读取原凭据，未覆盖已保存内容：%1\n请解锁系统凭据库，或重新输入凭据。")
-                    .arg(m_credentialStore->lastError()));
+    if (canPreserveSecret && profile.authentication != AuthenticationMethod::SshAgent
+        && profile.password.isEmpty() && profile.keyPassphrase.isEmpty()) {
+        // Renaming/moving/editing an address does not require decrypting or
+        // rewriting an unchanged credential. Preserve the original reference.
+        profile.credentialRef = originalProfile->credentialRef;
+        if (!m_repository->saveServer(profile)) {
+            QMessageBox::critical(this, QStringLiteral("保存服务器失败"), m_repository->lastError());
             return false;
         }
+        return true;
     }
     if (!profile.password.isEmpty()) secret.password = profile.password;
     if (!profile.keyPassphrase.isEmpty()) secret.keyPassphrase = profile.keyPassphrase;
@@ -988,10 +997,15 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
         return false;
     }
     if (profile.authentication == AuthenticationMethod::SshAgent) {
-        if (preserveEmptySecret && !profile.credentialRef.isEmpty()) m_credentialStore->remove(profile.credentialRef);
-    } else if (!m_credentialStore->save(profile.credentialRef, secret)) {
-        QMessageBox::critical(this, QStringLiteral("保存凭据失败"), m_credentialStore->lastError());
-        return false;
+        profile.credentialRef.clear();
+    } else {
+        // A new entry belongs to this application identity. Do not update or
+        // remove an old entry whose ACL may belong to another build/tool.
+        profile.credentialRef = QStringLiteral("server/%1/%2").arg(profile.id, QUuid::createUuid().toString(QUuid::WithoutBraces));
+        if (!m_credentialStore->save(profile.credentialRef, secret)) {
+            QMessageBox::critical(this, QStringLiteral("保存凭据失败"), m_credentialStore->lastError());
+            return false;
+        }
     }
     profile.password.clear();
     profile.keyPassphrase.clear();

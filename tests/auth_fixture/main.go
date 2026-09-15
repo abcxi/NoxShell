@@ -24,6 +24,7 @@ import (
 )
 
 const syntheticPassword = "noxshell-integration-test-only"
+const syntheticUnicodePassword = "  SSH。密码é！'\u00a0🔑 $();  "
 
 var outputMutex sync.Mutex
 
@@ -39,6 +40,7 @@ func report(event string, fields map[string]any) {
 
 func main() {
 	method := flag.String("auth", "password", "password, interactive, or both")
+	passwordCase := flag.String("password-case", "ascii", "fixed synthetic password: ascii or unicode")
 	noneDelay := flag.Int("none-delay-ms", 0, "delay the first authentication response")
 	passwordDelay := flag.Int("password-delay-ms", 0, "delay a password response")
 	rejectPassword := flag.Bool("reject-password", false, "reject ordinary password but permit interactive fallback")
@@ -49,6 +51,12 @@ func main() {
 	shellMode := flag.String("shell-mode", "prompt", "prompt, echo, no-read, flood, burst, burst-close, or reset")
 	metricsMode := flag.String("metrics-mode", "off", "off, normal, or oversized (synthetic data, never execute commands)")
 	flag.Parse()
+	expectedPassword := syntheticPassword
+	if *passwordCase == "unicode" {
+		expectedPassword = syntheticUnicodePassword
+	} else if *passwordCase != "ascii" {
+		panic("unsupported synthetic password case")
+	}
 
 	var privateKey any
 	var err error
@@ -100,7 +108,7 @@ func main() {
 		config.PasswordCallback = func(c ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			report("method_started", map[string]any{"method": "password"})
 			time.Sleep(time.Duration(*passwordDelay) * time.Millisecond)
-			if !*rejectPassword && c.User() == "fixture-user" && string(password) == syntheticPassword {
+			if !*rejectPassword && c.User() == "fixture-user" && string(password) == expectedPassword {
 				return nil, nil
 			}
 			return nil, errors.New("synthetic credential rejected")
@@ -113,7 +121,7 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			if c.User() == "fixture-user" && len(answers) == 1 && answers[0] == syntheticPassword {
+			if c.User() == "fixture-user" && len(answers) == 1 && answers[0] == expectedPassword {
 				return nil, nil
 			}
 			return nil, errors.New("synthetic credential rejected")

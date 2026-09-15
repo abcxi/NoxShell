@@ -7,6 +7,8 @@
 class QLabel;
 class QLineEdit;
 class QToolButton;
+class QPushButton;
+class QCheckBox;
 
 namespace noxshell {
 class SshSession;
@@ -48,6 +50,10 @@ private:
     SshSession *m_session{};
     QWidget *m_loadingOverlay{};
     QLabel *m_loadingDetail{};
+    QWidget *m_passwordForm{};
+    QLineEdit *m_connectionPassword{};
+    QCheckBox *m_rememberPassword{};
+    QPushButton *m_passwordConnectButton{};
     CommandHistoryPanel *m_commandHistory{};
     TerminalView *m_output{};
     QLineEdit *m_input{};

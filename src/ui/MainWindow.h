@@ -7,6 +7,7 @@
 #include <QMainWindow>
 #include <QHash>
 #include <QSet>
+#include <QList>
 
 class QLabel;
 class QTimer;
@@ -49,9 +50,9 @@ private:
     QWidget *createMonitorWorkspace();
     QWidget *createFileWorkspace();
     QWidget *createStatusBar();
-    void setSidebarVisible(bool visible);
     void setMonitorVisible(bool visible);
     void setFileWorkspaceVisible(bool visible);
+    void updateFileWorkspaceVisibility();
     void showTerminalSettings();
     void setThemeMode(ThemeMode mode, bool persist = true);
     void updateThemePresentation();
@@ -81,7 +82,9 @@ private:
     QLabel *m_serverMeta{};
     QLabel *m_onlineBadge{};
     QLabel *m_sampleStatus{};
-    QToolButton *m_sidebarToggleButton{};
+    QPushButton *m_rdpCredentialButton{};
+    ServerProfile m_pendingCredentialProfile;
+    bool m_readingRdpCredentials{false};
     QToolButton *m_monitorToggleButton{};
     QToolButton *m_settingsButton{};
     QToolButton *m_themeModeButton{};
@@ -97,6 +100,7 @@ private:
     SystemDetailPanel *m_systemDetailPanel{};
     TerminalWorkspace *m_terminalWorkspace{};
     QSplitter *m_terminalFileSplitter{};
+    QList<int> m_terminalFileSplitSizes;
     FilePanel *m_filePanel{};
     QStackedWidget *m_fileWorkspaceStack{};
     QWidget *m_filePlaceholder{};

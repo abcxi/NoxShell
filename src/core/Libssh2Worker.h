@@ -53,7 +53,8 @@ public slots:
     void disconnectFromHost();
 
 signals:
-    void connectionChanged(bool connected, const QString &message);
+    void passwordAuthenticationRejected(quint64 generation);
+    void connectionChanged(bool connected, const QString &message, quint64 generation);
     void outputReceived(const QString &text);
     void rawOutputReceived(const QByteArray &data);
     void promptChanged(const QString &prompt);
@@ -76,6 +77,7 @@ private slots:
     bool drainChannel();
 
 private:
+    void reportConnectionState(bool connected, const QString &message);
     void fail(const QString &stage, const QString &detail);
     void continueAuthentication();
     int authenticatePassword();

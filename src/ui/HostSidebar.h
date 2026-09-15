@@ -46,7 +46,6 @@ signals:
     void addServerInGroupRequested(const QString &group);
     void addRdpServerRequested();
     void addRdpServerInGroupRequested(const QString &group);
-    void collapseRequested();
 
 private:
     void populate();

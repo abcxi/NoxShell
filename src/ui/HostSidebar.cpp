@@ -4,6 +4,7 @@
 #include <QClipboard>
 #include <QDropEvent>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -60,37 +61,15 @@ protected:
     }
 };
 
-void updateHostItem(QWidget *widget, const ServerProfile &server)
+QString authenticationText(const ServerProfile &server)
 {
-    if (!widget) return;
-    auto *name = widget->findChild<QLabel *>(QStringLiteral("hostItemName"));
-    auto *address = widget->findChild<QLabel *>(QStringLiteral("hostItemAddress"));
-    if (name) name->setText(server.name);
-    if (address) address->setText(server.host);
-}
-
-QWidget *createHostItem(const ServerProfile &server)
-{
-    auto *widget = new QWidget;
-    widget->setAttribute(Qt::WA_TransparentForMouseEvents);
-    auto *layout = new QHBoxLayout(widget);
-    layout->setContentsMargins(4, 2, 7, 2);
-    layout->setSpacing(7);
-    auto *name = new QLabel;
-    name->setObjectName(QStringLiteral("hostItemName"));
-    auto *address = new QLabel;
-    address->setObjectName(QStringLiteral("hostItemAddress"));
-    layout->addWidget(name);
-    layout->addWidget(address);
-    if (server.connectionMode == ConnectionMode::Rdp) {
-        auto *protocol = new QLabel(QStringLiteral("RDP"));
-        protocol->setObjectName(QStringLiteral("hostItemProtocol"));
-        protocol->setToolTip(QStringLiteral("Windows 远程桌面"));
-        layout->addWidget(protocol);
+    if (server.connectionMode == ConnectionMode::Rdp) return QStringLiteral("密码");
+    switch (server.authentication) {
+    case AuthenticationMethod::Password: return QStringLiteral("密码");
+    case AuthenticationMethod::PrivateKey: return QStringLiteral("私钥");
+    case AuthenticationMethod::SshAgent: return QStringLiteral("SSH Agent");
     }
-    layout->addStretch();
-    updateHostItem(widget, server);
-    return widget;
+    return {};
 }
 } // namespace
 
@@ -100,7 +79,7 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     , m_groups(std::move(groups))
 {
     setObjectName(QStringLiteral("hostSidebar"));
-    setFixedWidth(244);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     for (const auto &server : std::as_const(m_servers)) {
         const auto group = server.group.trimmed();
         if (!group.isEmpty() && !m_groups.contains(group)) m_groups.append(group);
@@ -108,8 +87,8 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_groups.removeDuplicates();
 
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(10, 12, 9, 8);
-    layout->setSpacing(8);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(12);
     auto *filterRow = new QHBoxLayout;
     filterRow->setContentsMargins(0, 0, 0, 0);
     filterRow->setSpacing(7);
@@ -117,7 +96,7 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_search->setObjectName(QStringLiteral("hostSearch"));
     m_search->setPlaceholderText(QStringLiteral("搜索名称、IP 或分组"));
     m_search->setClearButtonEnabled(true);
-    auto *addButton = new QPushButton(QStringLiteral("+"));
+    auto *addButton = new QPushButton(QStringLiteral("+ 新建连接"));
     addButton->setObjectName(QStringLiteral("hostAddButton"));
     addButton->setToolTip(QStringLiteral("新增远程连接"));
     m_addConnectionMenu = new QMenu(addButton);
@@ -133,7 +112,18 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     auto *tree = new HostTreeWidget;
     m_list = tree;
     m_list->setObjectName(QStringLiteral("hostList"));
-    m_list->setHeaderHidden(true);
+    m_list->setColumnCount(7);
+    m_list->setHeaderLabels({QStringLiteral("名称"), QStringLiteral("主机 / IP"), QStringLiteral("端口"),
+        QStringLiteral("用户"), QStringLiteral("协议"), QStringLiteral("认证方式"), QStringLiteral("系统")});
+    m_list->header()->setStretchLastSection(false);
+    m_list->header()->setMinimumSectionSize(68);
+    m_list->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_list->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    for (int column = 2; column < m_list->columnCount(); ++column)
+        m_list->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    m_list->setAlternatingRowColors(true);
+    m_list->setUniformRowHeights(true);
+    m_list->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_list->setRootIsDecorated(true);
     m_list->setIndentation(14);
     m_list->setAnimated(true);
@@ -178,12 +168,15 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
     m_deleteGroupAction->setObjectName(QStringLiteral("hostDeleteGroupAction"));
     m_deleteAction->setObjectName(QStringLiteral("hostDeleteAction"));
 
-    auto *credentialButton = new QPushButton(QStringLiteral("⚙  连接与凭据"));
-    credentialButton->setObjectName(QStringLiteral("credentialSettingsButton"));
-    credentialButton->setFlat(true);
+    m_addConnectionMenu->addSeparator();
+    auto *addGroupAction = m_addConnectionMenu->addAction(QStringLiteral("新建分组"));
+    addGroupAction->setObjectName(QStringLiteral("hostAddGroupAction"));
+    connect(addGroupAction, &QAction::triggered, m_newGroupAction, &QAction::trigger);
+    auto *hint = new QLabel(QStringLiteral("双击连接 · 右键编辑、复制或管理分组"));
+    hint->setObjectName(QStringLiteral("hostManagementHint"));
     layout->addLayout(filterRow);
     layout->addWidget(m_list, 1);
-    layout->addWidget(credentialButton);
+    layout->addWidget(hint);
     populate();
 
     connect(m_addSshAction, &QAction::triggered, this, &HostSidebar::addServerRequested);
@@ -198,7 +191,6 @@ HostSidebar::HostSidebar(QVector<ServerProfile> servers, QStringList groups, QWi
         const auto profile = profileForItem(item);
         if (profile.id.isEmpty()) return;
         emit serverConnectRequested(profile);
-        emit collapseRequested();
     });
     connect(m_list, &QTreeWidget::customContextMenuRequested, this, &HostSidebar::showContextMenu);
 
@@ -401,6 +393,7 @@ void HostSidebar::populate()
         item->setFlags(Qt::NoItemFlags);
         item->setForeground(0, QColor(QStringLiteral("#8794A5")));
         item->setTextAlignment(0, Qt::AlignCenter);
+        item->setFirstColumnSpanned(true);
         item->setSizeHint(0, QSize(218, 72));
         return;
     }
@@ -416,8 +409,14 @@ void HostSidebar::populate()
             : QStringLiteral("SSH · %1@%2:%3").arg(server.user, server.host).arg(server.port);
         item->setToolTip(0, groupName.isEmpty() ? target : QStringLiteral("%1 · %2").arg(target, groupName));
         item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled);
-        item->setSizeHint(0, QSize(198, 38));
-        m_list->setItemWidget(item, 0, createHostItem(server));
+        const QStringList columns{server.name, server.host, QString::number(server.port), server.user,
+            server.connectionMode == ConnectionMode::Rdp ? QStringLiteral("RDP") : QStringLiteral("SSH"),
+            authenticationText(server), server.os};
+        for (int column = 0; column < columns.size(); ++column) {
+            item->setText(column, columns.at(column));
+            if (column > 0) item->setToolTip(column, columns.at(column));
+        }
+        item->setSizeHint(0, QSize(0, 36));
     };
 
     // 未设置分组的主机直接平铺；只有真实分组才使用目录节点。
@@ -435,7 +434,7 @@ void HostSidebar::populate()
         group->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
         group->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDropEnabled);
         group->setExpanded(true);
-        group->setForeground(0, QColor(QStringLiteral("#42566D")));
+        group->setFirstColumnSpanned(true);
         auto font = group->font(0);
         font.setBold(true);
         group->setFont(0, font);

@@ -6,6 +6,7 @@
 
 class QStackedWidget;
 class QTabBar;
+class QTabWidget;
 class QTreeWidget;
 class QLabel;
 class QAction;
@@ -28,12 +29,16 @@ public:
 
     [[nodiscard]] int sessionCount() const;
     [[nodiscard]] bool hasConnectedSession(const QString &serverId) const;
+    [[nodiscard]] bool hasConnectingSession(const QString &serverId) const;
     bool activateExisting(const QString &serverId);
     void openOrActivate(const ServerProfile &profile, bool connectNow = true);
     void duplicateSession(const ServerProfile &profile);
     void updateServer(const ServerProfile &profile);
     void closeServer(const QString &serverId);
     void setFileWorkspaceVisible(bool visible);
+    void setServerManager(QWidget *manager);
+    void showServerManager();
+    [[nodiscard]] bool isHomePageVisible() const;
 
 signals:
     void sessionCountChanged(int count);
@@ -42,7 +47,7 @@ signals:
     void sessionConnectionChanged(const QString &serverId, bool connected, const QString &message);
     void commandSubmitted(const QString &serverId, const QString &command);
     void fileWorkspaceToggleRequested();
-    void hostSidebarVisibilityRequested(bool visible);
+    void homePageVisibilityChanged(bool visible);
 
 private:
     Q_INVOKABLE bool prepareTabContextMenu(int index);
@@ -64,6 +69,8 @@ private:
     QStackedWidget *m_stack{};
     QStackedWidget *m_viewStack{};
     QWidget *m_emptyPage{};
+    QTabWidget *m_homeTabs{};
+    QWidget *m_serverManagerPage{};
     QWidget *m_sessionsPage{};
     QWidget *m_tabToolbar{};
     QTreeWidget *m_recentLogins{};

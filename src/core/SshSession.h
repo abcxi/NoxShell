@@ -4,6 +4,7 @@
 #include "FileTransferTask.h"
 #include "RemoteFileEntry.h"
 #include "ServerProfile.h"
+#include "CredentialStore.h"
 
 #include <QObject>
 #include <QHash>
@@ -26,6 +27,7 @@ public:
     ~SshSession() override;
 
     void connectTo(const ServerProfile &profile);
+    void connectWithPassword(const QString &password, bool remember);
     void disconnectFromHost();
     void execute(const QString &command);
     void sendInput(const QByteArray &data);
@@ -50,10 +52,14 @@ public:
     void approveHostKey(bool approved);
 
     [[nodiscard]] bool isConnected() const { return m_connected; }
+    [[nodiscard]] bool isConnecting() const { return m_connecting; }
     [[nodiscard]] ServerProfile profile() const { return m_profile; }
     [[nodiscard]] std::optional<MetricSample> lastMetricSample() const { return m_lastMetricSample; }
 
 signals:
+    void passwordRequired(const QString &reason);
+    void credentialReferenceChanged(const ServerProfile &profile);
+    void credentialSaveNotice(const QString &message);
     void connectRequested(const ServerProfile &profile, quint64 requestGeneration);
     void disconnectRequested();
     void executeRequested(const QString &command);
@@ -93,7 +99,15 @@ signals:
     void transferTaskChanged(const FileTransferTask &task);
     void transferQueueReset();
 
+private slots:
+    void handleConnectionChanged(bool connected, const QString &message, quint64 generation);
+    void handlePasswordRejected(quint64 generation);
+
 private:
+    void connectToImpl(const ServerProfile &profile, bool suppliedSecret = false, bool remember = false);
+    void rememberSuccessfulCredential();
+    bool m_waitingForPassword{false};
+    std::optional<CredentialSecret> m_credentialToRemember;
     void connectDemo();
     void executeDemo(const QString &command);
     QString demoResponseFor(const QString &command) const;
@@ -109,6 +123,10 @@ private:
 
     ServerProfile m_profile;
     bool m_connected{false};
+    bool m_connecting{false};
+    bool m_loadingCredentials{false};
+    quint64 m_connectionAttempt{};
+    quint64 m_transportGeneration{};
     bool m_demo{true};
     bool m_metricsInFlight{false};
     QElapsedTimer m_metricsCooldown;

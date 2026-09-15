@@ -1,5 +1,7 @@
 #include "ServerDialog.h"
 
+#include <QPointer>
+
 #include "../core/CredentialStore.h"
 #include "../core/ServerRepository.h"
 #include "../core/SshSession.h"
@@ -361,11 +363,12 @@ bool ServerDialog::prepareConnectionTestProfile(ServerProfile &candidate)
         || candidate.privateKeyPath == m_original.privateKeyPath;
     if (needsStoredSecret && m_editing && sameAuthentication && samePrivateKey
         && m_credentialStore && !m_original.credentialRef.isEmpty()) {
+        const QPointer<ServerDialog> lifetime(this);
         storedSecret = m_credentialStore->load(m_original.credentialRef);
+        if (!lifetime) return false;
         if (!m_credentialStore->lastError().isEmpty()) {
-            QMessageBox::warning(this, QStringLiteral("无法测试"),
-                QStringLiteral("无法读取已保存凭据：%1\n请解锁系统凭据库，或重新输入凭据后测试。")
-                    .arg(m_credentialStore->lastError()));
+            m_testStatus->setText(QStringLiteral("已存密码暂不可读取，请在上方输入 SSH 密码或私钥口令后测试；无需 Mac 密码。"));
+            (candidate.authentication == AuthenticationMethod::PrivateKey ? m_passphrase : m_password)->setFocus();
             return false;
         }
     }
@@ -392,8 +395,16 @@ bool ServerDialog::prepareConnectionTestProfile(ServerProfile &candidate)
 void ServerDialog::testConnection()
 {
     if (!m_repository || !m_credentialStore) return;
+    if (!m_testButton->isEnabled()) return;
+    m_testButton->setEnabled(false);
     auto candidate = profile();
-    if (!prepareConnectionTestProfile(candidate)) return;
+    const QPointer<ServerDialog> lifetime(this);
+    const bool ready = prepareConnectionTestProfile(candidate);
+    if (!lifetime) return;
+    if (!ready) {
+        m_testButton->setEnabled(true);
+        return;
+    }
 
     m_testButton->setEnabled(false);
     m_testButton->setText(QStringLiteral("测试中…"));

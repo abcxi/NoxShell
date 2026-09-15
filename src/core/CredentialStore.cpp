@@ -3,6 +3,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QMutexLocker>
+#include <QRecursiveMutex>
 #include <QStandardPaths>
 
 #ifdef Q_OS_MACOS
@@ -52,6 +54,34 @@ QString processFailure(QProcess &process)
 #endif
 
 #ifdef Q_OS_MACOS
+QRecursiveMutex &macCredentialMutex()
+{
+    static QRecursiveMutex mutex;
+    return mutex;
+}
+
+class MacCredentialInteraction final {
+public:
+    MacCredentialInteraction() : m_lock(&macCredentialMutex())
+    {
+        m_status = SecKeychainGetUserInteractionAllowed(&m_previous);
+        if (m_status == errSecSuccess && m_previous) {
+            m_status = SecKeychainSetUserInteractionAllowed(false);
+            m_restore = m_status == errSecSuccess;
+        }
+    }
+    ~MacCredentialInteraction()
+    {
+        if (m_restore) SecKeychainSetUserInteractionAllowed(m_previous);
+    }
+    OSStatus status() const { return m_status; }
+private:
+    QMutexLocker<QRecursiveMutex> m_lock;
+    Boolean m_previous{true};
+    bool m_restore{false};
+    OSStatus m_status{errSecSuccess};
+};
+
 struct MacCredentialQuery {
     CFMutableDictionaryRef value = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -76,18 +106,33 @@ struct MacCredentialQuery {
 QString macCredentialError(OSStatus status)
 {
     // Use the OS status only: never include encoded credential data in errors.
-    return QStringLiteral("系统凭据库错误 %1；如系统询问访问权限，请确认是玄壳后再授权").arg(status);
+    return QStringLiteral("系统加密存储暂不可用（%1）；未申请系统授权").arg(status);
 }
 
-bool readMacCredential(const char *service, const QString &reference, QByteArray &payload, QString &error)
+bool readMacCredential(const char *service, const QString &reference,
+    QByteArray &payload, QString &error, bool &authorizationRequired)
 {
+    // The legacy login keychain can ignore kSecUseAuthenticationUIFail. Also
+    // suppress interaction for this synchronous operation in OUR process.
+    // All our Keychain operations share the lock; restore before releasing it.
+    // This does not lock/unlock the keychain or change any item's permissions.
+    const MacCredentialInteraction interaction;
+    if (interaction.status() != errSecSuccess) {
+        error = macCredentialError(interaction.status());
+        return false; // Never read if suppression could not be established.
+    }
     MacCredentialQuery query(service, reference);
     CFDictionarySetValue(query.value, kSecReturnData, kCFBooleanTrue);
     CFDictionarySetValue(query.value, kSecMatchLimit, kSecMatchLimitOne);
+    // Keep the per-query policy too. Never fall back to an external process,
+    // whose authorization UI is outside this scope's control.
+    CFDictionarySetValue(query.value, kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
     CFTypeRef result = nullptr;
     const auto status = SecItemCopyMatching(query.value, &result);
     if (status != errSecSuccess || !result || CFGetTypeID(result) != CFDataGetTypeID()) {
         if (result) CFRelease(result);
+        authorizationRequired = status == errSecInteractionNotAllowed || status == errSecAuthFailed
+            || status == errSecUserCanceled;
         error = macCredentialError(status == errSecSuccess ? errSecDecode : status);
         return false;
     }
@@ -142,6 +187,11 @@ bool CredentialStore::save(const QString &reference, const CredentialSecret &sec
 #ifdef Q_OS_MACOS
     // Keep the existing service/account and payload format; do not migrate,
     // delete or weaken ACLs. Never pass secrets in process arguments.
+    const MacCredentialInteraction interaction;
+    if (interaction.status() != errSecSuccess) {
+        m_lastError = macCredentialError(interaction.status());
+        return false;
+    }
     MacCredentialQuery query(kServiceName, reference);
     const auto payload = encodeSecret(secret);
     const auto data = CFDataCreate(kCFAllocatorDefault,
@@ -208,6 +258,7 @@ bool CredentialStore::save(const QString &reference, const CredentialSecret &sec
 CredentialSecret CredentialStore::load(const QString &reference)
 {
     m_lastError.clear();
+    m_authorizationRequired = false;
     if (reference.trimmed().isEmpty()) {
         m_lastError = QStringLiteral("凭据引用不能为空");
         return {};
@@ -215,7 +266,7 @@ CredentialSecret CredentialStore::load(const QString &reference)
 #ifdef Q_OS_MACOS
     QByteArray payload;
     QString error;
-    if (!readMacCredential(kServiceName, reference, payload, error)) {
+    if (!readMacCredential(kServiceName, reference, payload, error, m_authorizationRequired)) {
         m_lastError = QStringLiteral("读取 macOS Keychain 失败：%1").arg(error);
         return {};
     }
@@ -253,6 +304,11 @@ bool CredentialStore::remove(const QString &reference)
     m_lastError.clear();
     if (reference.trimmed().isEmpty()) return true;
 #ifdef Q_OS_MACOS
+    const MacCredentialInteraction interaction;
+    if (interaction.status() != errSecSuccess) {
+        m_lastError = macCredentialError(interaction.status());
+        return false;
+    }
     MacCredentialQuery query(kServiceName, reference);
     const auto status = SecItemDelete(query.value);
     if (status != errSecSuccess && status != errSecItemNotFound) {

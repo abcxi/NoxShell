@@ -34,19 +34,16 @@ NSWindow *nativeWindow(QMainWindow *window)
 
 @interface NoxShellTitleBarControlsBridge : NSObject {
 @public
-    std::function<void()> sidebarHandler;
     std::function<void()> monitorHandler;
     std::function<void()> settingsHandler;
     std::function<void(int)> themeHandler;
 }
-@property(nonatomic, strong) NSButton *sidebarButton;
 @property(nonatomic, strong) NSButton *monitorButton;
 @property(nonatomic, strong) NSButton *settingsButton;
 @property(nonatomic, strong) NSButton *themeButton;
 @property(nonatomic, strong) NSMenu *themeMenu;
 @property(nonatomic, strong) NSTitlebarAccessoryViewController *leftController;
 @property(nonatomic, strong) NSTitlebarAccessoryViewController *rightController;
-- (void)toggleSidebar:(id)sender;
 - (void)toggleMonitor:(id)sender;
 - (void)openSettings:(id)sender;
 - (void)showThemeMenu:(id)sender;
@@ -54,12 +51,6 @@ NSWindow *nativeWindow(QMainWindow *window)
 @end
 
 @implementation NoxShellTitleBarControlsBridge
-- (void)toggleSidebar:(id)sender
-{
-    (void)sender;
-    if (sidebarHandler) sidebarHandler();
-}
-
 - (void)toggleMonitor:(id)sender
 {
     (void)sender;
@@ -97,7 +88,6 @@ void applyMacApplicationAppearance(int themeMode)
 }
 
 bool installMacTitleBarControls(QMainWindow *window,
-    std::function<void()> toggleSidebar,
     std::function<void()> toggleMonitor,
     std::function<void()> openTerminalSettings,
     std::function<void(int)> selectTheme,
@@ -108,7 +98,6 @@ bool installMacTitleBarControls(QMainWindow *window,
     if (objc_getAssociatedObject(native, &kTitleBarControlsKey)) return true;
 
     auto *bridge = [[NoxShellTitleBarControlsBridge alloc] init];
-    bridge->sidebarHandler = std::move(toggleSidebar);
     bridge->monitorHandler = std::move(toggleMonitor);
     bridge->settingsHandler = std::move(openTerminalSettings);
     bridge->themeHandler = std::move(selectTheme);
@@ -127,8 +116,6 @@ bool installMacTitleBarControls(QMainWindow *window,
         return button;
     };
 
-    bridge.sidebarButton = makeButton(symbolImage(@"sidebar.left", NSImageNameListViewTemplate),
-        bridge, @selector(toggleSidebar:));
     bridge.monitorButton = makeButton(symbolImage(@"rectangle.split.3x1", NSImageNameColumnViewTemplate),
         bridge, @selector(toggleMonitor:));
     bridge.settingsButton = makeButton(symbolImage(@"gearshape", NSImageNameActionTemplate),
@@ -149,12 +136,11 @@ bool installMacTitleBarControls(QMainWindow *window,
         [bridge.themeMenu addItem:item];
     }
 
-    auto *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 60, 28)];
+    auto *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 30, 28)];
     stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     stack.alignment = NSLayoutAttributeCenterY;
     stack.distribution = NSStackViewDistributionFill;
     stack.spacing = 2.0;
-    [stack addArrangedSubview:bridge.sidebarButton];
     [stack addArrangedSubview:bridge.monitorButton];
 
     auto *leftController = [[NSTitlebarAccessoryViewController alloc] init];
@@ -176,21 +162,18 @@ bool installMacTitleBarControls(QMainWindow *window,
     [native addTitlebarAccessoryViewController:rightController];
     objc_setAssociatedObject(native, &kTitleBarControlsKey, bridge, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    updateMacTitleBarControls(window, true, true, themeMode);
+    updateMacTitleBarControls(window, true, themeMode);
     return true;
 }
 
-void updateMacTitleBarControls(QMainWindow *window, bool sidebarVisible, bool monitorVisible, int themeMode)
+void updateMacTitleBarControls(QMainWindow *window, bool monitorVisible, int themeMode)
 {
     NSWindow *native = nativeWindow(window);
     auto *bridge = native ? (NoxShellTitleBarControlsBridge *)objc_getAssociatedObject(native, &kTitleBarControlsKey) : nil;
     if (!bridge) return;
 
-    bridge.sidebarButton.toolTip = sidebarVisible ? @"隐藏主机列表" : @"显示主机列表";
     bridge.monitorButton.toolTip = monitorVisible ? @"隐藏实时监控栏" : @"显示实时监控栏";
-    bridge.sidebarButton.accessibilityLabel = bridge.sidebarButton.toolTip;
     bridge.monitorButton.accessibilityLabel = bridge.monitorButton.toolTip;
-    bridge.sidebarButton.contentTintColor = sidebarVisible ? NSColor.labelColor : NSColor.secondaryLabelColor;
     bridge.monitorButton.contentTintColor = monitorVisible ? NSColor.labelColor : NSColor.secondaryLabelColor;
     for (NSMenuItem *item in bridge.themeMenu.itemArray) {
         item.state = item.tag == themeMode ? NSControlStateValueOn : NSControlStateValueOff;

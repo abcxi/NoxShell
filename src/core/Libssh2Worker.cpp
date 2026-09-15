@@ -224,7 +224,7 @@ void Libssh2Worker::connectTo(const ServerProfile &profile, quint64 requestGener
     m_profile = profile;
     m_metricsClock.start();
     m_metricsPolicy = {};
-    emit connectionChanged(false, QStringLiteral("TCP 连接 %1:%2…").arg(profile.host).arg(profile.port));
+    reportConnectionState(false, QStringLiteral("TCP 连接 %1:%2…").arg(profile.host).arg(profile.port));
 
     QString socketError;
     if (!connectSocket(profile.host, profile.port, kTcpConnectTimeoutMs, socketError)) {
@@ -239,7 +239,7 @@ void Libssh2Worker::connectTo(const ServerProfile &profile, quint64 requestGener
     }
     libssh2_session_set_blocking(m_session, 0);
     libssh2_session_set_timeout(m_session, kConnectTimeoutMs);
-    emit connectionChanged(false, QStringLiteral("正在进行 SSH 握手…"));
+    reportConnectionState(false, QStringLiteral("正在进行 SSH 握手…"));
     const auto handshakeResult = runConnectionOperation([this] {
         return libssh2_session_handshake(m_session, static_cast<libssh2_socket_t>(m_socketDescriptor));
     }, kHandshakeTimeoutMs);
@@ -263,7 +263,7 @@ void Libssh2Worker::connectTo(const ServerProfile &profile, quint64 requestGener
     const auto expected = normalizeFingerprint(profile.expectedFingerprint);
     if (expected.isEmpty()) {
         m_waitingForHostKey = true;
-        emit connectionChanged(false, QStringLiteral("等待确认主机指纹"));
+        reportConnectionState(false, QStringLiteral("等待确认主机指纹"));
         emit hostKeyVerificationRequired(m_fingerprint, hostKeyAlgorithm());
         return;
     }
@@ -289,7 +289,7 @@ void Libssh2Worker::approveHostKey(bool approved)
 
 void Libssh2Worker::continueAuthentication()
 {
-    emit connectionChanged(false, QStringLiteral("正在查询 %1@%2 的认证方式（最多等待 %3 秒）…")
+    reportConnectionState(false, QStringLiteral("正在查询 %1@%2 的认证方式（最多等待 %3 秒）…")
         .arg(m_profile.user, m_profile.host).arg(m_authenticationTimeoutMs / 1000));
     QStringList advertisedMethods;
     if (!advertisedAuthenticationMethods(advertisedMethods)) {
@@ -300,10 +300,12 @@ void Libssh2Worker::continueAuthentication()
     QStringList methodFailures;
     QString localFailure;
     bool authenticated = libssh2_userauth_authenticated(m_session) != 0;
+    int authenticationResult = 0;
     auto attempt = [&](const QString &name, const std::function<int()> &authenticate) {
         attemptedMethods.append(name);
-        emit connectionChanged(false, QStringLiteral("正在使用 %1 认证 %2@%3…").arg(name, m_profile.user, m_profile.host));
+        reportConnectionState(false, QStringLiteral("正在使用 %1 认证 %2@%3…").arg(name, m_profile.user, m_profile.host));
         const int result = authenticate();
+        authenticationResult = result;
         authenticated = result == 0;
         if (!authenticated) methodFailures.append(name + QStringLiteral("：") + connectionOperationError());
         return result;
@@ -344,7 +346,14 @@ void Libssh2Worker::continueAuthentication()
         if (!attemptedMethods.isEmpty()) {
             detail += QStringLiteral("；客户端已尝试：%1").arg(attemptedMethods.join(QStringLiteral("、")));
         }
+        const bool passwordRejected = m_profile.authentication == AuthenticationMethod::Password
+            && authenticationResult == LIBSSH2_ERROR_AUTHENTICATION_FAILED;
+        const auto generation = m_activeConnectionGeneration;
         fail(QStringLiteral("SSH 认证"), detail);
+        // Notify only after the transport has closed. No implicit retry, and
+        // never reinterpret timeout, host-key failure or unsupported auth as a
+        // bad password. The user decides whether to supply another credential.
+        if (passwordRejected && !connectionCanceled()) emit passwordAuthenticationRejected(generation);
         return;
     }
     m_profile.password.clear();
@@ -367,7 +376,7 @@ void Libssh2Worker::continueAuthentication()
         waitForSocket(15);
     }
     if (!m_connected) return;
-    emit connectionChanged(true, QStringLiteral("SSH 已连接 · %1 · %2").arg(hostKeyAlgorithm(), m_fingerprint));
+    reportConnectionState(true, QStringLiteral("SSH 已连接 · %1 · %2").arg(hostKeyAlgorithm(), m_fingerprint));
     emit promptChanged(QStringLiteral("%1@%2:~$ ").arg(m_profile.user, m_profile.name));
 }
 
@@ -1354,7 +1363,7 @@ bool Libssh2Worker::drainChannel()
     // EOF can arrive while libssh2 still has buffered output. Do not truncate
     // the final output just because this tick reached its byte budget.
     if (fullyDrained && libssh2_channel_eof(m_channel)) {
-        emit connectionChanged(false, QStringLiteral("远端已关闭 SSH 会话"));
+        reportConnectionState(false, QStringLiteral("远端已关闭 SSH 会话"));
         cleanup();
     }
     return receivedAny;
@@ -1364,7 +1373,12 @@ void Libssh2Worker::disconnectFromHost()
 {
     const bool wasConnected = m_connected || m_session || m_socketDescriptor >= 0;
     cleanup();
-    if (wasConnected) emit connectionChanged(false, QStringLiteral("SSH 已断开"));
+    if (wasConnected) reportConnectionState(false, QStringLiteral("SSH 已断开"));
+}
+
+void Libssh2Worker::reportConnectionState(bool connected, const QString &message)
+{
+    emit connectionChanged(connected, message, m_activeConnectionGeneration);
 }
 
 void Libssh2Worker::cleanup()
@@ -1613,7 +1627,7 @@ void Libssh2Worker::fail(const QString &stage, const QString &detail)
 {
     const auto message = QStringLiteral("%1失败：%2").arg(stage, detail.isEmpty() ? QStringLiteral("未知错误") : detail);
     cleanup();
-    emit connectionChanged(false, message);
+    reportConnectionState(false, message);
     emit outputReceived(message + QLatin1Char('\n'));
 }
 

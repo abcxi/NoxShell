@@ -33,14 +33,19 @@
 #include <QContextMenuEvent>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QEventLoop>
 #include <QDoubleSpinBox>
 #include <QDir>
 #include <QFile>
 #include <QFontComboBox>
 #include <QHBoxLayout>
+#include <QHeaderView>
+#include <QTabWidget>
 #include <QIcon>
 #include <QImage>
 #include <QLabel>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListWidget>
@@ -74,12 +79,21 @@
 #include <QtTest>
 
 #include <algorithm>
+#include <functional>
+#include <utility>
+
+#ifdef Q_OS_MACOS
+#include <Security/Security.h>
+#include <QJsonDocument>
+#include <QJsonObject>
+#endif
 
 class MemoryCredentialStore final : public noxshell::CredentialStore {
 public:
     bool save(const QString &reference, const noxshell::CredentialSecret &secret) override
     {
         ++saveCalls;
+        if (failSaves) { error = QStringLiteral("测试存储不可写"); return false; }
         error.clear();
         secrets.insert(reference, secret);
         return true;
@@ -88,6 +102,8 @@ public:
     noxshell::CredentialSecret load(const QString &reference) override
     {
         ++loadCalls;
+        // Exercise provider reentrancy/cancellation, without real Keychain UI.
+        if (auto callback = std::exchange(onLoad, {})) callback();
         error = failLoads ? QStringLiteral("测试凭据库已锁定") : QString{};
         return failLoads ? noxshell::CredentialSecret{} : secrets.value(reference);
     }
@@ -103,8 +119,10 @@ public:
 
     QHash<QString, noxshell::CredentialSecret> secrets;
     bool failLoads{};
+    bool failSaves{};
     int saveCalls{};
     int loadCalls{};
+    std::function<void()> onLoad;
     QString error;
 };
 
@@ -270,27 +288,79 @@ private slots:
             QSKIP("Native Keychain test is opt-in and uses one unique synthetic entry only");
         }
         noxshell::CredentialStore store;
-        const auto reference = QStringLiteral("noxshell-test-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
-        struct Cleanup {
-            noxshell::CredentialStore &store;
-            QString reference;
-            ~Cleanup() { store.remove(reference); }
-        } cleanup{store, reference};
-        noxshell::CredentialSecret secret;
-        secret.password = QStringLiteral(" synthetic \"你好\" $(); ");
-        secret.keyPassphrase = QStringLiteral("synthetic-passphrase");
-        QVERIFY2(store.save(reference, secret), qPrintable(store.lastError()));
-        auto loaded = store.load(reference);
-        QVERIFY2(store.lastError().isEmpty(), qPrintable(store.lastError()));
-        QCOMPARE(loaded.password, secret.password);
-        QCOMPARE(loaded.keyPassphrase, secret.keyPassphrase);
-        secret.password = QStringLiteral("updated-synthetic-only");
-        QVERIFY2(store.save(reference, secret), qPrintable(store.lastError()));
-        QCOMPARE(store.load(reference).password, secret.password);
-        QVERIFY(store.remove(reference));
-        QVERIFY(store.remove(reference));
+        const auto reference = QStringLiteral("noxshell-test-owned-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto cleanup = qScopeGuard([&] { store.remove(reference); });
+        // Each step runs in a fresh bounded process: verifies storage across app
+        // restarts, not a memory cache. Every operation starts with interaction ON.
+        for (const auto &operation : {"create", "read", "read", "read", "update", "read-updated", "delete", "delete"}) {
+            QProcess probe;
+            probe.start(QCoreApplication::applicationFilePath(),
+                {QStringLiteral("--owned-keychain-probe"), reference, QString::fromLatin1(operation)});
+            if (!probe.waitForFinished(5000)) {
+                probe.kill();
+                probe.waitForFinished(1000);
+                QFAIL("Silent native Keychain operation exceeded five seconds");
+            }
+            QCOMPARE(probe.exitStatus(), QProcess::NormalExit);
+            QVERIFY2(probe.exitCode() == 0, qPrintable(QStringLiteral("%1: exit %2").arg(QString::fromLatin1(operation)).arg(probe.exitCode())));
+        }
 #else
         QSKIP("macOS-only native Keychain backend");
+#endif
+    }
+
+    void inaccessibleLegacyCredentialNeverOpensAuthorization()
+    {
+#ifdef Q_OS_MACOS
+        if (!qEnvironmentVariableIsSet("NOXSHELL_TEST_NATIVE_KEYCHAIN")) {
+            QSKIP("Legacy Keychain compatibility test uses one opt-in synthetic entry only");
+        }
+        const auto reference = QStringLiteral("noxshell-test-legacy-")
+            + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto runSecurity = [](const QStringList &arguments) {
+            QProcess process;
+            process.start(QStringLiteral("/usr/bin/security"), arguments);
+            if (!process.waitForFinished(10000)) {
+                process.kill();
+                process.waitForFinished(1000);
+                return false;
+            }
+            return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+        };
+        const auto cleanup = qScopeGuard([&] {
+            runSecurity({QStringLiteral("delete-generic-password"), QStringLiteral("-s"),
+                QStringLiteral("com.noxshell.ops.ssh"), QStringLiteral("-a"), reference});
+        });
+        // Reproduce the pre-0.2.62 creator/ACL. The only argv secret here is a
+        // fixed, synthetic test value; production writes continue using SecItem.
+        const auto password = QStringLiteral("legacy-synthetic-only 中文 $();");
+        const auto keyPassphrase = QStringLiteral("legacy-synthetic-passphrase");
+        const auto payload = QJsonDocument(QJsonObject{
+            {QStringLiteral("password"), password}, {QStringLiteral("keyPassphrase"), keyPassphrase}})
+            .toJson(QJsonDocument::Compact).toBase64();
+        QVERIFY(runSecurity({QStringLiteral("add-generic-password"), QStringLiteral("-s"),
+            QStringLiteral("com.noxshell.ops.ssh"), QStringLiteral("-a"), reference,
+            QStringLiteral("-w"), QString::fromLatin1(payload)}));
+        // A separate bounded process catches accidental dialogs/hangs without
+        // blocking the test runner or skipping cleanup of the synthetic item.
+        QProcess probe;
+        probe.start(QCoreApplication::applicationFilePath(),
+            {QStringLiteral("--silent-keychain-probe"), reference});
+        if (!probe.waitForFinished(5000)) {
+            probe.kill();
+            probe.waitForFinished(1000);
+            QFAIL("Silent credential read exceeded 5 seconds; possible unexpected authorization UI");
+        }
+        QCOMPARE(probe.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(probe.exitCode(), 0);
+        noxshell::CredentialStore store;
+        runSecurity({QStringLiteral("delete-generic-password"), QStringLiteral("-s"),
+            QStringLiteral("com.noxshell.ops.ssh"), QStringLiteral("-a"), reference});
+        QVERIFY(store.load(reference).password.isEmpty());
+        QVERIFY(!store.lastError().isEmpty());
+        QVERIFY(!store.authorizationRequired());
+#else
+        QSKIP("macOS-only legacy Keychain compatibility");
 #endif
     }
 
@@ -817,7 +887,6 @@ private slots:
         noxshell::ui::HostSidebar sidebar({profile}, {QStringLiteral("生产环境"), QStringLiteral("测试环境")});
         QSignalSpy selectedSpy(&sidebar, &noxshell::ui::HostSidebar::serverSelected);
         QSignalSpy connectSpy(&sidebar, &noxshell::ui::HostSidebar::serverConnectRequested);
-        QSignalSpy collapseSpy(&sidebar, &noxshell::ui::HostSidebar::collapseRequested);
         QSignalSpy groupChangedSpy(&sidebar, &noxshell::ui::HostSidebar::serverGroupChanged);
         QSignalSpy addInGroupSpy(&sidebar, &noxshell::ui::HostSidebar::addServerInGroupRequested);
         QSignalSpy addRdpInGroupSpy(&sidebar, &noxshell::ui::HostSidebar::addRdpServerInGroupRequested);
@@ -844,21 +913,19 @@ private slots:
         QCOMPARE(search->geometry().y(), addButton->geometry().y());
         QVERIFY(addButton->geometry().x() > search->geometry().x());
         auto *hostItem = tree->topLevelItem(0)->child(0);
-        auto *rowWidget = tree->itemWidget(hostItem, 0);
-        QVERIFY(rowWidget);
-        QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemName"))->text(), QStringLiteral("sidebar-host"));
-        QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemAddress"))->text(), QStringLiteral("192.0.2.10"));
-        QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemName"))->geometry().y(),
-            rowWidget->findChild<QLabel *>(QStringLiteral("hostItemAddress"))->geometry().y());
+        QCOMPARE(tree->columnCount(), 7);
+        QVERIFY(!tree->isHeaderHidden());
+        QCOMPARE(hostItem->text(0), QStringLiteral("sidebar-host"));
+        QCOMPARE(hostItem->text(1), QStringLiteral("192.0.2.10"));
+        QCOMPARE(hostItem->text(2), QStringLiteral("22"));
+        QCOMPARE(hostItem->text(4), QStringLiteral("SSH"));
+        QCOMPARE(hostItem->text(5), QStringLiteral("密码"));
         QVERIFY(hostItem->sizeHint(0).height() <= 42);
-        QVERIFY(!rowWidget->findChild<QLabel *>(QStringLiteral("hostItemState")));
         QVERIFY(!hostItem->toolTip(0).contains(QStringLiteral("离线")));
         QVERIFY(!hostItem->toolTip(0).contains(QStringLiteral("在线")));
         QVERIFY(sidebar.setServerState(profile.id, noxshell::ServerState::Online));
-        QVERIFY(!rowWidget->findChild<QLabel *>(QStringLiteral("hostItemState")));
-        tree->itemDoubleClicked(hostItem, 0);
+        tree->itemDoubleClicked(hostItem, 1);
         QCOMPARE(connectSpy.count(), 1);
-        QCOMPARE(collapseSpy.count(), 1);
         QCOMPARE(qvariant_cast<noxshell::ServerProfile>(connectSpy.first().at(0)).id, profile.id);
         QVERIFY(sidebar.moveServerToGroup(profile.id, QStringLiteral("测试环境")));
         QCOMPARE(groupChangedSpy.count(), 1);
@@ -906,10 +973,7 @@ private slots:
         QVERIFY(hostItem);
         QCOMPARE(hostItem->childCount(), 0);
         QVERIFY(!hostItem->parent());
-        auto *rowWidget = tree->itemWidget(hostItem, 0);
-        QVERIFY(rowWidget);
-        QCOMPARE(rowWidget->findChild<QLabel *>(QStringLiteral("hostItemName"))->text(),
-            QStringLiteral("无分组主机"));
+        QCOMPARE(hostItem->text(0), QStringLiteral("无分组主机"));
         QVERIFY(!tree->topLevelItem(0)->text(0).contains(QStringLiteral("未分组")));
         QVERIFY(tree->topLevelItem(1)->text(0).startsWith(QStringLiteral("demo")));
 
@@ -1052,8 +1116,8 @@ private slots:
         QVERIFY(closeOthersAction);
         QVERIFY(closeAllAction);
         QVERIFY(newTabButton);
-        QSignalSpy sidebarVisibilitySpy(&workspace,
-            &noxshell::ui::TerminalWorkspace::hostSidebarVisibilityRequested);
+        auto *homeTabs = workspace.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
+        QVERIFY(homeTabs);
         QVERIFY(!workspace.findChild<QPushButton *>(QStringLiteral("clearTerminalButton")));
         QVERIFY(!workspace.findChild<QPushButton *>(QStringLiteral("duplicateTerminalButton")));
         QVERIFY(!tabToolbar->isHidden());
@@ -1104,8 +1168,7 @@ private slots:
         newTabButton->click();
         QCOMPARE(viewStack->currentWidget(), recentPage);
         QCOMPARE(tabs->count(), 2);
-        QCOMPARE(sidebarVisibilitySpy.count(), 1);
-        QCOMPARE(sidebarVisibilitySpy.takeFirst().at(0).toBool(), true);
+        QCOMPARE(homeTabs->currentIndex(), 1);
         tabs->tabBarClicked(1);
         QCOMPARE(viewStack->currentWidget(), sessionsPage);
         QCOMPARE(tabs->currentIndex(), 1);
@@ -1216,6 +1279,43 @@ private slots:
         workspace.openOrActivate(edited, true);
         QCOMPARE(workspace.sessionCount(), 2);
         QCOMPARE(oldConnectionSpy.count(), 0);
+    }
+
+    void reconnectFromOldTabUsesEditedCredentialReference()
+    {
+        MemoryCredentialStore credentials;
+        noxshell::ui::TerminalWorkspace workspace(nullptr, &credentials);
+        noxshell::ServerProfile original;
+        original.id = QStringLiteral("edited-password-reconnect");
+        original.name = original.id;
+        original.host = QStringLiteral("192.0.2.10");
+        original.user = QStringLiteral("test");
+        original.connectionMode = noxshell::ConnectionMode::Ssh;
+        original.credentialRef = QStringLiteral("old-password-reference");
+        credentials.secrets.insert(original.credentialRef, {QStringLiteral("old-test-password"), {}});
+        workspace.openOrActivate(original, false);
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QObject::disconnect(session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        workspace.openOrActivate(original, true);
+        QCOMPARE(requests.size(), 1);
+        session->disconnectFromHost();
+
+        auto edited = original;
+        edited.credentialRef = QStringLiteral("new-password-reference");
+        credentials.secrets.insert(edited.credentialRef, {QStringLiteral("new-test-password"), {}});
+        workspace.updateServer(edited);
+        bool prepared = false;
+        QVERIFY(QMetaObject::invokeMethod(&workspace, "prepareTabContextMenu", Qt::DirectConnection,
+            Q_RETURN_ARG(bool, prepared), Q_ARG(int, 0)));
+        QVERIFY(prepared);
+        auto *connectAction = workspace.findChild<QAction *>(QStringLiteral("terminalConnectAction"));
+        QVERIFY(connectAction && connectAction->isEnabled());
+        connectAction->trigger();
+        QCOMPARE(requests.size(), 2);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.last().at(0)).password, QStringLiteral("new-test-password"));
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.last().at(0)).credentialRef, edited.credentialRef);
     }
 
     void vtTerminalKeepsBoundedScrollbackAndMouseModes()
@@ -2732,13 +2832,12 @@ private slots:
         auto *themeButton = window.findChild<QToolButton *>(QStringLiteral("themeModeButton"));
         auto *windowToolbar = window.findChild<QToolBar *>(QStringLiteral("windowControlsToolbar"));
         QVERIFY(sidebar);
-        QVERIFY(sidebarToggle);
+        QVERIFY(!sidebarToggle);
         QVERIFY(monitorToggle);
         QVERIFY(settingsButton);
         QVERIFY(themeButton);
         QVERIFY(windowToolbar);
-        QCOMPARE(sidebarToggle->parentWidget(), monitorToggle->parentWidget());
-        QCOMPARE(sidebarToggle->parentWidget(), settingsButton->parentWidget());
+        QCOMPARE(monitorToggle->parentWidget(), settingsButton->parentWidget());
         QCOMPARE(themeButton->parentWidget(), settingsButton->parentWidget());
         QVERIFY(themeButton->menu());
         auto *systemTheme = themeButton->menu()->findChild<QAction *>(QStringLiteral("themeSystemAction"));
@@ -2777,27 +2876,25 @@ private slots:
         const auto hostItemForName = [hosts](const QString &name) -> QTreeWidgetItem * {
             for (QTreeWidgetItemIterator iterator(hosts); *iterator; ++iterator) {
                 auto *item = *iterator;
-                auto *row = hosts->itemWidget(item, 0);
-                auto *label = row ? row->findChild<QLabel *>(QStringLiteral("hostItemName")) : nullptr;
-                if (label && label->text() == name) return item;
+                if (item->text(0) == name) return item;
             }
             return nullptr;
         };
         const auto currentHostName = [hosts] {
-            auto *row = hosts->itemWidget(hosts->currentItem(), 0);
-            auto *label = row ? row->findChild<QLabel *>(QStringLiteral("hostItemName")) : nullptr;
-            return label ? label->text() : QString{};
+            return hosts->currentItem() ? hosts->currentItem()->text(0) : QString{};
         };
         QCOMPARE(window.toolBarArea(windowToolbar), Qt::TopToolBarArea);
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("topBar")));
         QVERIFY(!window.findChild<QLineEdit *>(QStringLiteral("globalSearch")));
         QVERIFY(!sidebar->isVisible());
-        QVERIFY(!sidebarToggle->icon().isNull());
         QVERIFY(!monitorToggle->icon().isNull());
-        QVERIFY(sidebarToggle->toolTip().contains(QStringLiteral("显示")));
-        QTest::mouseClick(sidebarToggle, Qt::LeftButton);
+        auto *homeTabs = window.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
+        QVERIFY(homeTabs);
+        QCOMPARE(homeTabs->count(), 2);
+        QCOMPARE(homeTabs->tabText(0), QStringLiteral("访问历史"));
+        QCOMPARE(homeTabs->tabText(1), QStringLiteral("服务器管理"));
+        homeTabs->setCurrentIndex(1);
         QVERIFY(sidebar->isVisible());
-        QVERIFY(sidebarToggle->toolTip().contains(QStringLiteral("隐藏")));
 
         auto *mainSplitter = window.findChild<QSplitter *>(QStringLiteral("mainWorkspaceSplitter"));
         auto *terminalFileSplitter = window.findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
@@ -2822,11 +2919,12 @@ private slots:
         QVERIFY(filePane);
         const auto monitorPosition = monitorRail->mapTo(&window, QPoint{});
         const auto terminalPosition = terminalPane->mapTo(&window, QPoint{});
-        const auto filePosition = filePane->mapTo(&window, QPoint{});
+        QCOMPARE(monitorPosition.x(), 0);
+        QVERIFY(homeTabs->isAncestorOf(sidebar));
+        QVERIFY(sidebar->width() > 700);
         QVERIFY(monitorPosition.x() < terminalPosition.x());
-        QVERIFY(terminalPosition.y() < filePosition.y());
-        QCOMPARE(terminalPosition.x(), filePosition.x());
-        QVERIFY(monitorRail->height() > terminalPane->height());
+        QVERIFY(filePane->isHidden());
+        QCOMPARE(terminalPane->height(), terminalFileSplitter->height());
 
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("serverHeader")));
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("terminalHeader")));
@@ -2956,6 +3054,7 @@ private slots:
         QTest::mouseClick(newTabButton, Qt::LeftButton);
         QVERIFY(recentPage->isVisible());
         QVERIFY(sidebar->isVisible());
+        homeTabs->setCurrentIndex(0);
         QTreeWidgetItem *currentServerLogin = nullptr;
         for (int index = 0; index < recentLogins->topLevelItemCount(); ++index) {
             if (recentLogins->topLevelItem(index)->text(0) == QStringLiteral("prod-web-01")) {
@@ -3034,7 +3133,7 @@ private slots:
         QVERIFY(output->hasFocus());
 
         // 主机列表只负责选择连接：单击另一台主机不得切换当前终端或监控对象。
-        QTest::mouseClick(sidebarToggle, Qt::LeftButton);
+        QTest::mouseClick(newTabButton, Qt::LeftButton);
         QVERIFY(sidebar->isVisible());
         QVERIFY(hostItemForName(QStringLiteral("db-master-01")));
         hosts->setCurrentItem(hostItemForName(QStringLiteral("db-master-01")));
@@ -3118,9 +3217,9 @@ private slots:
         // 左侧不展示会话状态，关闭标签只改变终端工作区。
         tabs->tabCloseRequested(1);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 1000);
-        auto *closedHostRow = hosts->itemWidget(hostItemForName(QStringLiteral("db-master-01")), 0);
+        auto *closedHostRow = hostItemForName(QStringLiteral("db-master-01"));
         QVERIFY(closedHostRow);
-        QVERIFY(!closedHostRow->findChild<QLabel *>(QStringLiteral("hostItemState")));
+        QVERIFY(!closedHostRow->toolTip(0).contains(QStringLiteral("离线")));
 
         auto *duplicate = window.findChild<QAction *>(QStringLiteral("terminalDuplicateAction"));
         QVERIFY(duplicate);
@@ -3133,6 +3232,651 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 1, 1000);
         window.close();
         QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
+    }
+
+    void connectionHomeCombinesHistoryAndServerManagement_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void connectionHomeCombinesHistoryAndServerManagement()
+    {
+        QFETCH(bool, dark);
+        const auto previousTheme = noxshell::ui::storedThemeMode();
+        const auto restoreTheme = qScopeGuard([previousTheme] {
+            noxshell::ui::applyApplicationTheme(previousTheme);
+        });
+        QTemporaryDir directory;
+        const auto database = directory.filePath(QStringLiteral("connection-home.sqlite3"));
+        noxshell::ServerRepository repository(database, true);
+        QVERIFY(repository.initialize());
+        auto servers = repository.loadServers();
+        QVERIFY(!servers.isEmpty());
+        QVERIFY(repository.recordSuccessfulLogin(servers.first().id));
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(database, nullptr, &credentials);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        window.resize(1440, 900);
+        window.show();
+        QTest::qWait(80);
+
+        auto *workspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
+        auto *home = window.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
+        auto *manager = window.findChild<noxshell::ui::HostSidebar *>();
+        auto *hosts = window.findChild<QTreeWidget *>(QStringLiteral("hostList"));
+        auto *history = window.findChild<QTreeWidget *>(QStringLiteral("recentLoginList"));
+        auto *monitor = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
+        auto *search = window.findChild<QLineEdit *>(QStringLiteral("hostSearch"));
+        auto *splitter = window.findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
+        auto *filePane = window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        auto *terminalPane = window.findChild<QWidget *>(QStringLiteral("terminalWorkspacePane"));
+        QVERIFY(workspace && home && manager && hosts && history && monitor && search);
+        QVERIFY(splitter && filePane && terminalPane);
+        QVERIFY(filePane->isHidden());
+        QVERIFY(splitter->handle(1)->isHidden());
+        QCOMPARE(terminalPane->height(), splitter->height());
+        QVERIFY(!window.findChild<QToolButton *>(QStringLiteral("sidebarToggleButton")));
+        QVERIFY(home->isAncestorOf(manager));
+        QCOMPARE(monitor->mapTo(&window, QPoint{}).x(), 0);
+        QCOMPARE(home->currentIndex(), 0);
+        QVERIFY(history->isVisible());
+        QVERIFY(!manager->isVisible());
+        const auto terminalWidth = workspace->width();
+        const auto screenshotDir = qEnvironmentVariable("NOXSHELL_HOME_SCREENSHOT_DIR");
+        const auto capture = [&](const QString &page) {
+            if (screenshotDir.isEmpty()) return true;
+            return window.grab().save(QDir(screenshotDir).filePath(
+                QStringLiteral("home-%1-%2.png").arg(dark ? QStringLiteral("dark") : QStringLiteral("light"), page)));
+        };
+        QVERIFY(capture(QStringLiteral("history")));
+        QTest::mouseClick(home->tabBar(), Qt::LeftButton, Qt::NoModifier, home->tabBar()->tabRect(1).center());
+        QVERIFY(manager->isVisible());
+        QCOMPARE(workspace->width(), terminalWidth);
+        QCOMPARE(terminalPane->height(), splitter->height());
+        QVERIFY(manager->width() > 1000);
+        QCOMPARE(hosts->columnCount(), 7);
+        QVERIFY(!hosts->isHeaderHidden());
+        QVERIFY(hosts->palette().color(QPalette::Base).lightness() < 128);
+        QVERIFY(hosts->palette().color(QPalette::Text).lightness() > 128);
+        QVERIFY(capture(QStringLiteral("servers")));
+
+        // Filtering and selecting records only read local configuration.
+        search->setText(QStringLiteral("does-not-match-any-host"));
+        for (int index = 0; index < hosts->topLevelItemCount(); ++index)
+            QVERIFY(hosts->topLevelItem(index)->isHidden());
+        search->setText(servers.first().group);
+        QVERIFY(manager->selectServerById(servers.first().id));
+        auto *first = hosts->currentItem();
+        QVERIFY(first && !first->isHidden());
+        QCOMPARE(first->text(1), servers.first().host);
+        QCOMPARE(first->text(2), QString::number(servers.first().port));
+        QCOMPARE(first->text(3), servers.first().user);
+        search->clear();
+        QCOMPARE(credentials.loadCalls, 0);
+        QCOMPARE(credentials.saveCalls, 0);
+        QCOMPARE(workspace->sessionCount(), 0);
+        QVERIFY(!window.findChild<noxshell::SshSession *>());
+
+        window.resize(1180, 720);
+        QTest::qWait(50);
+        QVERIFY(manager->width() > 700);
+        QVERIFY(hosts->header()->sectionViewportPosition(6) + hosts->columnWidth(6) <= hosts->viewport()->width());
+        QVERIFY(capture(QStringLiteral("compact")));
+        hosts->itemDoubleClicked(first, 1);
+        QTRY_COMPARE_WITH_TIMEOUT(workspace->sessionCount(), 1, 1000);
+        auto *session = workspace->findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QTRY_VERIFY_WITH_TIMEOUT(session->isConnected(), 1000);
+        QVERIFY(filePane->isVisible());
+        QVERIFY(splitter->handle(1)->isVisible());
+        window.resize(1440, 900);
+        QTest::qWait(50);
+        splitter->setSizes({450, 410});
+        const auto previousSplit = splitter->sizes();
+        const auto splitRestored = [&] {
+            const auto sizes = splitter->sizes();
+            return sizes.size() == 2 && qAbs(sizes.at(0) - previousSplit.at(0)) <= 2
+                && qAbs(sizes.at(1) - previousSplit.at(1)) <= 2;
+        };
+        auto *fileStack = window.findChild<QStackedWidget *>(QStringLiteral("fileWorkspaceStack"));
+        QVERIFY(fileStack);
+        auto *originalFilePanel = fileStack->currentWidget();
+        QSignalSpy connectionChanges(session, &noxshell::SshSession::connectionChanged);
+        auto *terminal = workspace->findChild<noxshell::ui::TerminalView *>();
+        QVERIFY(terminal);
+        const auto buffer = terminal->plainText();
+        auto *newTab = workspace->findChild<QToolButton *>(QStringLiteral("terminalNewTabButton"));
+        auto *sessions = workspace->findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
+        QVERIFY(newTab && sessions);
+        newTab->click();
+        QVERIFY(filePane->isHidden());
+        QTRY_COMPARE(terminalPane->height(), splitter->height());
+        QCOMPARE(home->currentIndex(), 1);
+        QVERIFY(manager->isVisible());
+        home->setCurrentIndex(0);
+        QVERIFY(history->isVisible());
+        sessions->tabBarClicked(0);
+        QVERIFY(terminal->isVisible());
+        QVERIFY(filePane->isVisible());
+        QTRY_VERIFY(splitRestored());
+        QCOMPARE(fileStack->currentWidget(), originalFilePanel);
+        QCOMPARE(terminal->plainText(), buffer);
+        QVERIFY(session->isConnected());
+        QCOMPARE(connectionChanges.count(), 0);
+        QCOMPARE(credentials.loadCalls, 0);
+
+        // Repeated navigation must not accumulate splitter-rounding drift.
+        for (int index = 0; index < 4; ++index) {
+            newTab->click();
+            sessions->tabBarClicked(0);
+            QTRY_VERIFY(splitRestored());
+        }
+
+        // Explicitly hiding files must remain in effect after visiting home.
+        auto *fileToggle = workspace->findChild<QToolButton *>(QStringLiteral("fileWorkspaceToggleButton"));
+        QVERIFY(fileToggle);
+        fileToggle->click();
+        QVERIFY(filePane->isHidden());
+        newTab->click();
+        sessions->tabBarClicked(0);
+        QVERIFY(filePane->isHidden());
+        fileToggle->click();
+        QVERIFY(filePane->isVisible());
+        QTRY_VERIFY(splitRestored());
+        sessions->tabCloseRequested(0);
+        QTRY_COMPARE(workspace->sessionCount(), 0);
+        QVERIFY(workspace->isHomePageVisible());
+        QVERIFY(filePane->isHidden());
+        QTRY_COMPARE(terminalPane->height(), splitter->height());
+    }
+
+    void startupAndHostBrowsingNeverReadCredentials()
+    {
+        QTemporaryDir directory;
+        const auto database = directory.filePath(QStringLiteral("silent-startup.sqlite3"));
+        noxshell::ServerRepository repository(database, false);
+        QVERIFY(repository.initialize());
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("silent-startup");
+        profile.name = QStringLiteral("silent-startup");
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/silent-startup");
+        QVERIFY(repository.saveServer(profile));
+        QVERIFY(repository.recordSuccessfulLogin(profile.id));
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        for (int startup = 0; startup < 3; ++startup) {
+            noxshell::ui::MainWindow window(database, nullptr, &credentials);
+            window.show();
+            QTest::qWait(80);
+            auto *sidebar = window.findChild<noxshell::ui::HostSidebar *>();
+            QVERIFY(sidebar);
+            sidebar->selectFirstServer();
+            QVERIFY(sidebar->selectServerById(profile.id));
+            auto *recent = window.findChild<QTreeWidget *>(QStringLiteral("recentLoginList"));
+            QVERIFY(recent);
+            QCOMPARE(recent->topLevelItemCount(), 1);
+            QCOMPARE(credentials.loadCalls, 0);
+            QCOMPARE(credentials.saveCalls, 0);
+        }
+    }
+
+    void unreadableCredentialUsesSshPasswordWithoutAuthorization()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("password-entry.sqlite3")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("password-entry");
+        profile.name = profile.id;
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/old-entry");
+        QVERIFY(repository.saveServer(profile));
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("old-synthetic-only"), {}});
+        noxshell::ui::TerminalWorkspace workspace(&repository, &credentials);
+        workspace.openOrActivate(profile, false);
+        workspace.show();
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QObject::disconnect(session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        QSignalSpy saved(session, &noxshell::SshSession::credentialReferenceChanged);
+        auto *password = workspace.findChild<QLineEdit *>(QStringLiteral("terminalConnectionPassword"));
+        auto *submit = workspace.findChild<QPushButton *>(QStringLiteral("terminalPasswordConnectButton"));
+        auto *remember = workspace.findChild<QCheckBox *>(QStringLiteral("terminalRememberPassword"));
+        QVERIFY(password && submit && remember);
+        QVERIFY(!workspace.findChild<QPushButton *>(QStringLiteral("terminalAuthorizeCredentialsButton")));
+        for (int attempt = 0; attempt < 3; ++attempt) workspace.openOrActivate(profile, true);
+        QCOMPARE(requests.size(), 0);
+        QVERIFY(password->isVisible());
+        QCOMPARE(password->echoMode(), QLineEdit::Password);
+        const auto screenshot = qEnvironmentVariable("NOXSHELL_AUTH_UI_SCREENSHOT");
+        if (!screenshot.isEmpty()) {
+            workspace.resize(900, 480);
+            QTest::qWait(50);
+            QVERIFY(workspace.grab().save(screenshot));
+        }
+        submit->click(); // Do not try an empty password.
+        QCOMPARE(requests.size(), 0);
+        const auto reads = credentials.loadCalls;
+        const auto exact = QStringLiteral("  SSH。密码 $();  ");
+        password->setText(exact);
+        submit->click();
+        submit->click(); // Duplicate submit cannot enqueue another handshake.
+        QCOMPARE(credentials.loadCalls, reads);
+        QCOMPARE(credentials.saveCalls, 0); // Not remembered before authentication.
+        QCOMPARE(requests.size(), 1);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.first().at(0)).password, exact);
+        QVERIFY(password->text().isEmpty());
+        QVERIFY(session->profile().password.isEmpty());
+        QVERIFY(!password->isVisible());
+        const auto generation = requests.first().at(1).toULongLong();
+        QVERIFY(QMetaObject::invokeMethod(session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("SSH 已连接")), Q_ARG(quint64, generation)));
+        QCOMPARE(saved.size(), 1);
+        QCOMPARE(credentials.saveCalls, 1);
+        const auto current = repository.loadServers().first();
+        QVERIFY(current.credentialRef != profile.credentialRef);
+        QCOMPARE(credentials.secrets.value(profile.credentialRef).password, QStringLiteral("old-synthetic-only"));
+        QCOMPARE(credentials.secrets.value(current.credentialRef).password, exact);
+        QCOMPARE(session->profile().credentialRef, current.credentialRef);
+
+        // A new session reads the new reference; no additional password entry.
+        credentials.failLoads = false;
+        noxshell::SshSession restarted(&repository, &credentials);
+        QObject::disconnect(&restarted, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy restartedRequests(&restarted, &noxshell::SshSession::connectRequested);
+        restarted.connectTo(current);
+        QCOMPARE(restartedRequests.size(), 1);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(restartedRequests.first().at(0)).password, exact);
+    }
+
+    void credentialReferenceUpdatePreservesEditsAndNeverResurrectsDeletedHost()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("reference-cas.sqlite3")), false);
+        QVERIFY(repository.initialize());
+        noxshell::ServerProfile original;
+        original.id = QStringLiteral("reference-cas");
+        original.host = QStringLiteral("192.0.2.10");
+        original.user = QStringLiteral("test");
+        original.credentialRef = QStringLiteral("old-reference");
+        QVERIFY(repository.saveServer(original));
+        auto edited = original;
+        edited.name = QStringLiteral("renamed-during-login");
+        QVERIFY(repository.saveServer(edited));
+        QVERIFY(repository.replaceCredentialReference(original, QStringLiteral("new-reference")));
+        QCOMPARE(repository.loadServers().first().name, edited.name);
+        QCOMPARE(repository.loadServers().first().credentialRef, QStringLiteral("new-reference"));
+        QVERIFY(!repository.replaceCredentialReference(original, QStringLiteral("stale-reference")));
+        edited.credentialRef = QStringLiteral("new-reference");
+        QVERIFY(repository.deleteServer(original.id));
+        QVERIFY(!repository.replaceCredentialReference(edited, QStringLiteral("deleted-reference")));
+        QVERIFY(repository.loadServers().isEmpty());
+    }
+
+    void privateKeyRecoveryCanExplicitlyUseEmptyPassphrase()
+    {
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::SshSession session(nullptr, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+        QSignalSpy passwordRequired(&session, &noxshell::SshSession::passwordRequired);
+        noxshell::ServerProfile profile;
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.authentication = noxshell::AuthenticationMethod::PrivateKey;
+        profile.privateKeyPath = QStringLiteral("/synthetic/key");
+        profile.credentialRef = QStringLiteral("unreadable-old-key");
+        session.connectTo(profile);
+        QCOMPARE(passwordRequired.size(), 1);
+        QCOMPARE(requests.size(), 0);
+        session.connectWithPassword({}, false);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(requests.size(), 1);
+        const auto requested = qvariant_cast<noxshell::ServerProfile>(requests.first().at(0));
+        QVERIFY(requested.keyPassphrase.isEmpty());
+        QCOMPARE(requested.privateKeyPath, profile.privateKeyPath);
+    }
+
+    void typedPasswordReachesLocalSshServerUnchanged()
+    {
+        const auto executable = qEnvironmentVariable("NOXSHELL_AUTH_TEST_SERVER");
+        if (executable.isEmpty()) QSKIP("Requires the optional loopback-only synthetic SSH fixture");
+        QProcess server;
+        server.start(executable, {QStringLiteral("-password-case"), QStringLiteral("unicode")});
+        const auto cleanup = qScopeGuard([&] {
+            if (server.state() != QProcess::NotRunning) { server.kill(); server.waitForFinished(2000); }
+        });
+        QVERIFY(server.waitForStarted(3000));
+        QTRY_VERIFY_WITH_TIMEOUT(server.canReadLine(), 5000);
+        const auto endpoint = QJsonDocument::fromJson(server.readLine()).object();
+        QCOMPARE(endpoint.value(QStringLiteral("event")).toString(), QStringLiteral("listening"));
+        const auto port = endpoint.value(QStringLiteral("port")).toInt();
+        QVERIFY(port > 0 && port <= 65535);
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("ui-ssh.sqlite3")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("ui-ssh-synthetic");
+        profile.name = profile.id;
+        profile.host = QStringLiteral("127.0.0.1");
+        profile.port = static_cast<quint16>(port);
+        profile.user = QStringLiteral("fixture-user");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("old-unreadable-test-entry");
+        profile.expectedFingerprint = endpoint.value(QStringLiteral("fingerprint")).toString();
+        QVERIFY(profile.expectedFingerprint.startsWith(QStringLiteral("SHA256:")));
+        QVERIFY(repository.saveServer(profile));
+        noxshell::ui::TerminalWorkspace workspace(&repository, &credentials);
+        workspace.show();
+        workspace.openOrActivate(profile, true);
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        auto *password = workspace.findChild<QLineEdit *>(QStringLiteral("terminalConnectionPassword"));
+        QVERIFY(session && password && password->isVisible());
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        const auto exact = QStringLiteral("  SSH。密码é！'\u00a0🔑 $();  ");
+        password->setText(exact);
+        QTest::keyClick(password, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(session->isConnected(), 8000);
+        QCOMPARE(requests.size(), 1);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(credentials.saveCalls, 1);
+        const auto saved = repository.loadServers().first();
+        QVERIFY(saved.credentialRef != profile.credentialRef);
+        QCOMPARE(credentials.secrets.value(saved.credentialRef).password, exact);
+        QVERIFY(session->profile().password.isEmpty());
+        QVERIFY(password->text().isEmpty());
+        session->disconnectFromHost();
+    }
+
+    void rejectedStoredPasswordCanBeReplacedWithoutRereadingIt()
+    {
+        MemoryCredentialStore credentials;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("rejected-stored-password");
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.port = 2222;
+        profile.user = QStringLiteral("test");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("readable-but-rejected");
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("old-test-password"), {}});
+        noxshell::ui::TerminalWorkspace workspace(nullptr, &credentials);
+        workspace.openOrActivate(profile, false);
+        workspace.show();
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QObject::disconnect(session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        workspace.openOrActivate(profile, true);
+        QCOMPARE(requests.size(), 1);
+        const auto generation = requests.last().at(1).toULongLong();
+        QVERIFY(QMetaObject::invokeMethod(session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, false), Q_ARG(QString, QStringLiteral("SSH 认证失败")), Q_ARG(quint64, generation)));
+        QVERIFY(QMetaObject::invokeMethod(session, "handlePasswordRejected", Qt::DirectConnection, Q_ARG(quint64, generation)));
+        auto *password = workspace.findChild<QLineEdit *>(QStringLiteral("terminalConnectionPassword"));
+        auto *button = workspace.findChild<QPushButton *>(QStringLiteral("terminalPasswordConnectButton"));
+        auto *detail = workspace.findChild<QLabel *>(QStringLiteral("terminalLoadingDetail"));
+        QVERIFY(password && button && detail && password->isVisible());
+        QVERIFY(detail->text().contains(QStringLiteral("test@192.0.2.10:2222")));
+        QCOMPARE(requests.size(), 1); // No automatic network retry.
+        password->setText(QStringLiteral("corrected-test-password"));
+        button->click();
+        QCOMPARE(requests.size(), 2);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.last().at(0)).password, QStringLiteral("corrected-test-password"));
+        QVERIFY(!password->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(session, "handlePasswordRejected", Qt::DirectConnection, Q_ARG(quint64, generation)));
+        QVERIFY(!password->isVisible()); // Late rejection from the previous attempt is discarded.
+        session->disconnectFromHost();
+    }
+
+    void passwordRecoveryDoesNotSaveFailuresOrCanceledAttempts()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("password-failure.sqlite3")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("password-failure");
+        profile.name = profile.id;
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/old-failure");
+        QVERIFY(repository.saveServer(profile));
+        noxshell::SshSession session(&repository, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+        QSignalSpy notices(&session, &noxshell::SshSession::credentialSaveNotice);
+        const auto begin = [&] {
+            session.connectTo(profile);
+            session.connectWithPassword(QStringLiteral("synthetic-only"), true);
+            return requests.last().at(1).toULongLong();
+        };
+        auto generation = begin();
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, false), Q_ARG(QString, QStringLiteral("SSH 认证失败")), Q_ARG(quint64, generation)));
+        QCOMPARE(credentials.saveCalls, 0);
+        generation = begin();
+        session.disconnectFromHost();
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("SSH 已连接")), Q_ARG(quint64, generation)));
+        QCOMPARE(credentials.saveCalls, 0);
+        const auto count = requests.size();
+        session.connectWithPassword(QStringLiteral("stale-password"), true);
+        QCOMPARE(requests.size(), count);
+        generation = begin();
+        credentials.failSaves = true;
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("SSH 已连接")), Q_ARG(quint64, generation)));
+        QVERIFY(session.isConnected()); // Remembering is optional, login is not blocked.
+        QCOMPARE(notices.size(), 1);
+        QCOMPARE(repository.loadServers().first().credentialRef, profile.credentialRef);
+        credentials.failSaves = false;
+        session.connectTo(profile);
+        session.connectWithPassword(QStringLiteral("session-only"), false);
+        generation = requests.last().at(1).toULongLong();
+        const auto saves = credentials.saveCalls;
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("SSH 已连接")), Q_ARG(quint64, generation)));
+        QCOMPARE(credentials.saveCalls, saves);
+        generation = begin();
+        profile.host = QStringLiteral("192.0.2.20");
+        QVERIFY(repository.saveServer(profile)); // Host edited while authentication was in flight.
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("SSH 已连接")), Q_ARG(quint64, generation)));
+        QCOMPARE(credentials.saveCalls, saves);
+        QCOMPARE(repository.loadServers().first().host, profile.host);
+    }
+
+    void connectionTestRequestsSshPasswordInline()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("silent-test.sqlite3")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("silent-dialog");
+        profile.name = profile.id;
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/silent-dialog");
+        noxshell::ui::ServerDialog dialog(profile);
+        dialog.setConnectionServices(&repository, &credentials);
+        dialog.show();
+        auto *test = dialog.findChild<QPushButton *>(QStringLiteral("dialogTestConnectionButton"));
+        auto *password = dialog.findChild<QLineEdit *>(QStringLiteral("passwordEditor"));
+        QVERIFY(test && password);
+        QVERIFY(!dialog.findChild<QPushButton *>(QStringLiteral("dialogAuthorizeCredentialsButton")));
+        QCOMPARE(credentials.loadCalls, 0);
+        test->click();
+        QCOMPARE(credentials.loadCalls, 1);
+        QVERIFY(test->isEnabled());
+        QVERIFY(!dialog.findChild<QProgressDialog *>());
+        QVERIFY(!dialog.findChild<QMessageBox *>());
+        QVERIFY(password->text().isEmpty());
+    }
+
+    void rdpUnreadableCredentialOffersRemotePasswordEditor()
+    {
+        QTemporaryDir directory;
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("silent-rdp.sqlite3")), nullptr, &credentials);
+        window.show();
+        auto *sidebar = window.findChild<noxshell::ui::HostSidebar *>();
+        QVERIFY(sidebar);
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("silent-rdp");
+        profile.name = profile.id;
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test");
+        profile.connectionMode = noxshell::ConnectionMode::Rdp;
+        profile.credentialRef = QStringLiteral("rdp/silent-rdp");
+        auto *enter = window.findChild<QPushButton *>(QStringLiteral("rdpEnterPasswordButton"));
+        QVERIFY(enter);
+        sidebar->serverConnectRequested(profile);
+        QCOMPARE(credentials.loadCalls, 1);
+        QVERIFY(enter->isVisible());
+        bool edited = false;
+        QTimer::singleShot(0, &window, [&] {
+            if (auto *dialog = window.findChild<noxshell::ui::RdpDialog *>()) {
+                edited = true;
+                dialog->reject(); // Never launch an actual RDP client.
+            }
+        });
+        enter->click();
+        QVERIFY(edited);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(credentials.saveCalls, 0);
+    }
+
+    void repeatedConnectDuringCredentialAuthorizationUsesOneRequest()
+    {
+        MemoryCredentialStore credentials;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("authorization-test");
+        profile.name = QStringLiteral("授权测试");
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test-user");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/authorization-test");
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("synthetic-only"), {}});
+        noxshell::ui::TerminalWorkspace workspace(nullptr, &credentials);
+        workspace.openOrActivate(profile, false);
+        workspace.show();
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QObject::disconnect(session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        bool connectingDuringAuthorization = false;
+        credentials.onLoad = [&] {
+            auto *stack = workspace.findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+            connectingDuringAuthorization = stack && stack->currentWidget()
+                && stack->currentWidget()->property("terminalConnectionPhase").toInt() == 1;
+            QEventLoop authorization;
+            QTimer::singleShot(0, &authorization, [&] {
+                workspace.openOrActivate(profile, true);
+                authorization.quit();
+            });
+            authorization.exec();
+        };
+        workspace.openOrActivate(profile, true);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(requests.size(), 1);
+        QVERIFY(connectingDuringAuthorization);
+        QVERIFY(workspace.hasConnectingSession(profile.id));
+        // Repeated clicks during TCP/authentication must not restart the attempt.
+        workspace.openOrActivate(profile, true);
+        QCOMPARE(credentials.loadCalls, 1);
+        QCOMPARE(requests.size(), 1);
+    }
+
+    void canceledCredentialAuthorizationCannotStartSshLater()
+    {
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+        noxshell::ServerProfile profile;
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test-user");
+        profile.credentialRef = QStringLiteral("server/canceled-authorization");
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("synthetic-only"), {}});
+        credentials.onLoad = [&] { session.disconnectFromHost(); };
+        session.connectTo(profile);
+        QCOMPARE(requests.size(), 0);
+        session.connectTo(profile);
+        QCOMPARE(requests.size(), 1);
+        QCOMPARE(credentials.loadCalls, 2);
+    }
+
+    void closingTabDuringAuthorizationDiscardsItsResult()
+    {
+        MemoryCredentialStore credentials;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("closed-authorization");
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test-user");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/closed-authorization");
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("synthetic-only"), {}});
+        noxshell::ui::TerminalWorkspace workspace(nullptr, &credentials);
+        workspace.openOrActivate(profile, false);
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QObject::disconnect(session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        credentials.onLoad = [&] {
+            workspace.closeServer(profile.id);
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        };
+        workspace.openOrActivate(profile, true);
+        QCOMPARE(requests.size(), 0);
+        QCOMPARE(workspace.sessionCount(), 0);
+    }
+
+    void credentialFailureIsVisibleAndCanBeRetried()
+    {
+        MemoryCredentialStore credentials;
+        credentials.failLoads = true;
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("denied-authorization");
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("test-user");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        profile.credentialRef = QStringLiteral("server/denied-authorization");
+        noxshell::ui::TerminalWorkspace workspace(nullptr, &credentials);
+        workspace.openOrActivate(profile, false);
+        auto *session = workspace.findChild<noxshell::SshSession *>();
+        auto *output = workspace.findChild<noxshell::ui::TerminalView *>();
+        QVERIFY(session);
+        QVERIFY(output);
+        QObject::disconnect(session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
+        workspace.openOrActivate(profile, true);
+        QCOMPARE(requests.size(), 0);
+        QVERIFY(workspace.findChild<QLineEdit *>(QStringLiteral("terminalConnectionPassword")));
+        credentials.failLoads = false;
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("synthetic-only"), {}});
+        workspace.openOrActivate(profile, true);
+        QCOMPARE(requests.size(), 1);
+        QCOMPARE(credentials.loadCalls, 2);
     }
 
     void sshCredentialLoadingPreservesExplicitInputAndStopsOnFailure()
@@ -3169,7 +3913,7 @@ private slots:
         credentials.failLoads = true;
         session.connectTo(profile);
         QCOMPARE(requests.count(), 0);
-        QVERIFY(states.last().at(1).toString().contains(QStringLiteral("凭据读取失败")));
+        QVERIFY(states.last().at(1).toString().contains(QStringLiteral("SSH 密码")));
 
         profile.authentication = noxshell::AuthenticationMethod::PrivateKey;
         profile.keyPassphrase = QStringLiteral("explicit。私钥 ");
@@ -3237,10 +3981,11 @@ private slots:
 
         credentials.failLoads = true;
         bool sawFailure = false;
+        const auto readsBeforeMetadataEdit = credentials.loadCalls;
         QTimer::singleShot(0, &window, [&] {
             auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
             if (!dialog) return;
-            dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("must-not-save"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("renamed-without-keychain"));
             QTimer::singleShot(0, &window, [&] {
                 for (auto *widget : QApplication::topLevelWidgets()) {
                     if (auto *message = qobject_cast<QMessageBox *>(widget)) {
@@ -3252,11 +3997,31 @@ private slots:
             dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
         });
         sidebar->serverEditRequested(saved);
-        QVERIFY(sawFailure);
+        QVERIFY(!sawFailure);
+        QCOMPARE(credentials.loadCalls, readsBeforeMetadataEdit);
         QCOMPARE(credentials.saveCalls, 1);
         QCOMPARE(credentials.secrets.value(saved.credentialRef).password.toUtf8(), exactPassword.toUtf8());
         for (const auto &profile : repository->loadServers()) {
-            if (profile.id == saved.id) QCOMPARE(profile.name, saved.name);
+            if (profile.id == saved.id) {
+                QCOMPARE(profile.name, QStringLiteral("renamed-without-keychain"));
+                QCOMPARE(profile.credentialRef, saved.credentialRef);
+            }
+        }
+        const auto replacement = QStringLiteral("new synthetic SSH password");
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("passwordEditor"))->setText(replacement);
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->serverEditRequested(saved);
+        QCOMPARE(credentials.loadCalls, readsBeforeMetadataEdit);
+        QCOMPARE(credentials.saveCalls, 2);
+        QCOMPARE(credentials.secrets.value(saved.credentialRef).password, exactPassword);
+        for (const auto &profile : repository->loadServers()) {
+            if (profile.id != saved.id) continue;
+            QVERIFY(profile.credentialRef != saved.credentialRef);
+            QCOMPARE(credentials.secrets.value(profile.credentialRef).password, replacement);
         }
     }
 
@@ -3328,20 +4093,21 @@ private slots:
         QVERIFY(!unexpectedFailure);
         QCOMPARE(credentials.loadCalls, 0);
         QCOMPARE(credentials.saveCalls, 1);
-        QVERIFY(credentials.secrets.contains(agent.credentialRef));
-        QVERIFY(credentials.secrets.value(agent.credentialRef).keyPassphrase.isEmpty());
         auto privateKeyProfile = agent;
         for (const auto &profile : repository->loadServers()) {
             if (profile.id == agent.id) privateKeyProfile = profile;
         }
         QCOMPARE(privateKeyProfile.authentication, noxshell::AuthenticationMethod::PrivateKey);
+        QVERIFY(privateKeyProfile.credentialRef != agent.credentialRef);
+        QVERIFY(credentials.secrets.contains(privateKeyProfile.credentialRef));
+        QVERIFY(credentials.secrets.value(privateKeyProfile.credentialRef).keyPassphrase.isEmpty());
 
         // An existing private key still needs its saved passphrase; a genuine
         // credential-store read error must not be treated as an empty passphrase.
         noxshell::ui::ServerDialog existingKeyDialog(privateKeyProfile);
         existingKeyDialog.setConnectionServices(repository, &credentials);
         existingKeyDialog.findChild<QPushButton *>(QStringLiteral("dialogTestConnectionButton"))->click();
-        QVERIFY(unexpectedFailure);
+        QVERIFY(!unexpectedFailure); // Inline server-password guidance, no modal authorization.
         QCOMPARE(credentials.loadCalls, 1);
         QVERIFY(!existingKeyDialog.findChild<QProgressDialog *>());
         QCOMPARE(credentials.saveCalls, 1);
@@ -3495,6 +4261,54 @@ private slots:
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
+#ifdef Q_OS_MACOS
+    if (app.arguments().size() == 3 && app.arguments().at(1) == QStringLiteral("--silent-keychain-probe")) {
+        const auto reference = app.arguments().at(2);
+        if (!reference.startsWith(QStringLiteral("noxshell-test-legacy-"))
+            || QUuid(reference.mid(21)).isNull()) return 2;
+        Boolean before = false;
+        if (SecKeychainGetUserInteractionAllowed(&before) != errSecSuccess || !before) return 3;
+        noxshell::CredentialStore store;
+        QElapsedTimer elapsed;
+        elapsed.start();
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const auto secret = store.load(reference);
+            if (!secret.password.isEmpty() || !secret.keyPassphrase.isEmpty() || !store.authorizationRequired()) return 4;
+            Boolean after = false;
+            if (SecKeychainGetUserInteractionAllowed(&after) != errSecSuccess || after != before) return 5;
+        }
+        // Writes/deletes must not prompt either, even on an inaccessible item.
+        store.save(reference, {QStringLiteral("synthetic-update-only"), {}});
+        Boolean after = false;
+        if (SecKeychainGetUserInteractionAllowed(&after) != errSecSuccess || after != before) return 7;
+        store.remove(reference);
+        if (SecKeychainGetUserInteractionAllowed(&after) != errSecSuccess || after != before) return 8;
+        return elapsed.elapsed() < 2000 ? 0 : 6;
+    }
+    if (app.arguments().size() == 4 && app.arguments().at(1) == QStringLiteral("--owned-keychain-probe")) {
+        const auto reference = app.arguments().at(2);
+        if (!reference.startsWith(QStringLiteral("noxshell-test-owned-")) || QUuid(reference.mid(20)).isNull()) return 2;
+        Boolean before = false;
+        if (SecKeychainGetUserInteractionAllowed(&before) != errSecSuccess || !before) return 3;
+        noxshell::CredentialStore store;
+        const auto operation = app.arguments().at(3);
+        const auto password = QStringLiteral(" synthetic \"你好\" $(); ");
+        const auto passphrase = QStringLiteral("synthetic-passphrase");
+        bool ok = false;
+        if (operation == QStringLiteral("create")) ok = store.save(reference, {password, passphrase});
+        else if (operation == QStringLiteral("update")) ok = store.save(reference, {QStringLiteral("updated-synthetic-only"), passphrase});
+        else if (operation == QStringLiteral("delete")) ok = store.remove(reference);
+        else if (operation == QStringLiteral("read") || operation == QStringLiteral("read-updated")) {
+            const auto secret = store.load(reference);
+            ok = store.lastError().isEmpty() && secret.keyPassphrase == passphrase
+                && secret.password == (operation == QStringLiteral("read") ? password : QStringLiteral("updated-synthetic-only"));
+        }
+        if (!ok) return 4;
+        Boolean after = false;
+        if (SecKeychainGetUserInteractionAllowed(&after) != errSecSuccess || after != before) return 5;
+        return 0;
+    }
+#endif
     QApplication::setApplicationName(QStringLiteral("玄壳"));
     QApplication::setOrganizationName(QStringLiteral("NoxShell"));
     QApplication::setApplicationVersion(QString::fromLatin1(NOXSHELL_APP_VERSION));

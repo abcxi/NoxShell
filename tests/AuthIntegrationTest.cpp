@@ -82,6 +82,7 @@ public:
 
 struct ConnectionAttempt {
     bool connected{};
+    bool passwordRejected{};
     QStringList messages;
     qint64 elapsedMs{};
     qint64 firstOutputMs{-1};
@@ -112,6 +113,8 @@ ConnectionAttempt attemptConnection(LocalSshServer &server, int timeoutMs,
 {
     noxshell::Libssh2Worker worker(nullptr, timeoutMs);
     ConnectionAttempt attempt;
+    QObject::connect(&worker, &noxshell::Libssh2Worker::passwordAuthenticationRejected,
+        &worker, [&](quint64) { attempt.passwordRejected = true; });
     QElapsedTimer elapsed;
     QObject::connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived,
         &worker, [&](const QByteArray &) {
@@ -182,11 +185,47 @@ private slots:
         QCOMPARE(server.startedMethods(), expectedMethods);
     }
 
+    void unicodePasswordIsSentByteForByte_data()
+    {
+        QTest::addColumn<QString>("method");
+        QTest::newRow("ordinary") << QStringLiteral("password");
+        QTest::newRow("interactive") << QStringLiteral("interactive");
+    }
+
+    void unicodePasswordIsSentByteForByte()
+    {
+        QFETCH(QString, method);
+        LocalSshServer server;
+        QVERIFY2(server.start({"-auth", method, "-password-case", "unicode"}), server.error().constData());
+        const auto attempt = attemptConnection(server, 5000, QStringLiteral("  SSH。密码é！'\u00a0🔑 $();  "));
+        QVERIFY2(attempt.connected, qPrintable(attempt.messages.join('\n')));
+        QVERIFY(!attempt.passwordRejected);
+    }
+
     void metricsCollectionIsBoundedAndShellRemainsUsable_data()
     {
         QTest::addColumn<QString>("mode");
         QTest::newRow("normal") << QStringLiteral("normal");
         QTest::newRow("oversized") << QStringLiteral("oversized");
+    }
+
+    void connectionStatesRetainTheirAttemptGeneration()
+    {
+        LocalSshServer server;
+        QVERIFY2(server.start({"-auth", "password"}), server.error().constData());
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        QSignalSpy states(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        const auto generation = worker.connectionGeneration();
+        worker.connectTo(fixtureProfile(server.port), generation);
+        QVERIFY(!states.isEmpty());
+        QVERIFY(states.last().at(0).toBool());
+        worker.cancelConnection();
+        QVERIFY(worker.connectionGeneration() != generation);
+        worker.disconnectFromHost();
+        QVERIFY(!states.last().at(0).toBool());
+        // Even a queued old disconnect must identify its original attempt.
+        for (const auto &event : states) QCOMPARE(event.at(2).toULongLong(), generation);
     }
 
     void metricsCollectionIsBoundedAndShellRemainsUsable()
@@ -454,6 +493,7 @@ private slots:
         const auto attempt = attemptConnection(server, 5000, QStringLiteral("deliberately-wrong-test-password"));
         const auto messages = attempt.messages.join('\n');
         QVERIFY(!attempt.connected);
+        QVERIFY(attempt.passwordRejected);
         QVERIFY2(messages.contains(QStringLiteral("SSH 认证失败")), qPrintable(messages));
         QVERIFY2(messages.contains(QStringLiteral("libssh2 -18")), qPrintable(messages));
         QVERIFY2(!messages.contains(QStringLiteral("超时")), qPrintable(messages));
