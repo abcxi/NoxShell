@@ -3,6 +3,8 @@
 #include "../core/ServerProfile.h"
 
 #include <QWidget>
+#include <QPointer>
+#include <QList>
 
 class QStackedWidget;
 class QTabBar;
@@ -54,6 +56,8 @@ private:
     void addSession(const ServerProfile &profile, bool activate, bool persist, bool connectNow);
     void duplicateSessionAt(int index);
     void closeSession(int index);
+    void removeSession(int index);
+    void requestCloseSessions(const QList<QPointer<QWidget>> &pages, const QString &title);
     void installCloseButton(int index);
     void closeOtherSessions(int index);
     void closeAllSessions();
@@ -81,6 +85,7 @@ private:
     QAction *m_closeOthersAction{};
     int m_tabContextIndex{-1};
     bool m_fileWorkspaceVisible{true};
+    bool m_confirmingClose{false};
 };
 
 } // namespace noxshell::ui

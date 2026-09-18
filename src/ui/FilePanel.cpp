@@ -3,9 +3,12 @@
 #include "../core/SshSession.h"
 #include "FilePermissionDialog.h"
 #include "RemoteFileEditor.h"
+#include "RemotePathEdit.h"
 #include "TransferQueuePanel.h"
 
 #include <QDir>
+#include <QCheckBox>
+#include <QCursor>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
@@ -22,13 +25,18 @@
 #include <QMimeData>
 #include <QProcess>
 #include <QProgressBar>
+#include <QPainter>
+#include <QMouseEvent>
 #include <QStandardPaths>
 #include <QSplitter>
+#include <QShortcut>
 #include <QStackedLayout>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
 #include <QStyle>
+#include <QStyledItemDelegate>
+#include <QStyleOptionHeader>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidgetAction>
@@ -46,6 +54,175 @@ constexpr int kDirectoryLoadedRole = Qt::UserRole + 2;
 constexpr int kPlaceholderRole = Qt::UserRole + 3;
 constexpr int kPermissionsRole = Qt::UserRole + 4;
 constexpr int kSymbolicLinkRole = Qt::UserRole + 5;
+constexpr int kSizeRole = Qt::UserRole + 6;
+constexpr int kSizeKnownRole = Qt::UserRole + 7;
+constexpr int kSizeStateRole = Qt::UserRole + 8;
+constexpr int kSizeErrorRole = Qt::UserRole + 9;
+enum SizeState { UnknownSize, QueuedSize, RunningSize, ReadySize, FailedSize };
+
+// Paint vector controls only for visible rows: no per-directory widgets or timers.
+QRect sizeActionRect(const QRect &cell)
+{
+    return QRect(cell.left() + 5, cell.center().y() - 11, 22, 22);
+}
+
+bool hasSizeAction(const QModelIndex &index)
+{
+    const auto entry = index.siblingAtColumn(0);
+    return index.column() == 1 && entry.data(kDirectoryRole).toBool()
+        && !entry.data(kSymbolicLinkRole).toBool();
+}
+
+bool sizeActionEnabled(const QModelIndex &index)
+{
+    const int state = index.siblingAtColumn(0).data(kSizeStateRole).toInt();
+    return hasSizeAction(index) && state != QueuedSize && state != RunningSize;
+}
+
+class FileHeader final : public QHeaderView {
+public:
+    explicit FileHeader(QWidget *parent) : QHeaderView(Qt::Horizontal, parent)
+    {
+        setObjectName(QStringLiteral("remoteFileHeader"));
+        setFixedHeight(36);
+        setHighlightSections(false);
+        setMouseTracking(true);
+    }
+
+protected:
+    void paintSection(QPainter *painter, const QRect &rect, int column) const override
+    {
+        if (!rect.isValid()) return;
+        painter->save();
+        QStyleOptionHeader option;
+        initStyleOption(&option);
+        initStyleOptionForIndex(&option, column);
+        option.rect = rect;
+        option.text.clear();
+        option.sortIndicator = QStyleOptionHeader::None;
+        style()->drawControl(QStyle::CE_Header, &option, painter, this);
+
+        const bool sortable = column == 0 || column == 1;
+        const bool active = sortable && sortIndicatorSection() == column;
+        auto textColor = palette().color(QPalette::Text);
+        textColor.setAlpha(active ? 255 : 190);
+        auto labelFont = font();
+        labelFont.setPixelSize(12);
+        labelFont.setWeight(QFont::Medium);
+        painter->setFont(labelFont);
+        painter->setPen(active ? palette().color(QPalette::Link) : textColor);
+        const auto labelRect = rect.adjusted(10, 0, sortable ? -31 : -10, -1);
+        painter->drawText(labelRect, Qt::AlignLeft | Qt::AlignVCenter,
+            QFontMetrics(labelFont).elidedText(model()->headerData(column, orientation()).toString(),
+                Qt::ElideRight, labelRect.width()));
+        auto divider = palette().color(QPalette::Text);
+        divider.setAlpha(24);
+        painter->setPen(divider);
+        painter->drawLine(rect.right(), rect.top() + 11, rect.right(), rect.bottom() - 11);
+        if (sortable) {
+            painter->setRenderHint(QPainter::Antialiasing);
+            auto muted = palette().color(QPalette::Text);
+            muted.setAlpha(85);
+            const qreal y = rect.center().y();
+            for (int direction = 0; direction < 2; ++direction) {
+                const bool selected = active && (sortIndicatorOrder() == Qt::AscendingOrder) == (direction == 0);
+                painter->setPen(QPen(selected ? palette().color(QPalette::Link) : muted,
+                    1.35, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+                const qreal x = rect.right() - 22 + direction * 8;
+                const qreal tip = y + (direction == 0 ? -5 : 5);
+                const qreal tail = y + (direction == 0 ? 5 : -5);
+                const qreal shoulder = tip + (direction == 0 ? 3 : -3);
+                painter->drawLine(QPointF(x, tail), QPointF(x, tip));
+                painter->drawPolyline(QPolygonF{QPointF(x - 2.5, shoulder), QPointF(x, tip), QPointF(x + 2.5, shoulder)});
+            }
+        }
+        painter->restore();
+    }
+};
+
+class FileSizeDelegate final : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        auto background = option;
+        initStyleOption(&background, index);
+        const auto text = background.text;
+        background.text.clear();
+        const auto *widget = option.widget;
+        if (!widget) return;
+        widget->style()->drawControl(QStyle::CE_ItemViewItem, &background, painter, widget);
+        painter->save();
+        painter->setClipRect(option.rect);
+        const bool action = hasSizeAction(index);
+        const auto textRect = option.rect.adjusted(action ? 34 : 8, 0, -9, 0);
+        // Let the stylesheet resolve selection text colors (light mode uses
+        // blue text on pale blue, unlike the application palette's white).
+        auto label = background;
+        label.rect = textRect;
+        label.text = text;
+        label.displayAlignment = Qt::AlignRight | Qt::AlignVCenter;
+        label.textElideMode = Qt::ElideLeft;
+        label.state &= ~QStyle::State_HasFocus;
+        widget->style()->drawControl(QStyle::CE_ItemViewItem, &label, painter, widget);
+        if (action) {
+            const auto button = sizeActionRect(option.rect);
+            const bool enabled = sizeActionEnabled(index) && (option.state & QStyle::State_Enabled);
+            const auto *view = qobject_cast<const QAbstractItemView *>(widget);
+            const auto *surface = view ? view->viewport() : widget;
+            const bool hovered = enabled && (option.state & QStyle::State_MouseOver)
+                && button.contains(surface->mapFromGlobal(QCursor::pos()));
+            auto color = background.palette.color(QPalette::Link);
+            if (!enabled) color.setAlpha(95);
+            painter->setRenderHint(QPainter::Antialiasing);
+            if (hovered) {
+                auto fill = color;
+                fill.setAlpha(24);
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(fill);
+                painter->drawRoundedRect(button, 4, 4);
+            }
+            painter->setBrush(Qt::NoBrush);
+            painter->setPen(QPen(color, 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            const auto center = QPointF(button.center());
+            const int state = index.siblingAtColumn(0).data(kSizeStateRole).toInt();
+            if (state == RunningSize || state == QueuedSize) {
+                painter->drawEllipse(center, 5, 5);
+                painter->drawPolyline(QPolygonF{center + QPointF(0, -3), center, center + QPointF(2.5, 1)});
+            } else {
+                painter->drawArc(QRectF(center.x() - 5, center.y() - 5, 10, 10), 45 * 16, 290 * 16);
+                painter->drawPolyline(QPolygonF{center + QPointF(0.5, -3.5),
+                    center + QPointF(4, -3.5), center + QPointF(4, -7)});
+            }
+        }
+        painter->restore();
+    }
+};
+
+class FileListItem final : public QTreeWidgetItem {
+public:
+    using QTreeWidgetItem::QTreeWidgetItem;
+    bool operator<(const QTreeWidgetItem &other) const override
+    {
+        const auto *tree = treeWidget();
+        const int column = tree ? tree->sortColumn() : 0;
+        const bool descending = tree && tree->header()->sortIndicatorOrder() == Qt::DescendingOrder;
+        if (column == 1) {
+            const bool known = data(0, kSizeKnownRole).toBool();
+            const bool otherKnown = other.data(0, kSizeKnownRole).toBool();
+            // Unknown sizes remain last in both ascending and descending views.
+            if (known != otherKnown) return descending ? !known : known;
+            const auto size = data(0, kSizeRole).toULongLong();
+            const auto otherSize = other.data(0, kSizeRole).toULongLong();
+            if (known && size != otherSize) return size < otherSize;
+        } else {
+            const bool directory = data(0, kDirectoryRole).toBool();
+            if (directory != other.data(0, kDirectoryRole).toBool()) return descending ? !directory : directory;
+        }
+        return QString::localeAwareCompare(text(0), other.text(0)) < 0;
+    }
+};
 
 QString permissionText(quint32 mode)
 {
@@ -162,12 +339,13 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
         button->setFixedSize(26, 26);
         button->setIconSize(QSize(16, 16));
     }
-    m_pathEdit = new QLineEdit(QStringLiteral("/"));
-    m_pathEdit->setObjectName(QStringLiteral("remotePathEdit"));
-    m_pathEdit->setMinimumWidth(120);
-    m_pathEdit->setFixedHeight(26);
-    m_pathEdit->setStyleSheet(QStringLiteral(
-        "QLineEdit#remotePathEdit{min-height:24px;max-height:24px;padding:0 9px;}"));
+    m_pathEdit = new RemotePathEdit;
+    auto *editPathShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_L), this);
+    editPathShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(editPathShortcut, &QShortcut::activated, m_pathEdit, &RemotePathEdit::beginEditing);
+    m_autoSize = new QCheckBox(QStringLiteral("自动计算"));
+    m_autoSize->setObjectName(QStringLiteral("fileAutoDirectorySize"));
+    m_autoSize->setToolTip(QStringLiteral("逐个计算当前列表的目录磁盘占用，默认关闭。\n低优先级，每项最多 60 秒；不跟随符号链接、不跨文件系统。\n切换目录或关闭开关会停止旧计算；扫描仍会产生磁盘 I/O。"));
 
     headerLayout->addWidget(title);
     headerLayout->addWidget(m_serverLabel);
@@ -175,11 +353,13 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     headerLayout->addWidget(m_backButton);
     headerLayout->addWidget(m_upButton);
     headerLayout->addWidget(m_pathEdit, 1);
+    headerLayout->addWidget(m_autoSize);
     headerLayout->addWidget(m_refreshButton);
     headerLayout->addWidget(m_transferQueueButton);
 
     m_tree = new QTreeWidget;
     m_tree->setObjectName(QStringLiteral("remoteFileTree"));
+    m_tree->setHeader(new FileHeader(m_tree));
     m_tree->setColumnCount(6);
     m_tree->setHeaderLabels({QStringLiteral("文件名"), QStringLiteral("大小"), QStringLiteral("类型"),
         QStringLiteral("修改时间"), QStringLiteral("权限"), QStringLiteral("用户/用户组")});
@@ -190,14 +370,19 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_tree->setAcceptDrops(true);
     m_tree->viewport()->setAcceptDrops(true);
     m_tree->viewport()->installEventFilter(this);
+    m_tree->setMouseTracking(true);
+    m_tree->setItemDelegateForColumn(1, new FileSizeDelegate(m_tree));
     m_tree->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_tree->header()->setStretchLastSection(false);
     m_tree->header()->setMinimumSectionSize(64);
     for (int column = 0; column < m_tree->columnCount(); ++column) {
         m_tree->header()->setSectionResizeMode(column, QHeaderView::Interactive);
     }
-    const int widths[] = {170, 78, 76, 132, 102, 112};
+    const int widths[] = {190, 132, 80, 150, 112, 122};
     for (int column = 0; column < m_tree->columnCount(); ++column) m_tree->setColumnWidth(column, widths[column]);
+    m_tree->headerItem()->setToolTip(0, QStringLiteral("点击按文件名升序 / 降序排列"));
+    m_tree->headerItem()->setToolTip(1, QStringLiteral("点击按实际字节数升序 / 降序排列；未计算的目录排在末尾"));
+    applyFileSort(m_sortIndex);
 
     auto *fileListContainer = new QWidget;
     fileListContainer->setObjectName(QStringLiteral("fileListContainer"));
@@ -281,9 +466,26 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
 
     connect(m_refreshButton, &QToolButton::clicked, this, [this] { navigateTo(m_currentPath, false); });
     connect(m_pathEdit, &QLineEdit::returnPressed, this, [this] { navigateTo(m_pathEdit->text()); });
+    connect(m_pathEdit, &RemotePathEdit::pathActivated, this, [this](const QString &path) { navigateTo(path); });
     connect(m_upButton, &QToolButton::clicked, this, &FilePanel::navigateUp);
     connect(m_backButton, &QToolButton::clicked, this, &FilePanel::navigateBack);
-    connect(m_tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item) {
+    m_tree->header()->setSectionsClickable(true);
+    connect(m_tree->header(), &QHeaderView::sectionClicked, this, [this](int column) {
+        // QHeaderView changes its sort section even with the native indicator
+        // hidden. Restore our state for columns that do not support sorting.
+        if (column != 0 && column != 1) { applyFileSort(m_sortIndex); return; }
+        const int base = column == 0 ? 0 : 2;
+        applyFileSort(m_sortIndex == base ? base + 1 : base);
+    });
+    connect(m_autoSize, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!enabled) { cancelSizeCalculations(); return; }
+        for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
+            auto *item = m_tree->topLevelItem(row);
+            if (!item->data(0, kSizeKnownRole).toBool()) queueDirectorySize(item);
+        }
+    });
+    connect(m_tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int column) {
+        if (column == 1 && item->data(0, kDirectoryRole).toBool()) return;
         if (item->data(0, kDirectoryRole).toBool()) navigateTo(item->data(0, kPathRole).toString());
         else openFile(item);
     });
@@ -316,6 +518,25 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     connect(m_removeAction, &QAction::triggered, this, &FilePanel::removeSelected);
     connect(m_session, &SshSession::directoryListed, this, &FilePanel::showEntries);
     connect(m_session, &SshSession::directoryListingFailed, this, &FilePanel::showError);
+    connect(m_session, &SshSession::directorySizeCalculated, this,
+        [this](quint64 request, const QString &path, quint64 bytes, const QString &error) {
+            if (!m_sizeRequest || request != m_sizeRequest || path != m_sizeActivePath || !m_pendingPath.isEmpty()) return;
+            m_sizeRequest = 0;
+            m_sizeActivePath.clear();
+            for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
+                auto *item = m_tree->topLevelItem(row);
+                if (item->data(0, kPathRole).toString() != path) continue;
+                item->setData(0, kSizeStateRole, error.isEmpty() ? ReadySize : FailedSize);
+                item->setData(0, kSizeKnownRole, error.isEmpty());
+                item->setData(0, kSizeRole, QVariant::fromValue(bytes));
+                item->setData(0, kSizeErrorRole, error);
+                updateSizeCell(item);
+                break;
+            }
+            if (m_sortIndex >= 2) applyFileSort(m_sortIndex);
+            // Yield to terminal, navigation and transfers between directories.
+            QTimer::singleShot(200, this, &FilePanel::startNextDirectorySize);
+        });
     connect(m_session, &SshSession::homeDirectoryResolved, this, [this](const QString &path) {
         m_initialDirectoryResolved = true;
         m_homePath = normalizePath(path);
@@ -395,6 +616,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
             updateActionState();
         });
     connect(m_session, &SshSession::connectionChanged, this, [this](bool connected, const QString &message) {
+        if (!connected) cancelSizeCalculations();
         m_connected = connected;
         m_directoryTree->setEnabled(connected);
         updateActionState();
@@ -413,8 +635,22 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     updateActionState();
 }
 
+FilePanel::~FilePanel()
+{
+    if (m_sizeRequest && m_session) m_session->cancelDirectorySize();
+}
+
+void FilePanel::changeEvent(QEvent *event)
+{
+    QFrame::changeEvent(event);
+    if (m_tree && (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)) {
+        for (int row = 0; row < m_tree->topLevelItemCount(); ++row) updateSizeCell(m_tree->topLevelItem(row));
+    }
+}
+
 void FilePanel::setServer(const ServerProfile &profile)
 {
+    cancelSizeCalculations();
     finishInlineRename(false);
     m_serverLabel->setText(QStringLiteral("SFTP · %1").arg(profile.name));
     m_profile = profile;
@@ -438,7 +674,7 @@ void FilePanel::setServer(const ServerProfile &profile)
     hideFileLoading();
     m_directoryTree->clear();
     m_directoryTree->setEnabled(false);
-    m_pathEdit->setText(m_currentPath);
+    m_pathEdit->setPath(m_currentPath);
     m_backButton->setEnabled(false);
     m_statusLabel->setText(QStringLiteral("  等待 %1 的 SFTP 会话").arg(profile.name));
     updateActionState();
@@ -506,6 +742,7 @@ void FilePanel::openInitialDirectory()
 
 void FilePanel::navigateTo(const QString &path, bool addToHistory)
 {
+    cancelSizeCalculations();
     finishInlineRename(false);
     const auto normalized = normalizePath(path);
     if (addToHistory && (m_historyIndex < 0 || m_history.value(m_historyIndex) != normalized)) {
@@ -516,7 +753,7 @@ void FilePanel::navigateTo(const QString &path, bool addToHistory)
     m_currentPath = normalized;
     m_directoryTargetPath = normalized;
     m_pendingPath = normalized;
-    m_pathEdit->setText(normalized);
+    m_pathEdit->setPath(normalized);
     m_backButton->setEnabled(m_historyIndex > 0);
     m_upButton->setEnabled(normalized != QStringLiteral("/"));
     m_tree->clear();
@@ -542,7 +779,7 @@ void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entrie
         const auto size = entry.directory ? QStringLiteral("—") : formatSize(entry.size);
         const auto type = entry.directory ? QStringLiteral("文件夹") : entry.symbolicLink ? QStringLiteral("符号链接") : QStringLiteral("文件");
         const auto modified = entry.modifiedAt.isValid() ? entry.modifiedAt.toString(QStringLiteral("yyyy/MM/dd HH:mm")) : QStringLiteral("—");
-        auto *item = new QTreeWidgetItem(m_tree,
+        auto *item = new FileListItem(m_tree,
             {entry.name, size, type, modified, permissionText(entry.permissions), ownerGroupText(entry)});
         item->setIcon(0, style()->standardIcon(entry.directory ? QStyle::SP_DirIcon
                                                                : entry.symbolicLink ? QStyle::SP_FileLinkIcon : QStyle::SP_FileIcon));
@@ -550,8 +787,11 @@ void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entrie
         item->setData(0, kDirectoryRole, entry.directory);
         item->setData(0, kPermissionsRole, entry.permissions);
         item->setData(0, kSymbolicLinkRole, entry.symbolicLink);
+        item->setData(0, kSizeRole, QVariant::fromValue(entry.size));
+        item->setData(0, kSizeKnownRole, !entry.directory);
         item->setToolTip(0, entry.path);
         item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+        if (entry.directory) updateSizeCell(item);
     }
     if (m_postRefreshStatus.isEmpty()) {
         m_statusLabel->setText(QStringLiteral("  %1 个项目  ·  %2").arg(entries.size()).arg(path));
@@ -560,7 +800,94 @@ void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entrie
         m_postRefreshStatus.clear();
     }
     revealDirectoryPath(path);
+    applyFileSort(m_sortIndex);
     updateActionState();
+    if (m_autoSize->isChecked()) {
+        for (int row = 0; row < m_tree->topLevelItemCount(); ++row) queueDirectorySize(m_tree->topLevelItem(row));
+    }
+}
+
+void FilePanel::applyFileSort(int index)
+{
+    m_sortIndex = index;
+    const int column = index >= 2 ? 1 : 0;
+    const auto order = index % 2 ? Qt::DescendingOrder : Qt::AscendingOrder;
+    m_tree->header()->setSortIndicator(column, order);
+    // Only the custom paired arrows are painted, not Qt's native single arrow.
+    m_tree->header()->setSortIndicatorShown(false);
+    m_tree->sortItems(column, order);
+    QStringList ordered;
+    for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
+        const auto path = m_tree->topLevelItem(row)->data(0, kPathRole).toString();
+        if (m_sizeQueue.contains(path)) ordered.append(path);
+    }
+    m_sizeQueue = ordered;
+}
+
+void FilePanel::updateSizeCell(QTreeWidgetItem *item)
+{
+    if (!item->data(0, kDirectoryRole).toBool()) return;
+    if (item->data(0, kSymbolicLinkRole).toBool()) {
+        item->setText(1, QStringLiteral("—"));
+        item->setToolTip(1, QStringLiteral("不遍历符号链接，避免循环或扫描目录外的文件"));
+        return;
+    }
+    switch (item->data(0, kSizeStateRole).toInt()) {
+    case QueuedSize: item->setText(1, QStringLiteral("等待计算…")); break;
+    case RunningSize: item->setText(1, QStringLiteral("计算中…")); break;
+    case ReadySize: item->setText(1, formatSize(item->data(0, kSizeRole).toULongLong())); break;
+    case FailedSize: item->setText(1, QStringLiteral("未完成")); break;
+    default: item->setText(1, QStringLiteral("—")); break;
+    }
+    item->setToolTip(1, QStringLiteral("点击左侧图标计算 / 重新计算目录磁盘占用。\n包含隐藏文件；不跟随链接、不跨文件系统；硬链接按 du 规则计数。\n不是下载文件，不读取文件内容；结果是本次扫描快照。\n%1")
+        .arg(item->data(0, kSizeErrorRole).toString().toHtmlEscaped()));
+}
+
+void FilePanel::cancelSizeCalculations()
+{
+    if (m_sizeRequest && m_session) m_session->cancelDirectorySize();
+    m_sizeRequest = 0;
+    m_sizeActivePath.clear();
+    m_sizeQueue.clear();
+    if (!m_tree) return;
+    for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
+        auto *item = m_tree->topLevelItem(row);
+        const int state = item->data(0, kSizeStateRole).toInt();
+        if (state != QueuedSize && state != RunningSize) continue;
+        item->setData(0, kSizeStateRole, UnknownSize);
+        item->setData(0, kSizeKnownRole, false);
+        updateSizeCell(item);
+    }
+}
+
+void FilePanel::queueDirectorySize(QTreeWidgetItem *item)
+{
+    if (!m_connected || !m_pendingPath.isEmpty() || !item || !item->data(0, kDirectoryRole).toBool()
+        || item->data(0, kSymbolicLinkRole).toBool()) return;
+    const auto path = item->data(0, kPathRole).toString();
+    if (path.isEmpty() || path == m_sizeActivePath || m_sizeQueue.contains(path)) return;
+    item->setData(0, kSizeStateRole, QueuedSize);
+    item->setData(0, kSizeKnownRole, false);
+    item->setData(0, kSizeErrorRole, QString{});
+    updateSizeCell(item);
+    m_sizeQueue.append(path);
+    if (m_sizeQueue.size() == 1 && !m_sizeRequest) QTimer::singleShot(0, this, &FilePanel::startNextDirectorySize);
+}
+
+void FilePanel::startNextDirectorySize()
+{
+    if (m_sizeRequest || !m_connected || !m_pendingPath.isEmpty() || m_sizeQueue.isEmpty()) return;
+    const auto path = m_sizeQueue.takeFirst();
+    for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
+        auto *item = m_tree->topLevelItem(row);
+        if (item->data(0, kPathRole).toString() != path) continue;
+        m_sizeActivePath = path;
+        item->setData(0, kSizeStateRole, RunningSize);
+        updateSizeCell(item);
+        m_sizeRequest = m_session->calculateDirectorySize(path);
+        return;
+    }
+    QTimer::singleShot(0, this, &FilePanel::startNextDirectorySize);
 }
 
 void FilePanel::showError(const QString &path, const QString &message)
@@ -710,6 +1037,7 @@ QList<QTreeWidgetItem *> FilePanel::selectedEntries() const
 
 void FilePanel::updateActionState()
 {
+    m_autoSize->setEnabled(m_connected);
     const auto items = selectedEntries();
     const bool canMutate = m_connected && !m_mutationInFlight && !m_inlineRenameActive;
     const bool hasSelection = canMutate && !items.isEmpty();
@@ -862,6 +1190,23 @@ void FilePanel::renameSelected()
 bool FilePanel::eventFilter(QObject *watched, QEvent *event)
 {
     if (m_tree && watched == m_tree->viewport()) {
+        if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
+            || event->type() == QEvent::MouseButtonRelease) {
+            const auto *mouse = static_cast<QMouseEvent *>(event);
+            const auto index = m_tree->indexAt(mouse->position().toPoint());
+            const bool overAction = m_connected && m_tree->isEnabled() && sizeActionEnabled(index)
+                && sizeActionRect(m_tree->visualRect(index)).contains(mouse->position().toPoint());
+            m_tree->viewport()->setCursor(overAction ? Qt::PointingHandCursor : Qt::ArrowCursor);
+            if (event->type() == QEvent::MouseButtonPress && mouse->button() == Qt::LeftButton) {
+                m_pressedSizeAction = overAction ? QPersistentModelIndex(index) : QPersistentModelIndex{};
+            } else if (event->type() == QEvent::MouseButtonRelease && mouse->button() == Qt::LeftButton) {
+                const bool activate = overAction && m_pressedSizeAction == index;
+                m_pressedSizeAction = QPersistentModelIndex{};
+                if (activate) queueDirectorySize(m_tree->itemAt(mouse->position().toPoint()));
+            }
+        } else if (event->type() == QEvent::Leave) {
+            m_tree->viewport()->unsetCursor();
+        }
         const auto localFiles = [](const QMimeData *mimeData) {
             QStringList paths;
             if (!mimeData || !mimeData->hasUrls()) return paths;

@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.69 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.76 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -50,6 +50,8 @@ set(NOXSHELL_CORE_SOURCES
     src/core/AppLogger.h
     src/core/CredentialStore.cpp
     src/core/CredentialStore.h
+    src/core/DirectorySizeCommand.cpp
+    src/core/DirectorySizeCommand.h
     src/core/FileTransferTask.h
     src/core/Libssh2Worker.cpp
     src/core/Libssh2Worker.h
@@ -81,14 +83,20 @@ qt_add_executable(NoxShell
     src/ui/AppTheme.h
     src/ui/CommandHistoryPanel.cpp
     src/ui/CommandHistoryPanel.h
+    src/ui/CredentialInput.cpp
+    src/ui/CredentialInput.h
     src/ui/FilePanel.cpp
     src/ui/FilePanel.h
+    src/ui/RemotePathEdit.cpp
+    src/ui/RemotePathEdit.h
     src/ui/FilePermissionDialog.cpp
     src/ui/FilePermissionDialog.h
     src/ui/HostSidebar.cpp
     src/ui/HostSidebar.h
     src/ui/MainWindow.cpp
     src/ui/MainWindow.h
+    src/ui/Application.cpp
+    src/ui/Application.h
     ${NOXSHELL_MAC_SOURCES}
     src/ui/MetricCard.cpp
     src/ui/MetricCard.h
@@ -133,6 +141,7 @@ if(BUILD_TESTING)
         qt_add_executable(NoxShellAuthIntegrationTest
             tests/AuthIntegrationTest.cpp
             src/core/Libssh2Worker.cpp src/core/Libssh2Worker.h
+            src/core/DirectorySizeCommand.cpp src/core/DirectorySizeCommand.h
             src/core/RemoteDirectoryFallback.cpp src/core/RemoteDirectoryFallback.h
         )
         target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Qt6::Core Qt6::Network Qt6::Test ${NOXSHELL_LIBSSH2_TARGET})
@@ -150,14 +159,20 @@ if(BUILD_TESTING)
         src/ui/AppTheme.h
         src/ui/CommandHistoryPanel.cpp
         src/ui/CommandHistoryPanel.h
+        src/ui/CredentialInput.cpp
+        src/ui/CredentialInput.h
         src/ui/FilePanel.cpp
         src/ui/FilePanel.h
+        src/ui/RemotePathEdit.cpp
+        src/ui/RemotePathEdit.h
         src/ui/FilePermissionDialog.cpp
         src/ui/FilePermissionDialog.h
         src/ui/HostSidebar.cpp
         src/ui/HostSidebar.h
         src/ui/MainWindow.cpp
         src/ui/MainWindow.h
+        src/ui/Application.cpp
+        src/ui/Application.h
         ${NOXSHELL_MAC_SOURCES}
         src/ui/MetricCard.cpp
         src/ui/MetricCard.h
@@ -191,6 +206,7 @@ if(BUILD_TESTING)
         set_target_properties(NoxShellSmokeTest PROPERTIES WIN32_EXECUTABLE FALSE)
     endif()
     if(APPLE)
+        target_sources(NoxShellSmokeTest PRIVATE tests/MacLifecycleProbe.mm)
         target_link_libraries(NoxShellSmokeTest PRIVATE "-framework Cocoa" "-framework Security")
     endif()
     add_test(NAME ui_smoke COMMAND NoxShellSmokeTest -v1)

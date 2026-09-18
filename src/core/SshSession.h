@@ -35,6 +35,8 @@ public:
     void requestMetrics();
     void requestHomeDirectory();
     void listDirectory(const QString &path);
+    quint64 calculateDirectorySize(const QString &path);
+    void cancelDirectorySize();
     void uploadFile(const QString &localPath, const QString &remotePath);
     void downloadFile(const QString &remotePath, const QString &localPath);
     quint64 readFile(const QString &remotePath, quint64 maxBytes = 4 * 1024 * 1024);
@@ -68,6 +70,8 @@ signals:
     void collectMetricsRequested(quint64 requestId);
     void homeDirectoryRequested(quint64 requestId);
     void listDirectoryRequested(quint64 requestId, const QString &path);
+    void directorySizeRequested(quint64 requestId, const QString &path);
+    void directorySizeCanceled();
     void uploadFileRequested(quint64 requestId, const QString &localPath, const QString &remotePath, quint64 bytesPerSecond);
     void downloadFileRequested(quint64 requestId, const QString &remotePath, const QString &localPath, quint64 bytesPerSecond);
     void readFileRequested(quint64 requestId, const QString &remotePath, quint64 maxBytes);
@@ -89,6 +93,7 @@ signals:
     void homeDirectoryResolutionFailed(const QString &message);
     void directoryListed(const QString &path, const RemoteFileEntries &entries);
     void directoryListingFailed(const QString &path, const QString &message);
+    void directorySizeCalculated(quint64 requestId, const QString &path, quint64 bytes, const QString &error);
     void fileOperationProgress(RemoteFileOperation operation, const QString &path, quint64 completed, quint64 total);
     void fileOperationFinished(RemoteFileOperation operation, const QString &path);
     void fileOperationFailed(RemoteFileOperation operation, const QString &path, const QString &message);
@@ -137,6 +142,7 @@ private:
     quint32 m_directoryGeneration{1};
     quint32 m_directoryRequestSerial{};
     QHash<QString, quint64> m_pendingDirectories;
+    quint64 m_directorySizeRequest{};
     QHash<QString, RemoteFileEntries> m_demoFileOverrides;
     QHash<QString, QByteArray> m_demoFileContents;
     QVector<FileTransferTask> m_transferQueue;

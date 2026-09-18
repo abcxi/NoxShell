@@ -1,6 +1,7 @@
 #include "../src/core/LinuxMetrics.h"
 #include "../src/core/AppLogger.h"
 #include "../src/core/CredentialStore.h"
+#include "../src/core/DirectorySizeCommand.h"
 #include "../src/core/FileTransferTask.h"
 #include "../src/core/MetricHistory.h"
 #include "../src/core/MetricsCollectionPolicy.h"
@@ -9,13 +10,16 @@
 #include "../src/core/SshSession.h"
 #include "../src/core/ServerRepository.h"
 #include "../src/ui/AppTheme.h"
+#include "../src/ui/Application.h"
 #include "../src/ui/CommandHistoryPanel.h"
+#include "../src/ui/CredentialInput.h"
 #include "../src/ui/FilePanel.h"
 #include "../src/ui/FilePermissionDialog.h"
 #include "../src/ui/HostSidebar.h"
 #include "../src/ui/MainWindow.h"
 #include "../src/ui/MetricCard.h"
 #include "../src/ui/RemoteFileEditor.h"
+#include "../src/ui/RemotePathEdit.h"
 #include "../src/ui/RdpDialog.h"
 #include "../src/ui/SearchMarkerScrollBar.h"
 #include "../src/ui/ServerDialog.h"
@@ -28,6 +32,7 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QCloseEvent>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QContextMenuEvent>
@@ -36,6 +41,7 @@
 #include <QEventLoop>
 #include <QDoubleSpinBox>
 #include <QDir>
+#include <QDesktopServices>
 #include <QFile>
 #include <QFontComboBox>
 #include <QHBoxLayout>
@@ -43,6 +49,7 @@
 #include <QTabWidget>
 #include <QIcon>
 #include <QImage>
+#include <QInputMethodEvent>
 #include <QLabel>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -70,6 +77,8 @@
 #include <QTabBar>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QTextBlock>
+#include <QTextLayout>
 #include <QToolBar>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -126,10 +135,336 @@ public:
     QString error;
 };
 
+class LocalDirectoryUrlCapture final : public QObject {
+    Q_OBJECT
+public:
+    QList<QUrl> urls;
+public slots:
+    void capture(const QUrl &url) { urls.append(url); }
+};
+
+// Repeated dialogs are answered too, so a regression fails a count assertion
+// instead of leaving unattended tests blocked inside a modal event loop.
+class CloseDialogResponder {
+public:
+    explicit CloseDialogResponder(QMessageBox::StandardButton response = QMessageBox::Yes)
+        : answer(response)
+    {
+        QObject::connect(&timer, &QTimer::timeout, &timer, [this] {
+            auto *dialog = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (!dialog || last == dialog || responding) return;
+            responding = true;
+            last = dialog;
+            ++count;
+            names.append(dialog->objectName());
+            texts.append(dialog->text());
+            safeDefault &= dialog->defaultButton() == dialog->button(QMessageBox::Cancel);
+            if (beforeAnswer) beforeAnswer(dialog);
+            if (escape) QTest::keyClick(dialog, Qt::Key_Escape);
+            else if (auto *button = dialog->button(answer)) button->click();
+            else dialog->reject();
+            responding = false;
+        });
+        timer.start(5);
+    }
+    QTimer timer;
+    QPointer<QMessageBox> last;
+    QMessageBox::StandardButton answer;
+    QStringList names, texts;
+    int count{};
+    bool safeDefault{true};
+    bool escape{};
+    bool responding{};
+    std::function<void(QMessageBox *)> beforeAnswer;
+};
+
+static int answerClose(const std::function<void()> &action)
+{
+    CloseDialogResponder responder;
+    action();
+    return responder.count;
+}
+
+#ifdef Q_OS_MACOS
+void nativeProbeCloseWindow(QWidget *window);
+void nativeProbeReopenApplication();
+void nativeProbeQuitApplication();
+#endif
+
+// Run a real application event loop in a child process: accepted Quit must
+// terminate it, but cancellation/reentrancy/dirty child dialogs must not.
+static int runWindowLifecycleProbe(noxshell::ui::Application &app)
+{
+    QTemporaryDir directory;
+    if (!directory.isValid()) return 2;
+    MemoryCredentialStore credentials;
+    noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("lifecycle.sqlite3")), nullptr, &credentials);
+    app.setMainWindow(&window);
+    auto *workspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
+    if (!workspace) return 3;
+    noxshell::ServerProfile profile;
+    profile.id = QStringLiteral("lifecycle-demo");
+    profile.name = QStringLiteral("关闭测试 · 演示连接");
+    profile.connectionMode = noxshell::ConnectionMode::Demo;
+    workspace->openOrActivate(profile, true);
+    auto *session = workspace->findChild<noxshell::SshSession *>();
+    auto *terminal = workspace->findChild<noxshell::ui::TerminalView *>();
+    if (!session || !terminal) return 4;
+    terminal->feedText(QStringLiteral("buffer-survives-window-hide"));
+    window.show();
+    int phase = 0;
+    int confirmations = 0;
+    int quitting = 0;
+    bool canceledTransfer = false;
+    bool completedTransfer = false;
+    const auto downloadPath = directory.filePath(QStringLiteral("hidden-window-download.txt"));
+    QObject::connect(session, &noxshell::SshSession::transferTaskChanged, &window,
+        [&](const noxshell::FileTransferTask &task) {
+            canceledTransfer |= task.state == noxshell::TransferState::Canceled;
+            completedTransfer |= task.state == noxshell::TransferState::Completed;
+        });
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &window, [&] { ++quitting; });
+    QSignalSpy sessionClosed(workspace, &noxshell::ui::TerminalWorkspace::sessionClosed);
+    const bool native = QGuiApplication::platformName() == QStringLiteral("cocoa");
+    const auto quit = [&] {
+#ifdef Q_OS_MACOS
+        if (native) { nativeProbeQuitApplication(); return; }
+#endif
+        app.quit();
+    };
+    class UnsavedDialog : public QDialog {
+    public:
+        using QDialog::QDialog;
+        bool veto{true};
+        void closeEvent(QCloseEvent *event) override { event->setAccepted(!veto); }
+    } unsaved(&window);
+    QTimer driver;
+    driver.setInterval(60);
+    QObject::connect(&driver, &QTimer::timeout, &window, [&] {
+        driver.stop(); // Modal loops must not advance the probe concurrently.
+        const auto fail = [&](int code) { app.exit(code); };
+        if (phase == 0) {
+            if (!session->isConnected()) { driver.start(); return; }
+            session->writeFile(QStringLiteral("/root/hidden-window.txt"), QByteArrayLiteral("demo-only-transfer"), true);
+            session->downloadFile(QStringLiteral("/root/hidden-window.txt"), downloadPath);
+#ifdef Q_OS_MACOS
+            if (native) nativeProbeCloseWindow(&window);
+            else window.close();
+#else
+            window.hide();
+#endif
+        } else if (phase == 1) {
+            if (window.isVisible() || !session->isConnected() || !sessionClosed.isEmpty()) { fail(10); return; }
+#ifdef Q_OS_MACOS
+            if (native) nativeProbeReopenApplication();
+            else app.applicationStateChanged(Qt::ApplicationActive);
+#else
+            window.show();
+#endif
+        } else if (phase == 2) {
+            if (!window.isVisible() || workspace->sessionCount() != 1
+                || !terminal->plainText().contains(QStringLiteral("buffer-survives-window-hide"))) { fail(11); return; }
+            if (!completedTransfer || canceledTransfer || !QFileInfo::exists(downloadPath)) { fail(16); return; }
+            CloseDialogResponder responder(QMessageBox::Cancel);
+            bool nestedIgnored = false;
+            responder.beforeAnswer = [&](QMessageBox *) {
+                QEvent nested(QEvent::Quit);
+                QCoreApplication::sendEvent(&app, &nested);
+                nestedIgnored = !nested.isAccepted();
+            };
+            quit();
+            confirmations += responder.count;
+            if (responder.count != 1 || !responder.safeDefault || !nestedIgnored) { fail(12); return; }
+        } else if (phase == 3) {
+            if (!window.isVisible() || !session->isConnected() || quitting) { fail(13); return; }
+            // A parented, unsaved editor can veto even after application approval.
+            unsaved.show();
+            CloseDialogResponder responder;
+            quit();
+            confirmations += responder.count;
+            if (responder.count != 1 || !window.isVisible() || !unsaved.isVisible() || quitting) { fail(14); return; }
+            unsaved.veto = false;
+            unsaved.close();
+#ifdef Q_OS_MACOS
+            window.close();
+#endif
+        } else if (phase == 4) {
+            CloseDialogResponder responder;
+            quit(); // Quit remains available while the main window is hidden.
+            confirmations += responder.count;
+            if (responder.count != 1 || responder.names != QStringList{QStringLiteral("applicationQuitConfirmation")}) {
+                fail(15); return;
+            }
+            ++phase;
+            return;
+        }
+        ++phase;
+        driver.start();
+    });
+    QTimer::singleShot(8000, &window, [&] { app.exit(20); });
+    driver.start();
+    const int result = app.exec();
+    app.setMainWindow(nullptr);
+    if (result) return result;
+    if (phase != 5 || confirmations != 3 || quitting != 1 || credentials.loadCalls != 0
+        || !sessionClosed.isEmpty() || canceledTransfer || !completedTransfer) return 21;
+    qInfo("NOXSHELL_WINDOW_LIFECYCLE_OK");
+    return 0;
+}
+
 class SmokeTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void asciiCredentialInputNormalizesOnlyNewEdits_data()
+    {
+        QTest::addColumn<bool>("revealed");
+        QTest::newRow("masked") << false;
+        QTest::newRow("revealed") << true;
+    }
+
+    void asciiCredentialInputNormalizesOnlyNewEdits()
+    {
+        QFETCH(bool, revealed);
+        QLineEdit editor;
+        QLabel feedback;
+        editor.setEchoMode(revealed ? QLineEdit::Normal : QLineEdit::Password);
+        noxshell::ui::configureAsciiCredentialInput(&editor, &feedback);
+        QVERIFY(editor.inputMethodHints().testFlag(Qt::ImhLatinOnly));
+        QVERIFY(editor.inputMethodHints().testFlag(Qt::ImhSensitiveData));
+        QString ascii, fullwidth;
+        for (ushort code = 0x21; code <= 0x7e; ++code) {
+            ascii.append(QChar(code));
+            fullwidth.append(QChar(code + 0xfee0));
+        }
+        editor.insert(QStringLiteral("  ") + ascii + QStringLiteral("  "));
+        QCOMPARE(editor.text(), QStringLiteral("  ") + ascii + QStringLiteral("  "));
+        editor.clear();
+        editor.insert(fullwidth);
+        QCOMPARE(editor.text(), ascii);
+        QCOMPARE(editor.cursorPosition(), ascii.size());
+        QVERIFY(feedback.text().contains(QStringLiteral("已将")));
+        editor.selectAll();
+        editor.insert(QStringLiteral("。｡、\u3000\u00a0‘’“”–—…【】"));
+        QCOMPARE(editor.text(), QStringLiteral("..,  ''\"\"--...[]"));
+        editor.clear();
+        QVERIFY(feedback.text().contains(QStringLiteral("仅英文半角")));
+        editor.insert(QStringLiteral("Ab cd"));
+        editor.setCursorPosition(2);
+        editor.insert(QStringLiteral("…"));
+        QCOMPARE(editor.text(), QStringLiteral("Ab... cd"));
+        QCOMPARE(editor.cursorPosition(), 5);
+        editor.setSelection(2, 3);
+        editor.insert(QStringLiteral("。"));
+        QCOMPARE(editor.text(), QStringLiteral("Ab. cd"));
+        QCOMPARE(editor.cursorPosition(), 3);
+
+        // Reject the whole edit, including mixed pastes, without erasing a selection.
+        for (const auto &invalid : {QStringLiteral("中文"), QStringLiteral("é"),
+                 QStringLiteral("🔑"), QStringLiteral("valid。but中文"),
+                 QStringLiteral("line\nbreak"), QStringLiteral("\t")}) {
+            editor.setSelection(0, 2);
+            editor.insert(invalid);
+            QCOMPARE(editor.text(), QStringLiteral("Ab. cd"));
+            QVERIFY(feedback.text().contains(QStringLiteral("未写入")));
+            QCOMPARE(editor.selectionStart(), 0);
+            QCOMPARE(editor.selectedText(), QStringLiteral("Ab"));
+        }
+        editor.setEchoMode(revealed ? QLineEdit::Password : QLineEdit::Normal);
+        QVERIFY(editor.inputMethodHints().testFlag(Qt::ImhLatinOnly));
+        editor.selectAll();
+        editor.insert(QStringLiteral("Ｓｓｈ１２３。！"));
+        QCOMPARE(editor.text(), QStringLiteral("Ssh123.!"));
+        editor.insert(QStringLiteral("中"));
+        QCOMPARE(editor.text(), QStringLiteral("Ssh123.!"));
+        QVERIFY(editor.hasAcceptableInput());
+    }
+
+    void asciiCredentialInputHandlesClipboardAndIme()
+    {
+        QLineEdit editor;
+        QLabel feedback;
+        editor.setEchoMode(QLineEdit::Password);
+        noxshell::ui::configureAsciiCredentialInput(&editor, &feedback);
+        const auto *clipboardData = QApplication::clipboard()->mimeData();
+        QMap<QString, QByteArray> clipboardBackup;
+        if (clipboardData) {
+            for (const auto &format : clipboardData->formats()) clipboardBackup.insert(format, clipboardData->data(format));
+        }
+        const auto restoreClipboard = qScopeGuard([&] {
+            auto *restored = new QMimeData;
+            for (auto it = clipboardBackup.cbegin(); it != clipboardBackup.cend(); ++it) restored->setData(it.key(), it.value());
+            QApplication::clipboard()->setMimeData(restored);
+        });
+        QApplication::clipboard()->setText(QStringLiteral("  Ａbc。１２３！  "));
+        editor.paste();
+        QCOMPARE(editor.text(), QStringLiteral("  Abc.123!  "));
+        editor.selectAll();
+        QApplication::clipboard()->setText(QStringLiteral("abc中文"));
+        editor.paste();
+        QCOMPARE(editor.text(), QStringLiteral("  Abc.123!  "));
+        QVERIFY(feedback.text().contains(QStringLiteral("未写入")));
+
+        editor.clear();
+        QInputMethodEvent preedit(QStringLiteral("zhong"), {});
+        QApplication::sendEvent(&editor, &preedit);
+        QVERIFY(editor.text().isEmpty());
+        QInputMethodEvent chineseCommit;
+        chineseCommit.setCommitString(QStringLiteral("中文"));
+        QApplication::sendEvent(&editor, &chineseCommit);
+        QVERIFY(editor.text().isEmpty());
+        QVERIFY(feedback.text().contains(QStringLiteral("未写入")));
+        QInputMethodEvent punctuationCommit;
+        punctuationCommit.setCommitString(QStringLiteral("ＳＳＨ。１２３！"));
+        QApplication::sendEvent(&editor, &punctuationCommit);
+        QCOMPARE(editor.text(), QStringLiteral("SSH.123!"));
+        QCOMPARE(editor.cursorPosition(), 8);
+        editor.setEchoMode(QLineEdit::Normal);
+        editor.setSelection(3, 1);
+        punctuationCommit.setCommitString(QStringLiteral("…"));
+        QApplication::sendEvent(&editor, &punctuationCommit);
+        QCOMPARE(editor.text(), QStringLiteral("SSH...123!"));
+        QCOMPARE(editor.cursorPosition(), 6);
+        editor.clear();
+        editor.insert(QStringLiteral("base"));
+        editor.insert(QStringLiteral("！"));
+        QCOMPARE(editor.text(), QStringLiteral("base!"));
+        if (editor.isUndoAvailable()) {
+            editor.undo();
+            QVERIFY(!editor.text().contains(QChar(0xff01)));
+            editor.redo();
+            QCOMPARE(editor.text(), QStringLiteral("base!"));
+        }
+    }
+
+    void allCredentialEditorsUseAsciiInputPolicy()
+    {
+        noxshell::ui::ServerDialog ssh;
+        noxshell::ui::RdpDialog rdp;
+        MemoryCredentialStore credentials;
+        noxshell::ui::TerminalWorkspace workspace(nullptr, &credentials);
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("ascii-input-only");
+        profile.name = profile.id;
+        profile.host = QStringLiteral("192.0.2.20");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        workspace.openOrActivate(profile, false); // Never connect to an external host.
+        const QList<QLineEdit *> editors{
+            ssh.findChild<QLineEdit *>(QStringLiteral("passwordEditor")),
+            ssh.findChild<QLineEdit *>(QStringLiteral("passphraseEditor")),
+            rdp.findChild<QLineEdit *>(QStringLiteral("rdpPasswordEditor")),
+            workspace.findChild<QLineEdit *>(QStringLiteral("terminalConnectionPassword"))};
+        for (auto *editor : editors) {
+            QVERIFY(editor);
+            QVERIFY(editor->validator());
+            QVERIFY(editor->inputMethodHints().testFlag(Qt::ImhLatinOnly));
+            editor->insert(QStringLiteral("Ａbc。１２３！"));
+            QCOMPARE(editor->text(), QStringLiteral("Abc.123!"));
+            editor->insert(QStringLiteral("中"));
+            QCOMPARE(editor->text(), QStringLiteral("Abc.123!"));
+        }
+    }
+
     void monitoringScheduleReducesExpensiveRemoteQueries()
     {
         noxshell::MetricsCollectionPolicy policy;
@@ -1068,6 +1403,146 @@ private slots:
         QVERIFY(loaded.first().password.isEmpty());
     }
 
+    void terminalCloseConfirmation_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void terminalCloseConfirmation()
+    {
+        QFETCH(bool, dark);
+        const auto previousTheme = noxshell::ui::storedThemeMode();
+        const auto restoreTheme = qScopeGuard([previousTheme] { noxshell::ui::applyApplicationTheme(previousTheme); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        noxshell::ui::TerminalWorkspace workspace(nullptr, nullptr);
+        workspace.resize(900, 500);
+        workspace.show();
+        QList<noxshell::ServerProfile> profiles;
+        for (int i = 0; i < 5; ++i) {
+            noxshell::ServerProfile profile;
+            profile.id = QStringLiteral("close-confirm-%1").arg(i);
+            profile.name = QStringLiteral("服务器 <b>%1</b>").arg(i);
+            profile.connectionMode = noxshell::ConnectionMode::Demo;
+            profiles.append(profile);
+            if (i < 3) workspace.openOrActivate(profile, true);
+        }
+        auto *tabs = workspace.findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
+        auto *stack = workspace.findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+        QVERIFY(tabs);
+        QVERIFY(stack);
+        auto *firstSession = stack->widget(0)->findChild<noxshell::SshSession *>();
+        auto *firstOutput = stack->widget(0)->findChild<noxshell::ui::TerminalView *>();
+        QVERIFY(firstSession);
+        QVERIFY(firstOutput);
+        QTRY_VERIFY_WITH_TIMEOUT(firstSession->isConnected(), 1000);
+        firstOutput->feedText(QStringLiteral("must-survive-cancel"));
+        QSignalSpy closed(&workspace, &noxshell::ui::TerminalWorkspace::sessionClosed);
+        auto *firstClose = tabs->tabButton(0, QTabBar::RightSide)
+            ->findChild<QToolButton *>(QStringLiteral("terminalTabCloseButton"));
+        QVERIFY(firstClose);
+        {
+            CloseDialogResponder responder(QMessageBox::Cancel);
+            bool captured = true;
+            responder.beforeAnswer = [&](QMessageBox *dialog) {
+                const auto captureDir = qEnvironmentVariable("NOXSHELL_CLOSE_SCREENSHOT_DIR");
+                if (captureDir.isEmpty()) return;
+                captured = QDir().mkpath(captureDir) && dialog->grab().save(QDir(captureDir).filePath(
+                    dark ? QStringLiteral("tab-close-dark.png") : QStringLiteral("tab-close-light.png")));
+            };
+            firstClose->click();
+            QCOMPARE(responder.count, 1);
+            QVERIFY(captured);
+            QVERIFY(responder.safeDefault);
+            QCOMPARE(responder.names, QStringList{QStringLiteral("terminalCloseConfirmation")});
+            QVERIFY(responder.texts.first().contains(profiles.first().name));
+        }
+        {
+            CloseDialogResponder responder;
+            responder.escape = true;
+            tabs->tabCloseRequested(0);
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(tabs->count(), 3);
+        QVERIFY(firstSession->isConnected());
+        QVERIFY(firstOutput->plainText().contains(QStringLiteral("must-survive-cancel")));
+        QVERIFY(closed.isEmpty());
+        const auto prepare = [&workspace](int index) {
+            bool prepared = false;
+            return QMetaObject::invokeMethod(&workspace, "prepareTabContextMenu", Qt::DirectConnection,
+                Q_RETURN_ARG(bool, prepared), Q_ARG(int, index)) && prepared;
+        };
+        auto *closeCurrent = workspace.findChild<QAction *>(QStringLiteral("terminalCloseCurrentAction"));
+        auto *closeOthers = workspace.findChild<QAction *>(QStringLiteral("terminalCloseOthersAction"));
+        auto *closeAll = workspace.findChild<QAction *>(QStringLiteral("terminalCloseAllAction"));
+        QVERIFY(closeCurrent);
+        QVERIFY(closeOthers);
+        QVERIFY(closeAll);
+        QVERIFY(prepare(0));
+        for (auto *action : {closeCurrent, closeOthers, closeAll}) {
+            CloseDialogResponder responder(QMessageBox::Cancel);
+            action->trigger();
+            QCOMPARE(responder.count, 1);
+            QCOMPARE(tabs->count(), 3);
+            QVERIFY(closed.isEmpty());
+            QVERIFY(firstSession->isConnected());
+        }
+        {
+            CloseDialogResponder responder;
+            bool plainText = false;
+            responder.beforeAnswer = [&](QMessageBox *dialog) {
+                plainText = dialog->textFormat() == Qt::PlainText;
+                // A repeated close while confirming cannot create another dialog.
+                tabs->tabCloseRequested(1);
+                workspace.openOrActivate(profiles.at(3), false);
+            };
+            closeCurrent->trigger();
+            QCOMPARE(responder.count, 1);
+            QVERIFY(plainText);
+        }
+        QCOMPARE(tabs->count(), 3);
+        QCOMPARE(closed.size(), 1);
+        QCOMPARE(tabs->tabData(0).toString(), profiles.at(1).id);
+        QCOMPARE(tabs->tabData(2).toString(), profiles.at(3).id);
+        QVERIFY(prepare(0));
+        {
+            CloseDialogResponder responder;
+            responder.beforeAnswer = [&](QMessageBox *) {
+                // Asynchronous removal shifts indices; new tabs are not part of
+                // the batch the user agreed to close.
+                workspace.closeServer(profiles.at(2).id);
+                workspace.openOrActivate(profiles.at(4), false);
+            };
+            closeOthers->trigger();
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(tabs->tabData(0).toString(), profiles.at(1).id);
+        QCOMPARE(tabs->tabData(1).toString(), profiles.at(4).id);
+        QCOMPARE(closed.size(), 3);
+        QVERIFY(prepare(0));
+        QCOMPARE(answerClose([&] { closeAll->trigger(); }), 1);
+        QCOMPARE(tabs->count(), 0);
+        QCOMPARE(closed.size(), 5);
+    }
+
+    void applicationWindowLifecycle()
+    {
+        QProcess probe;
+        auto environment = QProcessEnvironment::systemEnvironment();
+        environment.remove(QStringLiteral("NOXSHELL_SSH_TEST_ENDPOINT"));
+        environment.remove(QStringLiteral("NOXSHELL_TEST_NATIVE_KEYCHAIN"));
+        probe.setProcessEnvironment(environment);
+        probe.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--window-lifecycle-probe")});
+        QVERIFY(probe.waitForStarted(2000));
+        QVERIFY(probe.waitForFinished(12000));
+        const QByteArray output = probe.readAllStandardOutput() + probe.readAllStandardError();
+        QCOMPARE(probe.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(probe.exitCode() == 0, qPrintable(QStringLiteral("exit %1: %2").arg(probe.exitCode()).arg(QString::fromUtf8(output))));
+        QVERIFY(output.contains("NOXSHELL_WINDOW_LIFECYCLE_OK"));
+    }
+
     void terminalTabContextMenuDuplicatesAndClosesSessions()
     {
         noxshell::ui::TerminalWorkspace workspace(nullptr, nullptr);
@@ -1201,7 +1676,7 @@ private slots:
         QCOMPARE(tabs->count(), 3);
 
         QVERIFY(prepareContext(1));
-        closeOthersAction->trigger();
+        QCOMPARE(answerClose([&] { closeOthersAction->trigger(); }), 1);
         QCOMPARE(tabs->count(), 1);
         QCOMPARE(tabs->tabText(0), QStringLiteral("第二台"));
 
@@ -1211,14 +1686,14 @@ private slots:
         auto *secondCloseButton = tabs->tabButton(1, QTabBar::RightSide)
                                       ->findChild<QToolButton *>(QStringLiteral("terminalTabCloseButton"));
         QVERIFY(secondCloseButton);
-        secondCloseButton->click();
+        QCOMPARE(answerClose([&] { secondCloseButton->click(); }), 1);
         QCOMPARE(tabs->count(), 1);
 
         QVERIFY(prepareContext(0));
         duplicateAction->trigger();
         QCOMPARE(tabs->count(), 2);
         QVERIFY(prepareContext(0));
-        closeAllAction->trigger();
+        QCOMPARE(answerClose([&] { closeAllAction->trigger(); }), 1);
         QCOMPARE(tabs->count(), 0);
         QCOMPARE(viewStack->currentWidget(), recentPage);
     }
@@ -2064,6 +2539,665 @@ private slots:
         QCOMPARE(readSpy.last().at(2).toByteArray(), QByteArray("enabled=false\n"));
     }
 
+    void remoteEditorInitialLoadKeepsTextOutsideGutter_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void remoteEditorInitialLoadKeepsTextOutsideGutter()
+    {
+        QFETCH(bool, dark);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        const auto themeReset = qScopeGuard([] { noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light); });
+        noxshell::SshSession session(nullptr, nullptr);
+        noxshell::ServerProfile profile;
+        profile.name = QStringLiteral("演示服务器");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        session.connectTo(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(session.isConnected(), 1000);
+        const QString path = QStringLiteral("/var/www/app/config.yml");
+        QByteArray content("services:\n  - name: proxy.8001\n    addr: \"127.0.0.1:8001\"\n    enabled: true\n    # Local display fixture only\n");
+        for (int line = 0; line < 1000; ++line) content += "    item_" + QByteArray::number(line) + ": 42\n";
+        QSignalSpy written(&session, &noxshell::SshSession::remoteFileWritten);
+        session.writeFile(path, content, false);
+        QTRY_COMPARE_WITH_TIMEOUT(written.count(), 1, 1000);
+        noxshell::ui::RemoteFileEditor window(&session, profile.name, path);
+        window.setAttribute(Qt::WA_DeleteOnClose, false);
+        auto *editor = window.findChild<QPlainTextEdit *>(QStringLiteral("remoteFileEditorText"));
+        auto *gutter = window.findChild<QWidget *>(QStringLiteral("remoteFileEditorLineNumbers"));
+        QVERIFY(editor);
+        QVERIFY(gutter);
+        bool initialGeometryChecked = false;
+        bool initialGeometryCorrect = false;
+        connect(&session, &noxshell::SshSession::remoteFileRead, &window, [&](quint64, const QString &readPath, const QByteArray &) {
+            if (readPath != path) return;
+            initialGeometryChecked = true;
+            // Check synchronously after the real load callback, BEFORE scrolling,
+            // resizing, grabbing, or another event can accidentally repair it.
+            const int minimumGutter = 14 + editor->fontMetrics().horizontalAdvance(QString::number(editor->blockCount()));
+            initialGeometryCorrect = editor->viewport()->geometry().left() > gutter->geometry().right()
+                && gutter->width() >= minimumGutter;
+            qInfo() << "initial editor viewport/gutter" << editor->viewport()->geometry() << gutter->geometry();
+        });
+        window.show();
+        QTRY_VERIFY_WITH_TIMEOUT(initialGeometryChecked, 1000);
+        QCOMPARE(editor->toPlainText().toUtf8(), content);
+        QCOMPARE(editor->verticalScrollBar()->value(), 0);
+        QCOMPARE(editor->horizontalScrollBar()->value(), 0);
+        QVERIFY2(initialGeometryCorrect, "The line-number gutter overlaps the first characters on initial load");
+        QCoreApplication::processEvents();
+        QVERIFY(editor->viewport()->geometry().left() > gutter->geometry().right());
+        QVERIFY(editor->cursorRect().left() >= 0);
+        QVERIFY(editor->cursorRect().top() >= 0);
+        QCOMPARE(editor->fontMetrics().horizontalAdvance(QLatin1Char('i')),
+            editor->fontMetrics().horizontalAdvance(QLatin1Char('W')));
+        auto *save = window.findChild<QPushButton *>(QStringLiteral("remoteFileEditorSave"));
+        auto *undo = window.findChild<QToolButton *>(QStringLiteral("remoteFileEditorUndo"));
+        auto *redo = window.findChild<QToolButton *>(QStringLiteral("remoteFileEditorRedo"));
+        auto *wrap = window.findChild<QToolButton *>(QStringLiteral("remoteFileEditorWrap"));
+        auto *find = window.findChild<QToolButton *>(QStringLiteral("remoteFileEditorFind"));
+        auto *tabs = window.findChild<QTabBar *>(QStringLiteral("remoteFileEditorTabs"));
+        auto *position = window.findChild<QLabel *>(QStringLiteral("remoteFileEditorPosition"));
+        auto *state = window.findChild<QLabel *>(QStringLiteral("remoteFileEditorState"));
+        QVERIFY(save && undo && redo && wrap && find && tabs && position && state);
+        QVERIFY(!save->isEnabled());
+        QVERIFY(tabs->tabIcon(0).isNull());
+        QVERIFY(position->text().contains(QStringLiteral("行 1，列 1")));
+        QVERIFY(!editor->document()->firstBlock().layout()->formats().isEmpty());
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_EDITOR_CAPTURE_DIR");
+        if (!captureDir.isEmpty()) {
+            QVERIFY(QDir().mkpath(captureDir));
+            QVERIFY(window.grab().save(captureDir + (dark ? QStringLiteral("/dark.png") : QStringLiteral("/light.png"))));
+        }
+        // A live theme change must update the gutter/highlight without editing
+        // content, scrolling the document, or showing an unsaved marker.
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Light : noxshell::ui::ThemeMode::Dark);
+        QCoreApplication::processEvents();
+        QCOMPARE(editor->toPlainText().toUtf8(), content);
+        QVERIFY(tabs->tabIcon(0).isNull());
+        QVERIFY(!save->isEnabled());
+        QVERIFY(editor->viewport()->geometry().left() > gutter->geometry().right());
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        window.resize(600, 420);
+        QCoreApplication::processEvents();
+        QVERIFY(editor->viewport()->geometry().left() > gutter->geometry().right());
+        QVERIFY(save->isVisible());
+        QVERIFY(window.rect().contains(save->mapTo(&window, save->rect().bottomRight())));
+        QTest::mouseClick(wrap, Qt::LeftButton);
+        QCOMPARE(editor->lineWrapMode(), QPlainTextEdit::WidgetWidth);
+        QCOMPARE(editor->toPlainText().toUtf8(), content);
+        QVERIFY(!save->isEnabled());
+        QTest::mouseClick(wrap, Qt::LeftButton);
+        QTest::mouseClick(find, Qt::LeftButton);
+        QVERIFY(window.findChild<QWidget *>(QStringLiteral("remoteFileFindPanel"))->isVisible());
+        QTest::mouseClick(window.findChild<QToolButton *>(QStringLiteral("remoteFileFindClose")), Qt::LeftButton);
+        editor->insertPlainText(QStringLiteral("# edited\n"));
+        QVERIFY(save->isEnabled());
+        QVERIFY(undo->isEnabled());
+        QCOMPARE(state->text(), QStringLiteral("未保存"));
+        QTest::mouseClick(undo, Qt::LeftButton);
+        QCOMPARE(editor->toPlainText().toUtf8(), content);
+        QVERIFY(redo->isEnabled());
+        QTest::mouseClick(redo, Qt::LeftButton);
+        QVERIFY(editor->toPlainText().startsWith(QStringLiteral("# edited\n")));
+        QTest::mouseClick(save, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!save->isEnabled() && tabs->tabIcon(0).isNull(), 1000);
+        QCOMPARE(state->text(), QStringLiteral("已同步"));
+        // Crossing line-number digit boundaries must stay aligned immediately.
+        for (const int lines : {9, 10, 99, 100, 999, 1000}) {
+            editor->setPlainText(QStringLiteral("key: value\n").repeated(lines - 1) + QStringLiteral("last: true"));
+            QCOMPARE(editor->blockCount(), lines);
+            QVERIFY(editor->viewport()->geometry().left() > gutter->geometry().right());
+            QVERIFY(gutter->width() >= 14 + editor->fontMetrics().horizontalAdvance(QString::number(lines)));
+        }
+    }
+
+    void remoteEditorHighlightingIsBoundedAndDoesNotRewriteFiles()
+    {
+        noxshell::SshSession session(nullptr, nullptr);
+        noxshell::ServerProfile profile;
+        profile.name = QStringLiteral("syntax-fixture");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        session.connectTo(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(session.isConnected(), 1000);
+        const QList<QPair<QString, QByteArray>> fixtures{
+            {QStringLiteral("/var/www/app/sample.json"), QByteArray("{\"url\": \"https://example.invalid/#keep\", \"enabled\": true, \"limit\": 42}\n")},
+            {QStringLiteral("/var/www/app/sample.ini"), QByteArray("[network]\nport = 8001\npassword = \"not#comment\"\n# comment\n")},
+            {QStringLiteral("/var/www/app/sample.log"), QByteArray("plain text: no syntax modifications\n")},
+            {QStringLiteral("/var/www/app/long-line.yml"), QByteArray("key: ") + QByteArray(9000, 'a')},
+            {QStringLiteral("/var/www/app/large.yml"), QByteArray("key: true\n").repeated(60000)}
+        };
+        QSignalSpy writes(&session, &noxshell::SshSession::remoteFileWritten);
+        for (const auto &fixture : fixtures) {
+            const int before = writes.count();
+            session.writeFile(fixture.first, fixture.second, false);
+            QTRY_COMPARE_WITH_TIMEOUT(writes.count(), before + 1, 1000);
+        }
+        for (int index = 0; index < fixtures.size(); ++index) {
+            const auto &fixture = fixtures.at(index);
+            noxshell::ui::RemoteFileEditor window(&session, profile.name, fixture.first);
+            window.setAttribute(Qt::WA_DeleteOnClose, false);
+            window.show();
+            auto *editor = window.findChild<QPlainTextEdit *>(QStringLiteral("remoteFileEditorText"));
+            auto *save = window.findChild<QPushButton *>(QStringLiteral("remoteFileEditorSave"));
+            QTRY_VERIFY_WITH_TIMEOUT(editor->isEnabled(), 3000);
+            QCoreApplication::processEvents();
+            QCOMPARE(editor->toPlainText().toUtf8(), fixture.second);
+            QVERIFY(!save->isEnabled());
+            const auto formats = editor->document()->firstBlock().layout()->formats();
+            if (index < 2) QVERIFY(!formats.isEmpty());
+            else QVERIFY(formats.isEmpty()); // Logs, huge lines and huge files stay cheap.
+            QTest::mouseClick(window.findChild<QToolButton *>(QStringLiteral("remoteFileEditorWrap")), Qt::LeftButton);
+            QCOMPARE(editor->toPlainText().toUtf8(), fixture.second);
+            QVERIFY(!save->isEnabled());
+        }
+        QCOMPARE(writes.count(), fixtures.size()); // Viewing/styling never writes to the server.
+    }
+
+    void directorySizeCommandQuotesPathsAndParsesSafely()
+    {
+        quint64 bytes = 99;
+        QVERIFY(noxshell::detail::parseDirectorySize("123\t/path\nwith newline\n", bytes));
+        QCOMPARE(bytes, quint64(123 * 1024));
+        QVERIFY(noxshell::detail::parseDirectorySize("0\t/empty\n", bytes));
+        QCOMPARE(bytes, quint64(0));
+        for (const auto &invalid : {QByteArray("-1\t/path"), QByteArray("oops\n12\t/path"),
+                 QByteArray("18446744073709551615\t/path"), QByteArray("123"), QByteArray("12 MB")})
+            QVERIFY(!noxshell::detail::parseDirectorySize(invalid, bytes));
+        QVERIFY(noxshell::detail::directorySizeCommand(QStringLiteral("relative")).isEmpty());
+        QVERIFY(noxshell::detail::directorySizeCommand(QStringLiteral("/null") + QChar::Null).isEmpty());
+        const auto command = noxshell::detail::directorySizeCommand(QStringLiteral("/a'b $();\n目录"));
+        QVERIFY(command.contains("p='/a'\\''b $();\n"));
+        QVERIFY(command.contains("du -skx --"));
+        QVERIFY(command.contains("nice -n 19"));
+        QVERIFY(command.contains("ionice -c 3"));
+        QVERIFY(command.contains("timeout -k 2 60"));
+        QVERIFY(command.contains("set -- sh -c")); // Probing is bounded along with du itself.
+        QVERIFY(command.contains("read -r cancel <&3"));
+        QVERIFY(!command.contains("sudo"));
+    }
+
+    void directorySizeRemoteWrapperStopsChildOnCancel()
+    {
+#ifdef Q_OS_WIN
+        QSKIP("POSIX remote wrapper tested on Unix hosts");
+#else
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto bin = directory.filePath(QStringLiteral("bin"));
+        QVERIFY(QDir().mkpath(bin));
+        const auto script = [&](const QString &name, const QByteArray &body) {
+            QFile file(bin + QLatin1Char('/') + name);
+            if (!file.open(QIODevice::WriteOnly) || file.write("#!/bin/sh\n" + body) < 0) return false;
+            file.close();
+            return file.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        };
+        // Test supervision and exact argument boundaries without Linux tools,
+        // real mounts, a filesystem scan, root privileges or remote credentials.
+        QVERIFY(script(QStringLiteral("timeout"), "shift 3\nexec \"$@\"\n"));
+        QVERIFY(script(QStringLiteral("nice"), "shift 2\nexec \"$@\"\n"));
+        QVERIFY(script(QStringLiteral("ionice"), "shift 2\nexec \"$@\"\n"));
+        QVERIFY(script(QStringLiteral("stat"), "echo ext4\n"));
+        QVERIFY(script(QStringLiteral("du"),
+            "printf '%s' \"$3\" > \"$SCAN_CAPTURE\"\n"
+            "if [ \"$SCAN_MODE\" = wait ]; then\n"
+            " trap 'echo stopped > \"$SCAN_STOP\"; exit 130' TERM\n"
+            " echo started > \"$SCAN_START\"\n"
+            " while :; do sleep 0.05; done\n"
+            "fi\nprintf '42\\t%s\\n' \"$3\"\n"));
+        const auto target = directory.filePath(QStringLiteral("a'b;$(false)\n目录"));
+        QVERIFY(QDir().mkpath(target));
+        auto environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QStringLiteral("PATH"), bin + QStringLiteral(":/usr/bin:/bin"));
+        environment.insert(QStringLiteral("SCAN_CAPTURE"), directory.filePath(QStringLiteral("capture")));
+        environment.insert(QStringLiteral("SCAN_START"), directory.filePath(QStringLiteral("started")));
+        environment.insert(QStringLiteral("SCAN_STOP"), directory.filePath(QStringLiteral("stopped")));
+        QProcess process;
+        const auto cleanup = qScopeGuard([&] {
+            process.closeWriteChannel();
+            if (!process.waitForFinished(2000)) { process.kill(); process.waitForFinished(2000); }
+        });
+        process.setProcessEnvironment(environment);
+        const QStringList arguments{QStringLiteral("-c"), QString::fromUtf8(noxshell::detail::directorySizeCommand(target))};
+        process.start(QStringLiteral("/bin/sh"), arguments);
+        QVERIFY(process.waitForFinished(3000));
+        QCOMPARE(process.exitCode(), 0);
+        QVERIFY(process.readAllStandardError().isEmpty());
+        quint64 bytes = 0;
+        QVERIFY(noxshell::detail::parseDirectorySize(process.readAllStandardOutput(), bytes));
+        QCOMPARE(bytes, quint64(42 * 1024));
+        QFile capture(directory.filePath(QStringLiteral("capture")));
+        QVERIFY(capture.open(QIODevice::ReadOnly));
+        QCOMPARE(capture.readAll(), target.toUtf8());
+        capture.close();
+
+        environment.insert(QStringLiteral("SCAN_MODE"), QStringLiteral("wait"));
+        process.setProcessEnvironment(environment);
+        process.start(QStringLiteral("/bin/sh"), arguments);
+        QVERIFY(process.waitForStarted(1000));
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(directory.filePath(QStringLiteral("started"))), 2000);
+        process.closeWriteChannel();
+        QVERIFY(process.waitForFinished(3000));
+        QVERIFY(QFileInfo::exists(directory.filePath(QStringLiteral("stopped"))));
+        QVERIFY(process.exitCode() != 0);
+#endif
+    }
+
+    void fileDirectorySizesQueueCancelAndSort_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void fileDirectorySizesQueueCancelAndSort()
+    {
+        QFETCH(bool, dark);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        const auto restoreTheme = qScopeGuard([] { noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light); });
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QObject::disconnect(&session, &noxshell::SshSession::homeDirectoryRequested, nullptr, nullptr);
+        QObject::disconnect(&session, &noxshell::SshSession::listDirectoryRequested, nullptr, nullptr);
+        QObject::disconnect(&session, &noxshell::SshSession::directorySizeRequested, nullptr, nullptr);
+        QSignalSpy connectRequests(&session, &noxshell::SshSession::connectRequested);
+        QSignalSpy homeRequests(&session, &noxshell::SshSession::homeDirectoryRequested);
+        QSignalSpy sizeRequests(&session, &noxshell::SshSession::directorySizeRequested);
+        QSignalSpy cancels(&session, &noxshell::SshSession::directorySizeCanceled);
+        noxshell::ui::FilePanel panel(&session);
+        panel.resize(1100, 440);
+        panel.show();
+        noxshell::ServerProfile profile;
+        profile.id = profile.name = QStringLiteral("directory-size-test");
+        profile.host = QStringLiteral("192.0.2.20");
+        profile.user = QStringLiteral("fixture");
+        profile.password = QStringLiteral("synthetic-only");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        panel.setServer(profile);
+        session.connectTo(profile);
+        QCOMPARE(connectRequests.size(), 1);
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("fixture connected")),
+            Q_ARG(quint64, connectRequests.first().at(1).toULongLong())));
+        QTRY_COMPARE(homeRequests.size(), 1);
+        session.homeDirectoryResolved(QStringLiteral("/fixture"));
+        noxshell::RemoteFileEntries entries;
+        const auto entry = [](const QString &name, quint64 size, bool directory) {
+            noxshell::RemoteFileEntry value;
+            value.name = name;
+            value.path = QStringLiteral("/fixture/") + name;
+            value.directory = directory;
+            value.size = size;
+            return value;
+        };
+        entries << entry(QStringLiteral("b-dir"), 0, true) << entry(QStringLiteral("a-dir"), 0, true)
+                << entry(QStringLiteral("small"), 900, false) << entry(QStringLiteral("large"), 2048, false);
+        session.directoryListed(QStringLiteral("/fixture"), entries);
+        auto *tree = panel.findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        auto *automatic = panel.findChild<QCheckBox *>(QStringLiteral("fileAutoDirectorySize"));
+        auto *pathEdit = panel.findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
+        QVERIFY(tree && automatic && pathEdit);
+        QVERIFY(!panel.findChild<QComboBox *>(QStringLiteral("fileSortMode")));
+        QCOMPARE(tree->header()->objectName(), QStringLiteral("remoteFileHeader"));
+        const auto clickHeader = [tree](int column) {
+            QTest::mouseClick(tree->header()->viewport(), Qt::LeftButton, Qt::NoModifier,
+                QPoint(tree->header()->sectionViewportPosition(column) + tree->columnWidth(column) / 2,
+                    tree->header()->height() / 2));
+        };
+        const auto sizePoint = [tree](QTreeWidgetItem *item, bool action) {
+            return QPoint(tree->header()->sectionViewportPosition(1) + (action ? 16 : tree->columnWidth(1) - 16),
+                tree->visualItemRect(item).center().y());
+        };
+        const auto clickSizeAction = [tree, &sizePoint](QTreeWidgetItem *item) {
+            QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, sizePoint(item, true));
+        };
+        QVERIFY(!automatic->isChecked());
+        QCOMPARE(sizeRequests.size(), 0);
+        QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("a-dir"));
+        auto *a = tree->topLevelItem(0);
+        auto *b = tree->topLevelItem(1);
+        QCOMPARE(a->text(1), QStringLiteral("—"));
+        QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, sizePoint(a, false));
+        QCoreApplication::processEvents();
+        QCOMPARE(sizeRequests.size(), 0); // Selecting the value does not start a scan.
+        QTest::mousePress(tree->viewport(), Qt::LeftButton, Qt::NoModifier, sizePoint(a, false));
+        QTest::mouseRelease(tree->viewport(), Qt::LeftButton, Qt::NoModifier, sizePoint(a, true));
+        QCoreApplication::processEvents();
+        QCOMPARE(sizeRequests.size(), 0); // Dragging into the icon is not a click.
+        clickSizeAction(a);
+        QTRY_COMPARE(sizeRequests.size(), 1);
+        QCOMPARE(sizeRequests.last().at(1).toString(), QStringLiteral("/fixture/a-dir"));
+        QCOMPARE(a->text(1), QStringLiteral("计算中…"));
+        const auto first = sizeRequests.last().at(0).toULongLong();
+        session.directorySizeCalculated(first, QStringLiteral("/fixture/a-dir"), 1024, {});
+        QCOMPARE(a->text(1), QStringLiteral("1.0 KB"));
+        clickHeader(1);
+        QCOMPARE(tree->header()->sortIndicatorSection(), 1);
+        QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::AscendingOrder);
+        QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("small"));
+        QCOMPARE(tree->topLevelItem(1), a);
+        QCOMPARE(tree->topLevelItem(3), b);
+        clickHeader(1);
+        QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::DescendingOrder);
+        QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("large"));
+        QCOMPARE(tree->topLevelItem(3), b);
+        clickHeader(2); // Other headers do not change the selected sort.
+        QCOMPARE(tree->sortColumn(), 1);
+        QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::DescendingOrder);
+        clickHeader(0);
+        QCOMPARE(tree->sortColumn(), 0);
+        QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::AscendingOrder);
+        clickHeader(0);
+        QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::DescendingOrder);
+        QCOMPARE(tree->topLevelItem(0), b);
+        clickHeader(0);
+        automatic->setChecked(true);
+        QTRY_COMPARE(sizeRequests.size(), 2);
+        QCOMPARE(sizeRequests.last().at(1).toString(), QStringLiteral("/fixture/b-dir"));
+        const auto obsolete = sizeRequests.last().at(0).toULongLong();
+        const int cancelCount = cancels.size();
+        pathEdit->setText(QStringLiteral("/new"));
+        QTest::keyClick(pathEdit, Qt::Key_Return);
+        QVERIFY(cancels.size() > cancelCount);
+        noxshell::RemoteFileEntries next{entry(QStringLiteral("d-dir"), 0, true), entry(QStringLiteral("c-dir"), 0, true)};
+        for (auto &value : next) value.path = QStringLiteral("/new/") + value.name;
+        session.directoryListed(QStringLiteral("/new"), next);
+        QTRY_COMPARE(sizeRequests.size(), 3);
+        QCOMPARE(sizeRequests.last().at(1).toString(), QStringLiteral("/new/c-dir"));
+        QCOMPARE(tree->topLevelItem(1)->text(1), QStringLiteral("等待计算…"));
+        session.directorySizeCalculated(obsolete, QStringLiteral("/fixture/b-dir"), 99999999, {});
+        QCOMPARE(tree->topLevelItem(0)->text(1), QStringLiteral("计算中…"));
+        QCOMPARE(sizeRequests.size(), 3);
+        const auto current = sizeRequests.last().at(0).toULongLong();
+        session.directorySizeCalculated(current, QStringLiteral("/new/c-dir"), 0, QStringLiteral("Permission denied"));
+        QCOMPARE(tree->topLevelItem(0)->text(1), QStringLiteral("未完成"));
+        QTRY_COMPARE(sizeRequests.size(), 4);
+        QCOMPARE(sizeRequests.last().at(1).toString(), QStringLiteral("/new/d-dir"));
+        automatic->setChecked(false);
+        QCOMPARE(tree->topLevelItem(1)->text(1), QStringLiteral("—"));
+        session.directorySizeCalculated(sizeRequests.last().at(0).toULongLong(), QStringLiteral("/new/d-dir"), 4096, {});
+        QCOMPARE(tree->topLevelItem(1)->text(1), QStringLiteral("—"));
+        QTest::qWait(230);
+        QCOMPARE(sizeRequests.size(), 4);
+        auto *recalculated = tree->topLevelItem(0);
+        clickSizeAction(recalculated);
+        QTRY_COMPARE(sizeRequests.size(), 5);
+        session.directorySizeCalculated(sizeRequests.last().at(0).toULongLong(), QStringLiteral("/new/c-dir"), 2048, {});
+        QCOMPARE(recalculated->text(1), QStringLiteral("2.0 KB"));
+        clickSizeAction(recalculated);
+        clickSizeAction(recalculated); // Rapid repeated clicks do not create duplicate scans.
+        QTRY_COMPARE(sizeRequests.size(), 6);
+        tree->itemDoubleClicked(recalculated, 1);
+        QCOMPARE(panel.currentPath(), QStringLiteral("/new"));
+        session.directorySizeCalculated(sizeRequests.last().at(0).toULongLong(), QStringLiteral("/new/c-dir"), 8192, {});
+        QCOMPARE(recalculated->text(1), QStringLiteral("8.0 KB"));
+        QCOMPARE(recalculated->textAlignment(1), Qt::AlignRight | Qt::AlignVCenter);
+        QVERIFY(recalculated->toolTip(1).contains(QStringLiteral("左侧图标")));
+        tree->setColumnWidth(1, 96);
+        QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, sizePoint(recalculated, false));
+        QCoreApplication::processEvents();
+        QCOMPARE(sizeRequests.size(), 6);
+        tree->setColumnWidth(1, 132);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Light : noxshell::ui::ThemeMode::Dark);
+        QCoreApplication::processEvents();
+        QCOMPARE(recalculated->text(1), QStringLiteral("8.0 KB"));
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        QCoreApplication::processEvents();
+        tree->clearSelection();
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_SIZE_CAPTURE_DIR");
+        if (!captureDir.isEmpty()) {
+            QVERIFY(QDir().mkpath(captureDir));
+            QVERIFY(panel.grab().save(captureDir + (dark ? QStringLiteral("/dark.png") : QStringLiteral("/light.png"))));
+            recalculated->setSelected(true);
+            QVERIFY(panel.grab().save(captureDir + (dark ? QStringLiteral("/dark-selected.png") : QStringLiteral("/light-selected.png"))));
+        }
+    }
+
+    void remotePathBreadcrumbs_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void remotePathBreadcrumbs()
+    {
+        QFETCH(bool, dark);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        const auto restoreTheme = qScopeGuard([] { noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light); });
+        QWidget window;
+        auto *layout = new QVBoxLayout(&window);
+        auto *outside = new QLineEdit;
+        auto *path = new noxshell::ui::RemotePathEdit;
+        layout->addWidget(outside);
+        layout->addWidget(path);
+        window.resize(760, 140);
+        window.show();
+        window.activateWindow();
+        outside->setFocus();
+        QTRY_VERIFY(outside->hasFocus());
+        const QString initial = QStringLiteral("/var/lib/docker/volumes/zyb_logs/_data");
+        path->setPath(initial);
+        QSignalSpy activated(path, &noxshell::ui::RemotePathEdit::pathActivated);
+        QSignalSpy submitted(path, &QLineEdit::returnPressed);
+        const auto segment = [path](const QString &destination) -> QToolButton * {
+            for (auto *button : path->findChildren<QToolButton *>(QStringLiteral("remotePathSegment"))) {
+                if (button->isVisible() && button->property("remotePath").toString() == destination) return button;
+            }
+            return nullptr;
+        };
+        QTRY_VERIFY(!path->isEditing());
+        auto *lib = segment(QStringLiteral("/var/lib"));
+        QVERIFY(lib);
+        QTest::mouseClick(lib, Qt::LeftButton);
+        QCOMPARE(activated.size(), 1);
+        QCOMPARE(activated.last().first().toString(), QStringLiteral("/var/lib"));
+        QVERIFY(!path->isEditing());
+        // Selecting a breadcrumb submits exactly once, not a text edit/Enter.
+        QCOMPARE(submitted.size(), 0);
+        path->setPath(QStringLiteral("/var/lib"));
+        QTest::mouseClick(segment(QStringLiteral("/var/lib")), Qt::LeftButton);
+        QCOMPARE(activated.size(), 1); // Clicking the current directory is a no-op.
+        QTest::mouseClick(segment(QStringLiteral("/")), Qt::LeftButton);
+        QCOMPARE(activated.last().first().toString(), QStringLiteral("/"));
+
+        path->setPath(initial);
+        QTest::mouseClick(path, Qt::LeftButton, Qt::NoModifier, QPoint(path->width() - 45, 13));
+        QVERIFY(path->isEditing());
+        QTRY_VERIFY(path->hasFocus());
+        QCOMPARE(path->text(), initial);
+        QVERIFY(!segment(QStringLiteral("/var/lib")));
+        path->setText(QStringLiteral("/not-submitted"));
+        QTest::mouseClick(outside, Qt::LeftButton);
+        QTRY_VERIFY(outside->hasFocus());
+        QTRY_VERIFY(!path->isEditing());
+        QCOMPARE(path->text(), initial);
+        QCOMPARE(submitted.size(), 0);
+
+        auto *editButton = path->findChild<QToolButton *>(QStringLiteral("remotePathEditButton"));
+        QVERIFY(editButton && !editButton->icon().isNull());
+        QTest::mouseClick(editButton, Qt::LeftButton);
+        QVERIFY(path->isEditing());
+        path->setText(QStringLiteral("/also-not-submitted"));
+        QFocusEvent popupFocusOut(QEvent::FocusOut, Qt::PopupFocusReason);
+        QApplication::sendEvent(path, &popupFocusOut);
+        QVERIFY(path->isEditing());
+        QCOMPARE(path->text(), QStringLiteral("/also-not-submitted"));
+        QTest::keyClick(path, Qt::Key_Escape);
+        QVERIFY(!path->isEditing());
+        QCOMPARE(path->text(), initial);
+        QCOMPARE(submitted.size(), 0);
+
+        path->beginEditing();
+        const QString unusual = QStringLiteral("/目录/my files/a&b/100%/#data;$(literal)");
+        path->setText(unusual);
+        connect(path, &QLineEdit::returnPressed, path, [path] { path->setPath(path->text()); });
+        QTest::keyClick(path, Qt::Key_Return);
+        QCOMPARE(submitted.size(), 1);
+        QCOMPARE(path->text(), unusual);
+        QVERIFY(!path->isEditing());
+        auto *ampersand = segment(QStringLiteral("/目录/my files/a&b"));
+        QVERIFY(ampersand);
+        QCOMPARE(ampersand->text(), QStringLiteral("a&&b"));
+        QTest::mouseClick(ampersand, Qt::LeftButton);
+        QCOMPARE(activated.last().first().toString(), QStringLiteral("/目录/my files/a&b"));
+
+        const QString longPath = QStringLiteral("/var/lib/docker/volumes/") + QString(180, QLatin1Char('x')) + QStringLiteral("/_data");
+        path->setPath(longPath);
+        window.resize(260, 140);
+        QCoreApplication::processEvents();
+        auto *overflow = path->findChild<QToolButton *>(QStringLiteral("remotePathOverflow"));
+        QVERIFY(overflow && overflow->isVisible());
+        QVERIFY(overflow->menu() && !overflow->menu()->actions().isEmpty());
+        QVERIFY(segment(QStringLiteral("/")));
+        QVERIFY(segment(longPath));
+        for (auto *button : path->findChildren<QToolButton *>()) {
+            if (button->isVisible()) QVERIFY(path->rect().contains(button->geometry()));
+        }
+        const auto action = overflow->menu()->actions().first();
+        QCOMPARE(action->data().toString(), QStringLiteral("/var"));
+        bool menuOpened = false;
+        QTimer::singleShot(0, overflow->menu(), [menu = overflow->menu(), &menuOpened] {
+            menuOpened = menu->isVisible();
+            menu->setActiveAction(menu->actions().first());
+            QTest::keyClick(menu, Qt::Key_Return);
+            menu->close();
+        });
+        QTest::mouseClick(overflow, Qt::LeftButton);
+        QTRY_VERIFY(menuOpened);
+        QCOMPARE(activated.last().first().toString(), QStringLiteral("/var"));
+        path->beginEditing();
+        QCOMPARE(path->text(), longPath); // Never copy an ellipsis into the path.
+        QTest::keyClick(path, Qt::Key_Escape);
+        const auto longLeaf = QStringLiteral("/") + QString(240, QLatin1Char('z'));
+        path->setPath(longLeaf);
+        QVERIFY(segment(longLeaf));
+        QVERIFY(segment(longLeaf)->text().contains(QChar(0x2026)));
+        QCOMPARE(segment(longLeaf)->toolTip(), longLeaf);
+        QVERIFY(path->rect().contains(segment(longLeaf)->geometry()));
+        path->setPath(QStringLiteral("/"));
+        QVERIFY(segment(QStringLiteral("/")));
+        QVERIFY(!overflow->isVisible());
+
+        path->setPath(initial);
+        window.resize(760, 140);
+        QCoreApplication::processEvents();
+        const auto capture = qEnvironmentVariable("NOXSHELL_BREADCRUMB_CAPTURE_DIR");
+        if (!capture.isEmpty()) {
+            QDir().mkpath(capture);
+            QVERIFY(window.grab().save(capture + (dark ? QStringLiteral("/dark.png") : QStringLiteral("/light.png"))));
+        }
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Light : noxshell::ui::ThemeMode::Dark);
+        QCoreApplication::processEvents();
+        QVERIFY(!path->isEditing());
+        QVERIFY(segment(QStringLiteral("/var/lib")));
+        QCOMPARE(path->text(), initial);
+    }
+
+    void remotePathBreadcrumbNavigation_data() { remotePathBreadcrumbs_data(); }
+
+    void remotePathBreadcrumbNavigation()
+    {
+        QFETCH(bool, dark);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        const auto restoreTheme = qScopeGuard([] { noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light); });
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QObject::disconnect(&session, &noxshell::SshSession::homeDirectoryRequested, nullptr, nullptr);
+        QObject::disconnect(&session, &noxshell::SshSession::listDirectoryRequested, nullptr, nullptr);
+        QSignalSpy connections(&session, &noxshell::SshSession::connectRequested);
+        QSignalSpy homes(&session, &noxshell::SshSession::homeDirectoryRequested);
+        QSignalSpy listings(&session, &noxshell::SshSession::listDirectoryRequested);
+        noxshell::ui::FilePanel panel(&session);
+        panel.resize(1200, 430);
+        panel.show();
+        panel.activateWindow();
+        noxshell::ServerProfile profile;
+        profile.id = profile.name = QStringLiteral("breadcrumb-fixture");
+        profile.host = QStringLiteral("192.0.2.20");
+        profile.user = QStringLiteral("fixture");
+        profile.password = QStringLiteral("synthetic-only");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        panel.setServer(profile);
+        session.connectTo(profile);
+        QCOMPARE(connections.size(), 1);
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("fixture connected")),
+            Q_ARG(quint64, connections.first().at(1).toULongLong())));
+        QTRY_COMPARE(homes.size(), 1);
+        const QString initial = QStringLiteral("/var/lib/docker/volumes/zyb_logs/_data");
+        session.homeDirectoryResolved(initial);
+        session.directoryListed(initial, {});
+        auto *path = panel.findChild<noxshell::ui::RemotePathEdit *>();
+        QVERIFY(path);
+        QVERIFY(!path->isEditing());
+        const auto clickSegment = [path](const QString &destination) {
+            for (auto *button : path->findChildren<QToolButton *>(QStringLiteral("remotePathSegment"))) {
+                if (button->isVisible() && button->property("remotePath").toString() == destination) {
+                    QTest::mouseClick(button, Qt::LeftButton);
+                    return true;
+                }
+            }
+            return false;
+        };
+        QVERIFY(clickSegment(QStringLiteral("/var/lib")));
+        QCOMPARE(panel.currentPath(), QStringLiteral("/var/lib"));
+        QCOMPARE(path->text(), panel.currentPath());
+        QVERIFY(!path->isEditing());
+        session.directoryListed(panel.currentPath(), {});
+        auto *back = panel.findChild<QToolButton *>(QStringLiteral("fileBackButton"));
+        QVERIFY(back && back->isEnabled());
+        QTest::mouseClick(back, Qt::LeftButton);
+        QCOMPARE(panel.currentPath(), initial);
+        session.directoryListed(initial, {});
+        auto *tree = panel.findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        QVERIFY(tree);
+        tree->setFocus();
+        QTest::keyClick(tree, Qt::Key_L, Qt::ControlModifier);
+        QTRY_VERIFY(path->isEditing());
+        QCOMPARE(path->selectedText(), initial);
+        path->setText(QStringLiteral("/var"));
+        QTest::keyClick(path, Qt::Key_Return);
+        QCOMPARE(panel.currentPath(), QStringLiteral("/var"));
+        QVERIFY(!path->isEditing());
+        session.directoryListed(panel.currentPath(), {});
+        const int count = listings.size();
+        path->beginEditing();
+        path->setText(QStringLiteral("/unsubmitted"));
+        QTest::mouseClick(tree->viewport(), Qt::LeftButton);
+        QTRY_VERIFY(!path->isEditing());
+        QCOMPARE(panel.currentPath(), QStringLiteral("/var"));
+        QCOMPARE(path->text(), panel.currentPath());
+        QCOMPARE(listings.size(), count);
+        QVERIFY(clickSegment(QStringLiteral("/")));
+        QCOMPARE(panel.currentPath(), QStringLiteral("/"));
+        session.directoryListed(panel.currentPath(), {});
+        QVERIFY(!panel.findChild<QToolButton *>(QStringLiteral("fileUpButton"))->isEnabled());
+
+        session.homeDirectoryResolved(initial);
+        noxshell::RemoteFileEntries entries;
+        for (const auto &name : {QStringLiteral("archive"), QStringLiteral("config.yml"), QStringLiteral("server.log")}) {
+            noxshell::RemoteFileEntry entry;
+            entry.name = name;
+            entry.path = initial + QLatin1Char('/') + name;
+            entry.directory = name == QStringLiteral("archive");
+            entry.size = 4096;
+            entries.append(entry);
+        }
+        session.directoryListed(initial, entries);
+        QCoreApplication::processEvents();
+        QVERIFY(!path->isEditing()); // Deferred deletion/focus changes must not reopen editing.
+        const auto capture = qEnvironmentVariable("NOXSHELL_BREADCRUMB_CAPTURE_DIR");
+        if (!capture.isEmpty()) {
+            QDir().mkpath(capture);
+            QVERIFY(panel.grab().save(capture + (dark ? QStringLiteral("/panel-dark.png") : QStringLiteral("/panel-light.png"))));
+        }
+    }
+
     void demoSftpListsAndNavigatesDirectories()
     {
         noxshell::SshSession session(nullptr, nullptr);
@@ -2231,12 +3365,12 @@ private slots:
         QVERIFY(replaceAll);
         QVERIFY(findClose);
         QVERIFY(fileSearchMarkers);
-        QVERIFY(!fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileEditorSave")));
+        QVERIFY(fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileEditorSave")));
         QVERIFY(!fileEditor->findChild<QPushButton *>(QStringLiteral("remoteFileEditorClose")));
         QCOMPARE(editorTabs->count(), 1);
         QVERIFY(editorTabs->tabText(0).contains(QStringLiteral("demo-sftp")));
         QVERIFY(editorTabs->tabText(0).contains(firstFileName));
-        QCOMPARE(editorTabs->height(), 30);
+        QCOMPARE(editorTabs->height(), 38);
         QVERIFY(!editorTabs->tabButton(0, QTabBar::LeftSide));
         auto *firstEditorCloseContainer = editorTabs->tabButton(0, QTabBar::RightSide);
         QVERIFY(firstEditorCloseContainer);
@@ -2703,6 +3837,103 @@ private slots:
         QVERIFY(std::none_of(entries.cbegin(), entries.cend(), [&target](const noxshell::RemoteFileEntry &entry) {
             return entry.path == target;
         }));
+    }
+
+    void completedDownloadOpensOnlyItsLocalDirectory_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void completedDownloadOpensOnlyItsLocalDirectory()
+    {
+        QFETCH(bool, dark);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        const auto restoreTheme = qScopeGuard([] { noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light); });
+        // Intercept desktop requests: this test must not launch Finder or open a
+        // real download. Include characters that must remain part of a file URL.
+        LocalDirectoryUrlCapture capture;
+        QDesktopServices::setUrlHandler(QStringLiteral("file"), &capture, "capture");
+        const auto resetHandler = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("file")); });
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto destination = directory.filePath(QStringLiteral("下载 ' # & 空格"));
+        QVERIFY(QDir().mkpath(destination));
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        noxshell::ui::TransferQueuePanel panel(&session);
+        panel.resize(520, 250);
+        panel.show();
+        noxshell::FileTransferTask task;
+        task.id = 81;
+        task.operation = noxshell::RemoteFileOperation::Download;
+        task.localPath = destination + QStringLiteral("/test.command");
+        task.remotePath = QStringLiteral("/remote/test.command");
+        task.total = 4096;
+        session.transferTaskChanged(task);
+        auto *list = panel.findChild<QListWidget *>(QStringLiteral("transferQueueList"));
+        QVERIFY(list);
+        QCOMPARE(list->count(), 1);
+        auto *row = list->itemWidget(list->item(0));
+        auto *open = row->findChild<QToolButton *>(QStringLiteral("transferOpenDirectory"));
+        auto *cancel = row->findChild<QPushButton *>(QStringLiteral("transferCancel"));
+        QVERIFY(open && cancel);
+        for (const auto state : {noxshell::TransferState::Queued, noxshell::TransferState::Running,
+                 noxshell::TransferState::Failed, noxshell::TransferState::Canceled}) {
+            task.state = state;
+            session.transferTaskChanged(task);
+            QVERIFY(open->isHidden());
+            QVERIFY(!open->isEnabled());
+        }
+        task.state = noxshell::TransferState::Completed;
+        task.completed = task.total;
+        session.transferTaskChanged(task);
+        QTRY_VERIFY(open->isVisible());
+        QVERIFY(open->isEnabled());
+        QVERIFY(cancel->isHidden());
+        QVERIFY(!open->icon().isNull());
+        QCOMPARE(open->accessibleName(), QStringLiteral("打开所在目录"));
+        QVERIFY(open->toolTip().contains(destination));
+        QVERIFY(capture.urls.isEmpty()); // Completion alone never opens a folder.
+        QTest::mouseClick(open, Qt::LeftButton);
+        QCOMPARE(capture.urls.size(), 1);
+        QVERIFY(capture.urls.last().isLocalFile());
+        QCOMPARE(capture.urls.last().toLocalFile(), destination); // Never the .command file.
+        QCoreApplication::processEvents();
+        QVERIFY(row->findChild<QLabel *>(QStringLiteral("transferState"))->geometry().right() < open->geometry().left());
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_TRANSFER_CAPTURE_DIR");
+        if (!captureDir.isEmpty()) {
+            QVERIFY(QDir().mkpath(captureDir));
+            QVERIFY(panel.grab().save(captureDir + (dark ? QStringLiteral("/dark.png") : QStringLiteral("/light.png"))));
+        }
+        auto upload = task;
+        upload.id = 82;
+        upload.operation = noxshell::RemoteFileOperation::Upload;
+        session.transferTaskChanged(upload);
+        auto *uploadButton = list->itemWidget(list->item(1))->findChild<QToolButton *>(QStringLiteral("transferOpenDirectory"));
+        QVERIFY(uploadButton && uploadButton->isHidden() && !uploadButton->isEnabled());
+        const auto updatedDestination = directory.filePath(QStringLiteral("new destination"));
+        QVERIFY(QDir().mkpath(updatedDestination));
+        task.localPath = updatedDestination + QStringLiteral("/new.txt");
+        session.transferTaskChanged(task);
+        QTest::mouseClick(open, Qt::LeftButton);
+        QCOMPARE(capture.urls.size(), 2);
+        QCOMPARE(capture.urls.last().toLocalFile(), updatedDestination); // Resolve current task, not a stale path.
+        task.localPath = directory.filePath(QStringLiteral("missing-directory/gone.txt"));
+        session.transferTaskChanged(task);
+        QTest::mouseClick(open, Qt::LeftButton);
+        QCOMPARE(capture.urls.size(), 2);
+        QVERIFY(row->findChild<QLabel *>(QStringLiteral("transferPath"))->text().contains(QStringLiteral("不存在")));
+        for (const auto &invalidPath : {QString{}, QStringLiteral("relative.txt"), QStringLiteral("https://example.invalid/file")}) {
+            task.localPath = invalidPath;
+            session.transferTaskChanged(task);
+            QVERIFY(open->isHidden());
+            QVERIFY(!open->isEnabled());
+        }
+        session.transferQueueReset();
+        QCOMPARE(list->count(), 0);
+        QCOMPARE(credentials.loadCalls, 0);
     }
 
     void transferQueueSerializesCancelsAndContinues()
@@ -3215,7 +4446,7 @@ private slots:
         QVERIFY(window.findChildren<noxshell::SshSession *>(QString{}, Qt::FindDirectChildrenOnly).isEmpty());
 
         // 左侧不展示会话状态，关闭标签只改变终端工作区。
-        tabs->tabCloseRequested(1);
+        QCOMPARE(answerClose([&] { tabs->tabCloseRequested(1); }), 1);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 1000);
         auto *closedHostRow = hostItemForName(QStringLiteral("db-master-01"));
         QVERIFY(closedHostRow);
@@ -3227,9 +4458,12 @@ private slots:
         tabs->customContextMenuRequested(tabs->tabRect(0).center());
         duplicate->trigger();
         QCOMPARE(tabs->count(), 2);
-        tabs->tabCloseRequested(tabs->currentIndex());
+        QCOMPARE(answerClose([&] { tabs->tabCloseRequested(tabs->currentIndex()); }), 1);
         QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 1000);
         QTRY_COMPARE_WITH_TIMEOUT(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 1, 1000);
+#ifndef Q_OS_MACOS
+        window.setQuitInProgress(true); // macOS alone uses close-to-hide.
+#endif
         window.close();
         QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
     }
@@ -3385,7 +4619,7 @@ private slots:
         fileToggle->click();
         QVERIFY(filePane->isVisible());
         QTRY_VERIFY(splitRestored());
-        sessions->tabCloseRequested(0);
+        QCOMPARE(answerClose([&] { sessions->tabCloseRequested(0); }), 1);
         QTRY_COMPARE(workspace->sessionCount(), 0);
         QVERIFY(workspace->isHomePageVisible());
         QVERIFY(filePane->isHidden());
@@ -3467,8 +4701,9 @@ private slots:
         submit->click(); // Do not try an empty password.
         QCOMPARE(requests.size(), 0);
         const auto reads = credentials.loadCalls;
-        const auto exact = QStringLiteral("  SSH。密码 $();  ");
-        password->setText(exact);
+        const auto exact = QStringLiteral("  SSH.password $();  ");
+        password->insert(QStringLiteral("  ＳＳＨ。password $();  "));
+        QCOMPARE(password->text(), exact);
         submit->click();
         submit->click(); // Duplicate submit cannot enqueue another handshake.
         QCOMPARE(credentials.loadCalls, reads);
@@ -3547,12 +4782,12 @@ private slots:
         QCOMPARE(requested.privateKeyPath, profile.privateKeyPath);
     }
 
-    void typedPasswordReachesLocalSshServerUnchanged()
+    void normalizedPasswordReachesLocalSshServer()
     {
         const auto executable = qEnvironmentVariable("NOXSHELL_AUTH_TEST_SERVER");
         if (executable.isEmpty()) QSKIP("Requires the optional loopback-only synthetic SSH fixture");
         QProcess server;
-        server.start(executable, {QStringLiteral("-password-case"), QStringLiteral("unicode")});
+        server.start(executable, {});
         const auto cleanup = qScopeGuard([&] {
             if (server.state() != QProcess::NotRunning) { server.kill(); server.waitForFinished(2000); }
         });
@@ -3585,8 +4820,9 @@ private slots:
         auto *password = workspace.findChild<QLineEdit *>(QStringLiteral("terminalConnectionPassword"));
         QVERIFY(session && password && password->isVisible());
         QSignalSpy requests(session, &noxshell::SshSession::connectRequested);
-        const auto exact = QStringLiteral("  SSH。密码é！'\u00a0🔑 $();  ");
-        password->setText(exact);
+        const auto exact = QStringLiteral("noxshell-integration-test-only");
+        password->insert(QStringLiteral("ｎｏｘｓｈｅｌｌ－ｉｎｔｅｇｒａｔｉｏｎ－ｔｅｓｔ－ｏｎｌｙ"));
+        QCOMPARE(password->text(), exact);
         QTest::keyClick(password, Qt::Key_Return);
         QTRY_VERIFY_WITH_TIMEOUT(session->isConnected(), 8000);
         QCOMPARE(requests.size(), 1);
@@ -3946,7 +5182,8 @@ private slots:
         auto *repository = window.findChild<noxshell::ServerRepository *>();
         QVERIFY(sidebar);
         QVERIFY(repository);
-        const auto exactPassword = QStringLiteral("  新建。passwordé！‘’\u00a0🔑  ");
+        const auto typedPassword = QStringLiteral("  ＳＳＨ。password！‘’\u00a0  ");
+        const auto exactPassword = QStringLiteral("  SSH.password!''   ");
         bool populated = false;
         QTimer::singleShot(0, &window, [&] {
             auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
@@ -3954,7 +5191,7 @@ private slots:
             dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("credential-round-trip"));
             dialog->findChild<QLineEdit *>(QStringLiteral("hostEditor"))->setText(QStringLiteral("192.0.2.11"));
             dialog->findChild<QLineEdit *>(QStringLiteral("userEditor"))->setText(QStringLiteral("root"));
-            dialog->findChild<QLineEdit *>(QStringLiteral("passwordEditor"))->insert(exactPassword);
+            dialog->findChild<QLineEdit *>(QStringLiteral("passwordEditor"))->insert(typedPassword);
             populated = true;
             dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
         });
@@ -4150,17 +5387,17 @@ private slots:
         QVERIFY(passwordReveal);
         QVERIFY(passwordHint);
         QCOMPARE(passwordEditor->echoMode(), QLineEdit::Password);
-        const auto exactPassword = QStringLiteral("  abc。中文é！‘’\u00a0🔑123  ");
-        passwordEditor->insert(exactPassword);
+        const auto exactPassword = QStringLiteral("  abc.SSH!'' 123  ");
+        passwordEditor->insert(QStringLiteral("  abc。ＳＳＨ！‘’\u00a0１２３  "));
         QCOMPARE(passwordEditor->text(), exactPassword);
         QCOMPARE(addDialog.profile().password.toUtf8(), exactPassword.toUtf8());
-        QVERIFY(passwordHint->text().contains(QStringLiteral("按原样保留")));
+        QVERIFY(passwordHint->text().contains(QStringLiteral("半角空格不变")));
         auto *passphraseEditor = addDialog.findChild<QLineEdit *>(QStringLiteral("passphraseEditor"));
         QVERIFY(passphraseEditor);
-        passphraseEditor->insert(exactPassword);
+        passphraseEditor->insert(QStringLiteral("  abc。ＳＳＨ！‘’\u00a0１２３  "));
         QCOMPARE(addDialog.profile().keyPassphrase.toUtf8(), exactPassword.toUtf8());
         passwordEditor->clear();
-        passwordEditor->setText(QStringLiteral("临时密码"));
+        passwordEditor->insert(QStringLiteral("temporary-password"));
         QVERIFY(!passwordReveal->icon().isNull());
         passwordReveal->trigger();
         QCOMPARE(passwordEditor->echoMode(), QLineEdit::Normal);
@@ -4260,7 +5497,7 @@ private slots:
 
 int main(int argc, char **argv)
 {
-    QApplication app(argc, argv);
+    noxshell::ui::Application app(argc, argv);
 #ifdef Q_OS_MACOS
     if (app.arguments().size() == 3 && app.arguments().at(1) == QStringLiteral("--silent-keychain-probe")) {
         const auto reference = app.arguments().at(2);
@@ -4312,7 +5549,13 @@ int main(int argc, char **argv)
     QApplication::setApplicationName(QStringLiteral("玄壳"));
     QApplication::setOrganizationName(QStringLiteral("NoxShell"));
     QApplication::setApplicationVersion(QString::fromLatin1(NOXSHELL_APP_VERSION));
+    QTemporaryDir settingsDirectory;
+    if (!settingsDirectory.isValid()) return 2;
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDirectory.path());
+    QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, settingsDirectory.path());
     noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light);
+    if (app.arguments().contains(QStringLiteral("--window-lifecycle-probe"))) return runWindowLifecycleProbe(app);
     SmokeTest test;
     return QTest::qExec(&test, argc, argv);
 }

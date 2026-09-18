@@ -1,4 +1,5 @@
 #include "ui/AppTheme.h"
+#include "ui/Application.h"
 #include "ui/MainWindow.h"
 #include "core/AppLogger.h"
 #include "core/ServerRepository.h"
@@ -19,7 +20,7 @@
 
 int main(int argc, char *argv[])
 {
-    QApplication app(argc, argv);
+    noxshell::ui::Application app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("玄壳"));
     QApplication::setOrganizationName(QStringLiteral("NoxShell"));
     QApplication::setApplicationVersion(QString::fromLatin1(NOXSHELL_APP_VERSION));
@@ -41,7 +42,7 @@ int main(int argc, char *argv[])
         window.show();
         QTimer::singleShot(500, &app, [&app] {
             std::puts("NOXSHELL_STARTUP_SMOKE_OK");
-            app.quit();
+            app.exit(0); // Automated startup probe must not enter user close handling.
         });
         return app.exec();
     }
@@ -60,6 +61,7 @@ int main(int argc, char *argv[])
         if (screenshotData->isValid()) screenshotDatabase = screenshotData->filePath(QStringLiteral("screenshot.sqlite3"));
     }
     noxshell::ui::MainWindow window(screenshotDatabase);
+    app.setMainWindow(&window);
     window.show();
     if (!screenshotPath.isEmpty()) {
         QTimer::singleShot(1000, &app, [&app, &window, screenshotPath] {

@@ -31,6 +31,7 @@ signals:
 private:
     void updateTask(const FileTransferTask &task);
     void updateSummary();
+    void openDownloadDirectory(quint64 taskId);
 
     SshSession *m_session{};
     QLabel *m_summary{};

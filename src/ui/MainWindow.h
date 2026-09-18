@@ -37,9 +37,12 @@ class MainWindow final : public QMainWindow {
 
 public:
     explicit MainWindow(QString databasePath = {}, QWidget *parent = nullptr, CredentialStore *credentialStore = nullptr);
+    bool confirmApplicationQuit();
+    void setQuitInProgress(bool quitting) { m_quitInProgress = quitting; }
 
 protected:
     void changeEvent(QEvent *event) override;
+    void closeEvent(QCloseEvent *event) override;
     bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
 
 private:
@@ -116,6 +119,8 @@ private:
     bool m_serverDeletionInFlight{false};
     bool m_nativeTitleBarControls{false};
     bool m_fileWorkspaceVisible{true};
+    bool m_hiddenByClose{false};
+    bool m_quitInProgress{false};
     ThemeMode m_themeMode{ThemeMode::System};
 };
 

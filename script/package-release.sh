@@ -10,6 +10,15 @@ readonly OUTPUT_DIR="${PROJECT_DIR}/output"
 readonly MACOS_DEPLOYMENT_TARGET="${NOXSHELL_MACOS_DEPLOYMENT_TARGET:-14.0}"
 
 [[ -n "${VERSION}" ]] || { printf '无法读取项目版本。\n' >&2; exit 1; }
+if [[ "$(uname -s)" == Darwin ]]; then
+    source "${SCRIPT_DIR}/macos-signing-config.sh"
+    bash "${PROJECT_DIR}/tests/MacSigningConfigTest.sh"
+    # Fail before building rather than silently replacing the release identity.
+    noxshell_load_signing_config
+    if [[ "${NOXSHELL_SIGNING_MODE}" == developer-id ]]; then
+        bash "${SCRIPT_DIR}/test-macos-keychain-upgrade.sh"
+    fi
+fi
 mkdir -p "${OUTPUT_DIR}"
 
 printf '构建并测试玄壳 v%s…\n' "${VERSION}"
@@ -87,7 +96,7 @@ case "$(uname -s)" in
         [[ -f "${REPAIR_TOOL}" ]] || { printf '缺少 macOS 一键修复工具：%s\n' "${REPAIR_TOOL}" >&2; exit 1; }
         mkdir -p "${DMG_ROOT}"
         ditto "${APP_PATH}" "${DMG_ROOT}/玄壳.app"
-        codesign --verify --deep --strict "${DMG_ROOT}/玄壳.app"
+        noxshell_verify_signing_identity "${DMG_ROOT}/玄壳.app" com.noxshell.ops
         ln -s /Applications "${DMG_ROOT}/Applications"
         install -m 0755 "${REPAIR_TOOL}" "${DMG_ROOT}/一键修复玄壳.command"
         hdiutil create -quiet -ov -volname "玄壳" -fs HFS+ -format ULMO \

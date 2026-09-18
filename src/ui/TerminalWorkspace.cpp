@@ -15,6 +15,7 @@
 #include <QPixmap>
 #include <QProxyStyle>
 #include <QSignalBlocker>
+#include <QScopedValueRollback>
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTabWidget>
@@ -474,7 +475,8 @@ void TerminalWorkspace::updateServer(const ServerProfile &profile)
 void TerminalWorkspace::closeServer(const QString &serverId)
 {
     for (int index = m_tabs->count() - 1; index >= 0; --index) {
-        if (m_tabs->tabData(index).toString() == serverId) closeSession(index);
+        // Server deletion already has its own confirmation in MainWindow.
+        if (m_tabs->tabData(index).toString() == serverId) removeSession(index);
     }
 }
 
@@ -595,6 +597,39 @@ void TerminalWorkspace::installCloseButton(int index)
 
 void TerminalWorkspace::closeSession(int index)
 {
+    if (index < 0 || index >= m_stack->count()) return;
+    requestCloseSessions({m_stack->widget(index)}, QStringLiteral("确认关闭会话"));
+}
+
+void TerminalWorkspace::requestCloseSessions(const QList<QPointer<QWidget>> &pages, const QString &title)
+{
+    if (pages.isEmpty() || m_confirmingClose) return;
+    const QScopedValueRollback confirming(m_confirmingClose, true);
+    QString text;
+    if (pages.size() == 1 && pages.first()) {
+        const auto profile = pages.first()->property("serverProfile").value<ServerProfile>();
+        text = QStringLiteral("确认关闭“%1”的标签页？").arg(profile.name);
+    } else {
+        text = QStringLiteral("确认关闭这 %1 个标签页？").arg(pages.size());
+    }
+    QMessageBox dialog(QMessageBox::Question, title, text, QMessageBox::Yes | QMessageBox::Cancel, this);
+    dialog.setObjectName(QStringLiteral("terminalCloseConfirmation"));
+    dialog.setTextFormat(Qt::PlainText);
+    dialog.setInformativeText(QStringLiteral("关闭会断开对应 SSH 会话，并停止该会话中进行的文件传输。"));
+    dialog.button(QMessageBox::Yes)->setText(QStringLiteral("关闭会话"));
+    dialog.button(QMessageBox::Cancel)->setText(QStringLiteral("取消"));
+    dialog.setDefaultButton(QMessageBox::Cancel);
+    dialog.setEscapeButton(QMessageBox::Cancel);
+    if (dialog.exec() != QMessageBox::Yes) return;
+    // Track the pages, not their indices: nested events can change the tab list
+    // while the dialog is open. New tabs must never join an earlier close request.
+    for (auto iterator = pages.crbegin(); iterator != pages.crend(); ++iterator) {
+        if (*iterator) removeSession(m_stack->indexOf(*iterator));
+    }
+}
+
+void TerminalWorkspace::removeSession(int index)
+{
     if (index < 0 || index >= m_tabs->count()) return;
     auto *page = m_stack->widget(index);
     auto *session = page->findChild<SshSession *>();
@@ -622,17 +657,22 @@ void TerminalWorkspace::closeSession(int index)
 void TerminalWorkspace::closeOtherSessions(int index)
 {
     if (index < 0 || index >= m_stack->count()) return;
-    auto *keptPage = m_stack->widget(index);
-    for (int candidate = m_stack->count() - 1; candidate >= 0; --candidate) {
-        if (m_stack->widget(candidate) != keptPage) closeSession(candidate);
+    const QPointer<QWidget> keptPage = m_stack->widget(index);
+    QList<QPointer<QWidget>> pages;
+    for (int candidate = 0; candidate < m_stack->count(); ++candidate) {
+        if (m_stack->widget(candidate) != keptPage) pages.append(m_stack->widget(candidate));
     }
+    requestCloseSessions(pages, QStringLiteral("确认关闭其他会话"));
+    if (!keptPage) return;
     const int keptIndex = m_stack->indexOf(keptPage);
     if (keptIndex >= 0) m_tabs->setCurrentIndex(keptIndex);
 }
 
 void TerminalWorkspace::closeAllSessions()
 {
-    for (int index = m_tabs->count() - 1; index >= 0; --index) closeSession(index);
+    QList<QPointer<QWidget>> pages;
+    for (int index = 0; index < m_stack->count(); ++index) pages.append(m_stack->widget(index));
+    requestCloseSessions(pages, QStringLiteral("确认关闭全部会话"));
 }
 
 void TerminalWorkspace::updateWorkspaceState()

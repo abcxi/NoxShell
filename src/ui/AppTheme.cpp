@@ -98,6 +98,8 @@ QString applicationStyleSheet(bool dark)
             padding:9px; border-radius:4px;
         }
         QLabel#portInlineLabel { color:#53657B; }
+        QLabel#asciiCredentialHint { color:#A75B00; font-size:11px; }
+        QWidget#terminalLoadingOverlay QLabel#asciiCredentialHint { color:#E2AB64; }
         QLabel#permissionFileName { color:#18324F; font-weight:650; }
         QToolButton#copyHostAddressButton { border: 0; border-radius: 4px; background: transparent; }
         QToolButton#copyHostAddressButton:hover { background: #E8F3FF; }
@@ -195,6 +197,16 @@ QString applicationStyleSheet(bool dark)
         QLabel#filePanelTitle { font-weight:650; }
         QLabel#fileServerLabel { color:#738297; font-size:12px; }
         QLabel#fileStatusLabel { color:#738297; font-size:11px; }
+        QToolButton#remotePathSegment, QToolButton#remotePathOverflow, QToolButton#remotePathEditButton {
+            color:#53677E; background:transparent; border:0; border-radius:3px; padding:0;
+            font-size:12px;
+        }
+        QToolButton#remotePathSegment[current="true"] { color:#183B60; font-weight:600; }
+        QToolButton#remotePathSegment:hover, QToolButton#remotePathOverflow:hover,
+        QToolButton#remotePathEditButton:hover { color:#006EFF; background:#E8F3FF; }
+        QToolButton#remotePathSegment:pressed, QToolButton#remotePathOverflow:pressed,
+        QToolButton#remotePathEditButton:pressed { background:#D5E8FC; }
+        QToolButton#remotePathOverflow::menu-indicator { image:none; }
         QWidget#fileLoadingOverlay { background:rgba(248, 250, 253, 218); }
         QFrame#fileLoadingCard { background:#FFFFFF; border:1px solid #D8E4EF; border-radius:8px; }
         QLabel#fileLoadingTitle { color:#28445F; font-size:14px; font-weight:650; }
@@ -291,6 +303,10 @@ QString applicationStyleSheet(bool dark)
         QProgressBar#transferProgress { border: 0; border-radius: 3px; background: #E5EBF2; }
         QProgressBar#transferProgress::chunk { background: #1684FF; border-radius: 3px; }
         QPushButton#transferCancel { min-height: 23px; padding: 0 6px; font-size:10px; }
+        QToolButton#transferOpenDirectory { background:transparent; border:0; border-radius:4px; padding:0; }
+        QToolButton#transferOpenDirectory:hover { background:#E8F3FF; }
+        QToolButton#transferOpenDirectory:pressed { background:#D5E8FC; }
+        QToolButton#transferOpenDirectory:focus { border:1px solid #1684FF; }
         QLabel#alertTitle { color: #9A4E1D; font-weight: 650; }
         QLabel#alertText { color: #8A6A54; font-size: 11px; }
         QWidget#terminalOutput { background: #0C1825; border: 0; }
@@ -473,10 +489,17 @@ QString applicationStyleSheet(bool dark)
         QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
         QScrollBar::handle:vertical { background: #C6D0DB; min-height: 28px; border-radius: 5px; margin: 2px; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QTabBar#remoteFileEditorTabs { background:#F4F6F8; border-bottom:1px solid #DCE3EA; }
+        QDialog#remoteFileEditor { background:#F3F6FA; }
+        QPlainTextEdit#remoteFileEditorText {
+            color:#25354A; background:#FFFFFF; border:0; border-radius:0; padding:0;
+            selection-background-color:#D7E9FF; selection-color:#173A64;
+        }
+        QPlainTextEdit#remoteFileEditorText:disabled { color:#8190A2; background:#FAFBFD; }
+        QTabBar#remoteFileEditorTabs { background:#EDF1F6; border-bottom:1px solid #DCE4EE; }
         QTabBar#remoteFileEditorTabs::tab {
-            min-width:150px; max-width:260px; min-height:28px; max-height:28px;
-            padding:0 6px; color:#44566C; background:#F4F6F8;
+            min-width:150px; max-width:260px; min-height:35px; max-height:35px;
+            padding:0 12px; color:#718195; background:#EDF1F6;
+            border:0; border-right:1px solid #E0E6EF; border-bottom:2px solid transparent;
         }
         QTabBar#remoteFileEditorTabs::tab:selected {
             background:#FFFFFF; color:#172B43; font-weight:650; border-bottom:2px solid #1684FF;
@@ -487,6 +510,22 @@ QString applicationStyleSheet(bool dark)
             color:#718398; background:transparent; border:0; border-radius:3px; font-size:15px; padding:0;
         }
         QToolButton#remoteFileTabCloseButton:hover { color:#172B43; background:#DCE7F2; }
+        QFrame#remoteFileEditorToolbar { background:#FFFFFF; border-bottom:1px solid #E2E9F2; }
+        QLabel#remoteFileEditorPath { color:#63788F; font-size:12px; }
+        QLabel#remoteFileEditorState { color:#698493; background:#F0F5F8; padding:3px 7px; border-radius:4px; font-size:11px; }
+        QLabel#remoteFileEditorState[dirty="true"] { color:#A36A1B; background:#FFF3DE; }
+        QFrame#remoteFileEditorToolbar QToolButton {
+            border:1px solid transparent; border-radius:5px; padding:0 7px;
+            color:#536D88; background:transparent; font-size:12px;
+        }
+        QFrame#remoteFileEditorToolbar QToolButton:hover { background:#EDF4FD; color:#2469BA; }
+        QFrame#remoteFileEditorToolbar QToolButton:checked { background:#E5F0FF; color:#2469BA; border-color:#C4DBF8; }
+        QFrame#remoteFileEditorToolbar QToolButton:disabled { color:#B8C5D3; }
+        QFrame#remoteFileEditorToolbar QToolButton#remoteFileEditorUndo,
+        QFrame#remoteFileEditorToolbar QToolButton#remoteFileEditorRedo { font-size:19px; padding:0; }
+        QPushButton#remoteFileEditorSave { background:#2678DA; color:white; border:1px solid #2678DA; border-radius:5px; padding:0 18px; font-size:12px; }
+        QPushButton#remoteFileEditorSave:hover { background:#1769C5; }
+        QPushButton#remoteFileEditorSave:disabled { background:#EFF4FA; color:#8FA6BE; border-color:#DCE6F1; }
         QFrame#remoteFileFindPanel { background:#F7F9FC; border-bottom:1px solid #DCE3EA; }
         QFrame#remoteFileFindPanel QLineEdit {
             min-height:28px; border:1px solid #C9D4E2; border-radius:3px; background:#FFFFFF; padding:0 7px;
@@ -499,15 +538,15 @@ QString applicationStyleSheet(bool dark)
             border-color:#8EA4BC; background:#F1F6FC;
         }
         QFrame#remoteFileFindPanel QToolButton:checked { color:#006EFF; border-color:#1684FF; background:#EAF3FF; }
-        QLabel#remoteFileEditorStatus {
-            border-top:1px solid #DCE3EA; background:#F8FAFC; color:#738297;
-            padding:0 10px; font-size:11px;
-        }
+        QFrame#remoteFileEditorStatusBar { border-top:1px solid #E1E8F1; background:#F6F9FC; }
+        QLabel#remoteFileEditorStatus, QLabel#remoteFileEditorPosition { color:#7B8FA5; font-size:11px; background:transparent; }
+        QLabel#remoteFileEditorLanguage { color:#476885; font-size:11px; background:transparent; }
     )QSS");
 
     if (!dark) return style;
     style += QStringLiteral(R"QSS(
         * { color: #D7E2EE; }
+        QLabel#asciiCredentialHint { color:#E2AB64; }
         QMainWindow, QDialog, QMessageBox, QInputDialog, QWidget#appRoot,
         QWidget#operationsWorkspace, QWidget#terminalWorkspacePane, QWidget#fileWorkspacePane {
             background: #111820;
@@ -608,6 +647,12 @@ QString applicationStyleSheet(bool dark)
         QWidget#fileToolbar { background:#18212B; border-bottom-color:#303D4A; }
         QLabel#fileWorkspacePlaceholder { color:#7F91A4; background:#151D25; }
         QLabel#fileServerLabel, QLabel#fileStatusLabel { color:#8FA0B2; }
+        QToolButton#remotePathSegment, QToolButton#remotePathOverflow, QToolButton#remotePathEditButton { color:#A7BBCE; }
+        QToolButton#remotePathSegment[current="true"] { color:#E0EDF7; }
+        QToolButton#remotePathSegment:hover, QToolButton#remotePathOverflow:hover,
+        QToolButton#remotePathEditButton:hover { color:#80C4FF; background:#293E51; }
+        QToolButton#remotePathSegment:pressed, QToolButton#remotePathOverflow:pressed,
+        QToolButton#remotePathEditButton:pressed { background:#35536E; }
         QWidget#fileLoadingOverlay { background:rgba(21, 29, 37, 218); }
         QFrame#fileLoadingCard { background:#1E2A36; border-color:#3A4A5A; }
         QLabel#fileLoadingTitle { color:#DCE7F2; }
@@ -648,6 +693,8 @@ QString applicationStyleSheet(bool dark)
         QListWidget#transferQueueList::item { background:#1D2732; border-color:#354252; }
         QListWidget#transferQueueList::item:selected { color:white; background:#233241; border-color:#467198; }
         QProgressBar#transferProgress { background:#303B48; }
+        QToolButton#transferOpenDirectory:hover { background:#2B4054; }
+        QToolButton#transferOpenDirectory:pressed { background:#35536E; }
         QSplitter::handle { background:#2A3542; }
         QSplitter::handle:hover { background:#477AA6; }
         QScrollBar::handle:vertical { background:#536273; }
@@ -662,12 +709,29 @@ QString applicationStyleSheet(bool dark)
             color:#FFFFFF; background:#263442; border-color:#52708C;
         }
         QFrame#remoteFileFindPanel QToolButton:checked { color:#70B7FF; background:#173D5D; border-color:#3F83B8; }
-        QTabBar#remoteFileEditorTabs { background:#18212B; border-bottom:1px solid #354252; }
-        QTabBar#remoteFileEditorTabs::tab { color:#9AABBD; background:#18212B; }
-        QTabBar#remoteFileEditorTabs::tab:selected { color:#E4EDF6; background:#111820; }
+        QDialog#remoteFileEditor { background:#141D28; }
+        QPlainTextEdit#remoteFileEditorText { color:#D5DFED; background:#18222F; border:0; selection-background-color:#304F76; selection-color:#F0F6FF; }
+        QPlainTextEdit#remoteFileEditorText:disabled { color:#7D8EA4; background:#17202B; }
+        QTabBar#remoteFileEditorTabs { background:#121B26; border-bottom-color:#2C3A4B; }
+        QTabBar#remoteFileEditorTabs::tab { color:#869BB2; background:#121B26; border-right-color:#273546; }
+        QTabBar#remoteFileEditorTabs::tab:selected { color:#E4EDF6; background:#1B2838; border-bottom-color:#60A7FC; }
+        QTabBar#remoteFileEditorTabs::tab:hover:!selected { background:#1A2736; }
         QToolButton#remoteFileTabCloseButton { color:#91A3B6; }
         QToolButton#remoteFileTabCloseButton:hover { color:#FFFFFF; background:#2A3948; }
-        QLabel#remoteFileEditorStatus { color:#8FA0B2; background:#18212B; border-top:1px solid #354252; }
+        QFrame#remoteFileEditorToolbar { background:#1B2838; border-bottom-color:#2C3B4F; }
+        QLabel#remoteFileEditorPath { color:#91A7BF; }
+        QLabel#remoteFileEditorState { color:#92ADBC; background:#243647; }
+        QLabel#remoteFileEditorState[dirty="true"] { color:#E9BD79; background:#413527; }
+        QFrame#remoteFileEditorToolbar QToolButton { color:#A8BCD1; }
+        QFrame#remoteFileEditorToolbar QToolButton:hover { color:#DFECFF; background:#2A4059; }
+        QFrame#remoteFileEditorToolbar QToolButton:checked { color:#91C4FF; background:#263F5E; border-color:#3B5A7C; }
+        QFrame#remoteFileEditorToolbar QToolButton:disabled { color:#52677E; }
+        QPushButton#remoteFileEditorSave { background:#337FD9; border-color:#337FD9; }
+        QPushButton#remoteFileEditorSave:hover { background:#4390E9; }
+        QPushButton#remoteFileEditorSave:disabled { background:#223448; color:#67839E; border-color:#30465E; }
+        QFrame#remoteFileEditorStatusBar { background:#151F2C; border-top-color:#2C394C; }
+        QLabel#remoteFileEditorStatus, QLabel#remoteFileEditorPosition { color:#8198B0; }
+        QLabel#remoteFileEditorLanguage { color:#A0B9D4; }
     )QSS");
     return style;
 }
@@ -698,6 +762,7 @@ void applyApplicationTheme(ThemeMode mode)
         palette.setColor(QPalette::ToolTipBase, QColor(QStringLiteral("#202B36")));
         palette.setColor(QPalette::ToolTipText, QColor(QStringLiteral("#E8F0F7")));
         palette.setColor(QPalette::PlaceholderText, QColor(QStringLiteral("#708194")));
+        palette.setColor(QPalette::Link, QColor(QStringLiteral("#62C3FF")));
         palette.setColor(QPalette::Disabled, QPalette::Text, QColor(QStringLiteral("#647384")));
         palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(QStringLiteral("#647384")));
     } else {
@@ -713,6 +778,7 @@ void applyApplicationTheme(ThemeMode mode)
         palette.setColor(QPalette::ToolTipBase, QColor(QStringLiteral("#FFFFFF")));
         palette.setColor(QPalette::ToolTipText, QColor(QStringLiteral("#17233D")));
         palette.setColor(QPalette::PlaceholderText, QColor(QStringLiteral("#8A99AA")));
+        palette.setColor(QPalette::Link, QColor(QStringLiteral("#007AFF")));
         palette.setColor(QPalette::Disabled, QPalette::Text, QColor(QStringLiteral("#9AA7B6")));
         palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(QStringLiteral("#9AA7B6")));
     }

@@ -1,4 +1,5 @@
 #include "RdpDialog.h"
+#include "CredentialInput.h"
 
 #include <QComboBox>
 #include <QAction>
@@ -70,8 +71,6 @@ RdpDialog::RdpDialog(QWidget *parent)
     m_password = new QLineEdit;
     m_password->setObjectName(QStringLiteral("rdpPasswordEditor"));
     m_password->setEchoMode(QLineEdit::Password);
-    m_password->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
-        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
     m_password->setPlaceholderText(QStringLiteral("Windows 登录密码（可选）"));
     m_passwordReveal = m_password->addAction(
         QIcon(QStringLiteral(":/assets/eye.svg")), QLineEdit::TrailingPosition);
@@ -105,6 +104,9 @@ RdpDialog::RdpDialog(QWidget *parent)
     form->addRow(QStringLiteral("电脑/IP"), endpointRow);
     form->addRow(QStringLiteral("Windows 用户"), m_user);
     form->addRow(QStringLiteral("Windows 密码"), m_password);
+    auto *passwordInputHint = new QLabel;
+    configureAsciiCredentialInput(m_password, passwordInputHint);
+    form->addRow(passwordInputHint);
     form->addRow(QStringLiteral("分组（可选）"), m_group);
     layout->addLayout(form);
 

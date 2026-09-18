@@ -50,6 +50,8 @@ func main() {
 	rekeyBytes := flag.Uint64("rekey-bytes", 0, "rekey after this many bytes")
 	shellMode := flag.String("shell-mode", "prompt", "prompt, echo, no-read, flood, burst, burst-close, or reset")
 	metricsMode := flag.String("metrics-mode", "off", "off, normal, or oversized (synthetic data, never execute commands)")
+	sizeMode := flag.String("directory-size-mode", "off", "off, normal, error, oversized, or mixed (synthetic data only)")
+	channelDelay := flag.Int("extra-channel-delay-ms", 0, "delay additional channel opens")
 	flag.Parse()
 	expectedPassword := syntheticPassword
 	if *passwordCase == "unicode" {
@@ -148,19 +150,26 @@ func main() {
 	defer server.Close()
 	report("authenticated", nil)
 	go ssh.DiscardRequests(requests)
+	channelCount := 0
 	for incoming := range channels {
 		if incoming.ChannelType() != "session" {
 			_ = incoming.Reject(ssh.UnknownChannelType, "fixture only supports a shell")
 			continue
 		}
+		if channelCount > 0 {
+			time.Sleep(time.Duration(*channelDelay) * time.Millisecond)
+		}
+		channelCount++
 		channel, channelRequests, err := incoming.Accept()
 		if err != nil {
 			continue
 		}
 		go func() {
 			defer channel.Close()
+			inputDone := make(chan struct{})
 			if *shellMode != "no-read" {
 				go func() {
+					defer close(inputDone)
 					var target io.Writer = io.Discard
 					if *shellMode == "echo" {
 						target = channel
@@ -170,9 +179,35 @@ func main() {
 			}
 			for request := range channelRequests {
 				supported := request.Type == "pty-req" || request.Type == "shell" || request.Type == "window-change" ||
-					(request.Type == "exec" && *metricsMode != "off")
+					(request.Type == "exec" && (*metricsMode != "off" || *sizeMode != "off"))
 				if request.WantReply {
 					_ = request.Reply(supported, nil)
+				}
+				if request.Type == "exec" && *sizeMode != "off" {
+					var payload struct{ Command string }
+					if err := ssh.Unmarshal(request.Payload, &payload); err != nil {
+						return
+					}
+					if strings.Contains(payload.Command, "NOXSHELL_DIRECTORY_SIZE_V1") {
+						waiting := *sizeMode == "mixed" && strings.Contains(payload.Command, "p='/wait'")
+						report("size_started", map[string]any{"waiting": waiting})
+						var status uint32
+						if waiting {
+							<-inputDone
+							report("size_stopped", nil)
+							status = 130
+						} else if *sizeMode == "error" {
+							_, _ = io.WriteString(channel, "42\t/synthetic-partial\n")
+							_, _ = io.WriteString(channel.Stderr(), "Permission denied\n")
+							status = 1
+						} else if *sizeMode == "oversized" {
+							_, _ = channel.Write(bytes.Repeat([]byte("x"), 100*1024))
+						} else {
+							_, _ = io.WriteString(channel, "42\t/synthetic\n")
+						}
+						_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+						return
+					}
 				}
 				if request.Type == "exec" && *metricsMode != "off" {
 					var payload struct{ Command string }

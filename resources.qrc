@@ -10,6 +10,7 @@
         <file>assets/transfer-queue.svg</file>
         <file>assets/file-back.svg</file>
         <file>assets/file-up.svg</file>
+        <file>assets/file-path-edit.svg</file>
         <file>assets/file-refresh.svg</file>
         <file>assets/command-history.svg</file>
         <file>assets/file-panel-hide.svg</file>
@@ -20,5 +21,8 @@
         <file>assets/chevron-down.svg</file>
         <file>assets/spin-up.svg</file>
         <file>assets/spin-down.svg</file>
+        <file>assets/editor-undo.svg</file>
+        <file>assets/editor-redo.svg</file>
+        <file>assets/editor-find.svg</file>
   </qresource>
 </RCC>

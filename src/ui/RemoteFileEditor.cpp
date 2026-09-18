@@ -18,10 +18,14 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QScopedValueRollback>
 #include <QShortcut>
+#include <QShowEvent>
 #include <QSignalBlocker>
 #include <QStackedWidget>
+#include <QStyle>
 #include <QTabBar>
+#include <QSyntaxHighlighter>
 #include <QTextBlock>
 #include <QTextDocument>
 #include <QTimer>
@@ -35,6 +39,126 @@
 namespace noxshell::ui {
 
 namespace {
+
+class ElidedLabel final : public QLabel {
+public:
+    explicit ElidedLabel(QWidget *parent = nullptr) : QLabel(parent)
+    {
+        setTextFormat(Qt::PlainText);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        setMinimumWidth(0);
+    }
+    void setText(const QString &text)
+    {
+        m_fullText = text;
+        setToolTip(text);
+        updateText();
+    }
+protected:
+    void resizeEvent(QResizeEvent *event) override { QLabel::resizeEvent(event); updateText(); }
+private:
+    void updateText() { QLabel::setText(fontMetrics().elidedText(m_fullText, Qt::ElideMiddle, qMax(0, contentsRect().width() - 12))); }
+    QString m_fullText;
+};
+
+enum class ConfigSyntax { Plain, Yaml, Json, Ini };
+
+ConfigSyntax syntaxForPath(const QString &path)
+{
+    const auto suffix = QFileInfo(path).suffix().toLower();
+    if (suffix == QStringLiteral("yml") || suffix == QStringLiteral("yaml")) return ConfigSyntax::Yaml;
+    if (suffix == QStringLiteral("json")) return ConfigSyntax::Json;
+    if (suffix == QStringLiteral("ini") || suffix == QStringLiteral("conf") || suffix == QStringLiteral("cfg")
+        || QFileInfo(path).fileName() == QStringLiteral(".env")) return ConfigSyntax::Ini;
+    return ConfigSyntax::Plain;
+}
+
+QString syntaxName(ConfigSyntax syntax)
+{
+    switch (syntax) {
+    case ConfigSyntax::Yaml: return QStringLiteral("YAML");
+    case ConfigSyntax::Json: return QStringLiteral("JSON");
+    case ConfigSyntax::Ini: return QStringLiteral("配置");
+    case ConfigSyntax::Plain: return QStringLiteral("纯文本");
+    }
+    return {};
+}
+
+// Display-only, bounded, single-pass highlighting. It never reformats a file,
+// changes indentation, or parses/evaluates configuration values.
+class ConfigHighlighter final : public QSyntaxHighlighter {
+public:
+    ConfigHighlighter(QTextDocument *document, ConfigSyntax syntax)
+        : QSyntaxHighlighter(document), m_syntax(syntax), m_dark(isApplicationDarkTheme()) {}
+    void updateTheme()
+    {
+        const bool dark = isApplicationDarkTheme();
+        if (m_dark == dark) return;
+        m_dark = dark;
+        rehighlight();
+    }
+    void setWithinBudget(bool enabled)
+    {
+        if (m_enabled == enabled) return;
+        m_enabled = enabled;
+        rehighlight();
+    }
+protected:
+    void highlightBlock(const QString &text) override
+    {
+        if (!m_enabled || m_syntax == ConfigSyntax::Plain || text.size() > 8192) return;
+        const QColor key(m_dark ? "#83BCFF" : "#245DA8");
+        const QColor string(m_dark ? "#A5D6AF" : "#27764A");
+        const QColor number(m_dark ? "#E6BC88" : "#A05A20");
+        const QColor literal(m_dark ? "#C8A9EE" : "#8056B3");
+        const QColor comment(m_dark ? "#7D91A7" : "#7A8898");
+        const auto isKey = [&](int end) {
+            while (end < text.size() && text.at(end).isSpace()) ++end;
+            return end < text.size() && (text.at(end) == QLatin1Char(':')
+                || (m_syntax == ConfigSyntax::Ini && text.at(end) == QLatin1Char('=')));
+        };
+        for (int i = 0; i < text.size();) {
+            const auto ch = text.at(i);
+            if (ch.isSpace()) { ++i; continue; }
+            if (m_syntax != ConfigSyntax::Json && (ch == QLatin1Char('#')
+                    || (m_syntax == ConfigSyntax::Ini && ch == QLatin1Char(';')))
+                && (i == 0 || text.at(i - 1).isSpace())) {
+                setFormat(i, text.size() - i, comment);
+                break;
+            }
+            if (ch == QLatin1Char('"') || ch == QLatin1Char('\'')) {
+                const int start = i++;
+                while (i < text.size()) {
+                    if (text.at(i) == QLatin1Char('\\') && ch == QLatin1Char('"')) { i = qMin(i + 2, int(text.size())); continue; }
+                    if (text.at(i++) != ch) continue;
+                    if (ch == QLatin1Char('\'') && i < text.size() && text.at(i) == ch) { ++i; continue; }
+                    break;
+                }
+                setFormat(start, i - start, isKey(i) ? key : string);
+                continue;
+            }
+            if (m_syntax == ConfigSyntax::Ini && ch == QLatin1Char('[')) {
+                const int end = text.indexOf(QLatin1Char(']'), i + 1);
+                if (end >= 0) { setFormat(i, end - i + 1, key); i = end + 1; continue; }
+            }
+            if (QStringLiteral("{}[],:=").contains(ch)) { ++i; continue; }
+            const int start = i++;
+            while (i < text.size() && !text.at(i).isSpace()
+                && !QStringLiteral("{}[],:=\"'").contains(text.at(i))) ++i;
+            const auto token = text.mid(start, i - start);
+            bool numeric = false;
+            token.toDouble(&numeric);
+            if (isKey(i)) setFormat(start, i - start, key);
+            else if (numeric) setFormat(start, i - start, number);
+            else if (token == QStringLiteral("true") || token == QStringLiteral("false")
+                || token == QStringLiteral("null") || token == QStringLiteral("~")) setFormat(start, i - start, literal);
+        }
+    }
+private:
+    ConfigSyntax m_syntax;
+    bool m_dark;
+    bool m_enabled{true};
+};
 
 class CodeEditor;
 
@@ -52,7 +176,7 @@ private:
 
 class CodeEditor final : public QPlainTextEdit {
 public:
-    explicit CodeEditor(QWidget *parent = nullptr)
+    explicit CodeEditor(const QString &path, QWidget *parent = nullptr)
         : QPlainTextEdit(parent)
         , m_lineNumberArea(new LineNumberArea(this))
     {
@@ -63,16 +187,40 @@ public:
         connect(m_searchMarkerBar, &SearchMarkerScrollBar::searchMarkerActivated, this, [this](int index) {
             if (m_searchMarkerHandler) m_searchMarkerHandler(index);
         });
-        setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        auto codeFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        for (const auto &family : {QStringLiteral("Menlo"), QStringLiteral("Cascadia Mono"),
+                 QStringLiteral("Consolas"), QStringLiteral("DejaVu Sans Mono"), QStringLiteral("Liberation Mono")}) {
+            if (QFontDatabase::isFixedPitch(family)) { codeFont.setFamily(family); break; }
+        }
+        codeFont.setStyleHint(QFont::Monospace);
+        setFont(codeFont);
+        // An application-wide * font rule otherwise replaces the fixed font
+        // during style polish, after the initial gutter has been measured.
+        setStyleSheet(QStringLiteral("QPlainTextEdit#remoteFileEditorText { font-family: \"%1\"; font-size: 14px; }")
+            .arg(codeFont.family()));
+        setFrameShape(QFrame::NoFrame);
+        document()->setDocumentMargin(10);
         setLineWrapMode(QPlainTextEdit::NoWrap);
         setTabStopDistance(fontMetrics().horizontalAdvance(QLatin1Char(' ')) * 4);
         auto editorPalette = palette();
         editorPalette.setColor(QPalette::Highlight, QColor(QStringLiteral("#FFB938")));
         editorPalette.setColor(QPalette::HighlightedText, QColor(QStringLiteral("#17233D")));
         setPalette(editorPalette);
+        m_highlighter = new ConfigHighlighter(document(), syntaxForPath(path));
         connect(this, &QPlainTextEdit::blockCountChanged, this, &CodeEditor::updateLineNumberAreaWidth);
         connect(this, &QPlainTextEdit::updateRequest, this, &CodeEditor::updateLineNumberArea);
         connect(this, &QPlainTextEdit::cursorPositionChanged, this, &CodeEditor::updateExtraSelections);
+        connect(this, &QPlainTextEdit::textChanged, this, [this] {
+            m_highlighter->setWithinBudget(document()->characterCount() <= 512 * 1024);
+        });
+        updateLineNumberAreaWidth();
+        updateExtraSelections();
+    }
+
+    void setLoadedText(const QString &text)
+    {
+        m_highlighter->setWithinBudget(text.size() <= 512 * 1024);
+        setPlainText(text);
         updateLineNumberAreaWidth();
         updateExtraSelections();
     }
@@ -102,15 +250,18 @@ public:
     {
         int digits = 1;
         for (int lines = qMax(1, blockCount()); lines >= 10; lines /= 10) ++digits;
-        return 14 + fontMetrics().horizontalAdvance(QLatin1Char('9')) * digits;
+        return qMax(44, 24 + fontMetrics().horizontalAdvance(QLatin1Char('9')) * digits);
     }
 
     void paintLineNumbers(QPaintEvent *event)
     {
         QPainter painter(m_lineNumberArea);
+        painter.setFont(font());
         const bool dark = isApplicationDarkTheme();
-        painter.fillRect(event->rect(), QColor(dark ? QStringLiteral("#18212B") : QStringLiteral("#F4F6F8")));
-        painter.setPen(QColor(dark ? QStringLiteral("#74869A") : QStringLiteral("#8A98A9")));
+        painter.fillRect(event->rect(), QColor(dark ? QStringLiteral("#151E29") : QStringLiteral("#F6F8FB")));
+        painter.setPen(QColor(dark ? QStringLiteral("#293748") : QStringLiteral("#E5EBF2")));
+        painter.drawLine(m_lineNumberArea->width() - 1, event->rect().top(),
+            m_lineNumberArea->width() - 1, event->rect().bottom());
 
         auto block = firstVisibleBlock();
         int blockNumber = block.blockNumber();
@@ -118,7 +269,10 @@ public:
         int bottom = top + qRound(blockBoundingRect(block).height());
         while (block.isValid() && top <= event->rect().bottom()) {
             if (block.isVisible() && bottom >= event->rect().top()) {
-                painter.drawText(0, top, m_lineNumberArea->width() - 7, fontMetrics().height(),
+                const bool current = blockNumber == textCursor().blockNumber();
+                painter.setPen(QColor(current ? (dark ? "#8CC4FF" : "#246AC0") : (dark ? "#64788F" : "#8C9CAF")));
+                if (current) painter.fillRect(0, top, 2, qRound(blockBoundingRect(block).height()), QColor("#398DED"));
+                painter.drawText(0, top, m_lineNumberArea->width() - 12, fontMetrics().height(),
                     Qt::AlignRight, QString::number(blockNumber + 1));
             }
             block = block.next();
@@ -174,9 +328,13 @@ protected:
     void changeEvent(QEvent *event) override
     {
         QPlainTextEdit::changeEvent(event);
-        if (event->type() != QEvent::PaletteChange && event->type() != QEvent::StyleChange) return;
+        if (event->type() != QEvent::PaletteChange && event->type() != QEvent::StyleChange
+            && event->type() != QEvent::FontChange && event->type() != QEvent::ApplicationFontChange) return;
+        if (!m_lineNumberArea) return;
+        setTabStopDistance(fontMetrics().horizontalAdvance(QLatin1Char(' ')) * 4);
+        updateLineNumberAreaWidth();
         updateExtraSelections();
-        if (m_lineNumberArea) m_lineNumberArea->update();
+        if (m_highlighter) m_highlighter->updateTheme();
     }
 
     void keyPressEvent(QKeyEvent *event) override
@@ -221,14 +379,26 @@ protected:
     void resizeEvent(QResizeEvent *event) override
     {
         QPlainTextEdit::resizeEvent(event);
-        const auto contents = contentsRect();
-        m_lineNumberArea->setGeometry(QRect(contents.left(), contents.top(), lineNumberAreaWidth(), contents.height()));
+        updateLineNumberAreaWidth();
+    }
+
+    void showEvent(QShowEvent *event) override
+    {
+        QPlainTextEdit::showEvent(event);
+        updateLineNumberAreaWidth();
     }
 
 private:
     void updateLineNumberAreaWidth()
     {
-        setViewportMargins(lineNumberAreaWidth(), 0, 0, 0);
+        if (!m_lineNumberArea || m_updatingGutter) return;
+        const QScopedValueRollback guard(m_updatingGutter, true);
+        const int width = lineNumberAreaWidth();
+        if (viewportMargins().left() != width) setViewportMargins(width, 0, 0, 0);
+        // Margin and gutter geometry must change together, including font/theme
+        // changes and initial load. Never wait for a scroll event to repair it.
+        m_lineNumberArea->setGeometry(contentsRect().left(), viewport()->geometry().top(), width, viewport()->height());
+        m_lineNumberArea->update();
     }
 
     void updateLineNumberArea(const QRect &rect, int dy)
@@ -249,10 +419,13 @@ private:
         auto selections = QList<QTextEdit::ExtraSelection>{currentLine};
         selections.append(m_searchSelections);
         setExtraSelections(selections);
+        if (m_lineNumberArea) m_lineNumberArea->update();
     }
 
     LineNumberArea *m_lineNumberArea{};
     SearchMarkerScrollBar *m_searchMarkerBar{};
+    ConfigHighlighter *m_highlighter{};
+    bool m_updatingGutter{false};
     std::function<void()> m_saveHandler;
     std::function<void()> m_closeHandler;
     std::function<void(bool)> m_findHandler;
@@ -295,7 +468,8 @@ struct RemoteFileEditor::Document {
     QString path;
     QWidget *page{};
     CodeEditor *editor{};
-    QLabel *status{};
+    ElidedLabel *status{};
+    QLabel *position{};
     quint64 readRequestId{};
     quint64 writeRequestId{};
     bool loaded{false};
@@ -315,19 +489,78 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     setWindowFlag(Qt::Window, true);
     setWindowModality(Qt::NonModal);
     setWindowTitle(QStringLiteral("%1 · 远端文件编辑").arg(m_serverName));
-    resize(920, 660);
+    resize(1000, 720);
+    setMinimumSize(600, 380);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     m_tabs = new QTabBar;
     m_tabs->setObjectName(QStringLiteral("remoteFileEditorTabs"));
-    m_tabs->setFixedHeight(30);
+    m_tabs->setFixedHeight(38);
     m_tabs->setExpanding(false);
     m_tabs->setMovable(true);
     m_tabs->setTabsClosable(true);
     m_tabs->setDocumentMode(true);
+    m_tabs->setDrawBase(false);
     m_tabs->setElideMode(Qt::ElideMiddle);
+
+    auto *toolbar = new QFrame;
+    toolbar->setObjectName(QStringLiteral("remoteFileEditorToolbar"));
+    auto *toolbarLayout = new QHBoxLayout(toolbar);
+    toolbarLayout->setContentsMargins(14, 8, 12, 8);
+    toolbarLayout->setSpacing(8);
+    m_pathDisplay = new ElidedLabel;
+    m_pathDisplay->setObjectName(QStringLiteral("remoteFileEditorPath"));
+    m_documentState = new QLabel;
+    m_documentState->setObjectName(QStringLiteral("remoteFileEditorState"));
+    const auto tool = [&](const QString &name, const QString &text, const QString &hint) {
+        auto *button = new QToolButton;
+        button->setObjectName(name);
+        button->setText(text);
+        button->setAccessibleName(hint);
+        button->setToolTip(hint);
+        button->setAutoRaise(true);
+        button->setFixedHeight(28);
+        return button;
+    };
+    m_undoButton = tool(QStringLiteral("remoteFileEditorUndo"), {}, QStringLiteral("撤销（Cmd/Ctrl+Z）"));
+    m_redoButton = tool(QStringLiteral("remoteFileEditorRedo"), {}, QStringLiteral("重做（Cmd/Ctrl+Shift+Z）"));
+    m_undoButton->setIcon(QIcon(QStringLiteral(":/assets/editor-undo.svg")));
+    m_redoButton->setIcon(QIcon(QStringLiteral(":/assets/editor-redo.svg")));
+    m_undoButton->setFixedWidth(28);
+    m_redoButton->setFixedWidth(28);
+    auto *findButton = tool(QStringLiteral("remoteFileEditorFind"), QStringLiteral("查找"), QStringLiteral("查找 / 替换（Cmd/Ctrl+F）"));
+    findButton->setIcon(QIcon(QStringLiteral(":/assets/editor-find.svg")));
+    findButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_wrapButton = tool(QStringLiteral("remoteFileEditorWrap"), QStringLiteral("自动换行"), QStringLiteral("自动换行（仅改变显示，不修改文件）"));
+    m_wrapButton->setCheckable(true);
+    m_saveButton = new QPushButton(QStringLiteral("保存"));
+    m_saveButton->setObjectName(QStringLiteral("remoteFileEditorSave"));
+    m_saveButton->setToolTip(QStringLiteral("保存到远端服务器（Cmd/Ctrl+S）"));
+    m_saveButton->setAutoDefault(false);
+    m_saveButton->setDefault(false);
+    m_saveButton->setFixedHeight(28);
+    toolbarLayout->addWidget(m_pathDisplay, 1);
+    toolbarLayout->addWidget(m_documentState);
+    toolbarLayout->addSpacing(4);
+    toolbarLayout->addWidget(m_undoButton);
+    toolbarLayout->addWidget(m_redoButton);
+    toolbarLayout->addWidget(findButton);
+    toolbarLayout->addWidget(m_wrapButton);
+    toolbarLayout->addWidget(m_saveButton);
+    connect(m_undoButton, &QToolButton::clicked, this, [this] {
+        if (auto *document = activeDocument()) document->editor->undo();
+    });
+    connect(m_redoButton, &QToolButton::clicked, this, [this] {
+        if (auto *document = activeDocument()) document->editor->redo();
+    });
+    connect(findButton, &QToolButton::clicked, this, [this] { showFindPanel(false); });
+    connect(m_wrapButton, &QToolButton::toggled, this, [this](bool wrap) {
+        if (auto *document = activeDocument())
+            document->editor->setLineWrapMode(wrap ? QPlainTextEdit::WidgetWidth : QPlainTextEdit::NoWrap);
+    });
+    connect(m_saveButton, &QPushButton::clicked, this, [this] { saveDocument(activeDocument()); });
 
     m_findPanel = new QFrame;
     m_findPanel->setObjectName(QStringLiteral("remoteFileFindPanel"));
@@ -402,11 +635,13 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     m_stack = new QStackedWidget;
     m_stack->setObjectName(QStringLiteral("remoteFileEditorStack"));
     layout->addWidget(m_tabs);
+    layout->addWidget(toolbar);
     layout->addWidget(m_findPanel);
     layout->addWidget(m_stack, 1);
 
     connect(m_tabs, &QTabBar::currentChanged, this, [this](int index) {
         if (index >= 0 && index < m_stack->count()) m_stack->setCurrentIndex(index);
+        updateChrome();
         if (m_findPanel && m_findPanel->isVisible() && !m_findEdit->text().isEmpty()) findNext(false);
     });
     connect(m_tabs, &QTabBar::tabMoved, this, [this](int from, int to) {
@@ -415,6 +650,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
         m_documents.insert(to, document);
         m_stack->insertWidget(to, document->page);
         m_stack->setCurrentIndex(m_tabs->currentIndex());
+        updateChrome();
     });
     connect(m_tabs, &QTabBar::tabCloseRequested, this, &RemoteFileEditor::requestCloseDocument);
     connect(m_findEdit, &QLineEdit::textChanged, this, [this] {
@@ -451,15 +687,16 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
                 setBusy(document, false, QStringLiteral("%1 · 二进制文件不支持文本编辑").arg(path));
                 return;
             }
-            {
-                const QSignalBlocker blocker(document->editor);
-                document->editor->setPlainText(QString::fromUtf8(data));
-                document->editor->document()->setModified(false);
-            }
+            // busy/loaded guard the dirty handler. Blocking editor signals here
+            // also blocks blockCountChanged/updateRequest and leaves the gutter
+            // over the text until a later scroll or resize repairs the margins.
+            document->editor->setLoadedText(QString::fromUtf8(data));
+            document->editor->document()->setModified(false);
             document->loaded = true;
             setDirty(document, false);
-            setBusy(document, false, QStringLiteral("%1 · 已读取 %2 字节 · Ctrl+/ 切换注释").arg(path).arg(data.size()));
-            document->editor->setFocus();
+            setBusy(document, false, QStringLiteral("已读取 %1 字节 · Cmd/Ctrl+S 保存 · Ctrl+/ 注释").arg(data.size()));
+            updatePosition(document);
+            if (document == activeDocument()) document->editor->setFocus();
             if (document == activeDocument() && m_findPanel->isVisible() && !m_findEdit->text().isEmpty()) findNext(false);
         });
     connect(m_session, &SshSession::remoteFileReadFailed, this,
@@ -495,6 +732,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
             document->editor->setEnabled(false);
             document->status->setText(QStringLiteral("%1 · 连接已断开：%2").arg(document->path, message));
         }
+        updateChrome();
     });
 
     auto *closeShortcut = new QShortcut(QKeySequence::Close, this);
@@ -519,6 +757,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     connect(m_hideFindShortcut, &QShortcut::activated, this, &RemoteFileEditor::hideFindPanel);
 
     openFile(remotePath);
+    updateChrome();
 }
 
 RemoteFileEditor::~RemoteFileEditor()
@@ -544,13 +783,26 @@ void RemoteFileEditor::openFile(const QString &remotePath)
     auto *pageLayout = new QVBoxLayout(document->page);
     pageLayout->setContentsMargins(0, 0, 0, 0);
     pageLayout->setSpacing(0);
-    document->editor = new CodeEditor;
+    document->editor = new CodeEditor(remotePath);
     document->editor->setEnabled(false);
-    document->status = new QLabel(QStringLiteral("%1 · 正在读取远端文件…").arg(remotePath));
+    document->status = new ElidedLabel;
+    document->status->setText(QStringLiteral("正在读取远端文件…"));
     document->status->setObjectName(QStringLiteral("remoteFileEditorStatus"));
-    document->status->setFixedHeight(29);
+    auto *statusBar = new QFrame;
+    statusBar->setObjectName(QStringLiteral("remoteFileEditorStatusBar"));
+    statusBar->setFixedHeight(32);
+    auto *statusLayout = new QHBoxLayout(statusBar);
+    statusLayout->setContentsMargins(12, 0, 14, 0);
+    statusLayout->setSpacing(18);
+    document->position = new QLabel;
+    document->position->setObjectName(QStringLiteral("remoteFileEditorPosition"));
+    auto *language = new QLabel(syntaxName(syntaxForPath(remotePath)) + QStringLiteral("  ·  UTF-8"));
+    language->setObjectName(QStringLiteral("remoteFileEditorLanguage"));
+    statusLayout->addWidget(document->status, 1);
+    statusLayout->addWidget(document->position);
+    statusLayout->addWidget(language);
     pageLayout->addWidget(document->editor, 1);
-    pageLayout->addWidget(document->status);
+    pageLayout->addWidget(statusBar);
 
     const int index = m_tabs->addTab(QString{});
     m_stack->addWidget(document->page);
@@ -559,13 +811,22 @@ void RemoteFileEditor::openFile(const QString &remotePath)
     updateTab(document);
     installCloseButton(index);
     m_tabs->setCurrentIndex(index);
+    updateChrome();
 
-    connect(document->editor, &QPlainTextEdit::textChanged, document->page, [this, document] {
-        if (!document->loaded || document->busy) return;
+    connect(document->editor->document(), &QTextDocument::contentsChange, document->page,
+        [this, document](int, int removed, int added) {
+        // Syntax/theme-only format changes must not mark a remote file dirty.
+        if ((!removed && !added) || !document->loaded || document->busy) return;
         setDirty(document, true);
-        document->status->setText(QStringLiteral("%1 · 有未保存的修改 · Cmd/Ctrl+S 保存").arg(document->path));
-        if (document == activeDocument() && m_findPanel->isVisible()) updateFindStatus();
+        document->status->setText(QStringLiteral("有未保存的修改 · Cmd/Ctrl+S 保存"));
     });
+    connect(document->editor, &QPlainTextEdit::textChanged, document->page, [this, document] {
+        if (document->loaded && !document->busy && document == activeDocument() && m_findPanel->isVisible()) updateFindStatus();
+    });
+    connect(document->editor, &QPlainTextEdit::cursorPositionChanged, document->page, [this, document] { updatePosition(document); });
+    connect(document->editor, &QPlainTextEdit::blockCountChanged, document->page, [this, document] { updatePosition(document); });
+    connect(document->editor, &QPlainTextEdit::undoAvailable, document->page, [this] { updateChrome(); });
+    connect(document->editor, &QPlainTextEdit::redoAvailable, document->page, [this] { updateChrome(); });
     document->editor->setSaveHandler([this, document] { saveDocument(document); });
     document->editor->setCloseHandler([this, document] {
         const int index = documentIndex(document);
@@ -584,7 +845,10 @@ void RemoteFileEditor::openFile(const QString &remotePath)
         document->editor->setFocus(Qt::MouseFocusReason);
     });
 
-    QTimer::singleShot(0, this, [this, document] { beginLoad(document); });
+    // Closing a not-yet-loaded tab must cancel its queued load callback.
+    QTimer::singleShot(0, document->page, [this, page = document->page] {
+        if (auto *pending = documentForPage(page)) beginLoad(pending);
+    });
 }
 
 QString RemoteFileEditor::remotePath() const
@@ -698,7 +962,7 @@ void RemoteFileEditor::updateFindStatus()
             document->editor->clearSearchSelections();
         }
         m_findStatus->setText(QStringLiteral("0 / 0"));
-        m_findStatus->setStyleSheet(QStringLiteral("color:#738297;"));
+        m_findStatus->setStyleSheet(isApplicationDarkTheme() ? QStringLiteral("color:#A6BCD1;") : QStringLiteral("color:#738297;"));
         return;
     }
 
@@ -737,10 +1001,10 @@ void RemoteFileEditor::updateFindStatus()
     document->editor->setSearchMarkers(markerPositions, current > 0 ? current - 1 : (total > 0 ? 0 : -1));
     if (total == 0) {
         m_findStatus->setText(QStringLiteral("无匹配"));
-        m_findStatus->setStyleSheet(QStringLiteral("color:#D54941;"));
+        m_findStatus->setStyleSheet(isApplicationDarkTheme() ? QStringLiteral("color:#F08C82;") : QStringLiteral("color:#D54941;"));
     } else {
         m_findStatus->setText(QStringLiteral("%1 / %2").arg(current > 0 ? current : 1).arg(total));
-        m_findStatus->setStyleSheet(QStringLiteral("color:#53677E;"));
+        m_findStatus->setStyleSheet(isApplicationDarkTheme() ? QStringLiteral("color:#A6BCD1;") : QStringLiteral("color:#53677E;"));
     }
 }
 
@@ -832,8 +1096,10 @@ void RemoteFileEditor::setBusy(Document *document, bool busy, const QString &mes
 {
     if (!document) return;
     document->busy = busy;
-    document->status->setText(message);
+    const auto prefix = document->path + QStringLiteral(" · ");
+    document->status->setText(message.startsWith(prefix) ? message.mid(prefix.size()) : message);
     document->editor->setEnabled(document->loaded && !busy && m_session && m_session->isConnected());
+    updateChrome();
 }
 
 void RemoteFileEditor::setDirty(Document *document, bool dirty)
@@ -841,6 +1107,47 @@ void RemoteFileEditor::setDirty(Document *document, bool dirty)
     if (!document || document->dirty == dirty) return;
     document->dirty = dirty;
     updateTab(document);
+    updateChrome();
+}
+
+void RemoteFileEditor::updatePosition(Document *document)
+{
+    if (!document || !document->position) return;
+    const auto cursor = document->editor->textCursor();
+    document->position->setText(QStringLiteral("行 %1，列 %2  ·  %3 行")
+        .arg(cursor.blockNumber() + 1).arg(cursor.positionInBlock() + 1).arg(document->editor->blockCount()));
+}
+
+void RemoteFileEditor::updateChrome()
+{
+    if (!m_saveButton || !m_tabs || !m_pathDisplay) return;
+    const auto *document = activeDocument();
+    const bool ready = document && document->loaded && !document->busy
+        && m_session && m_session->isConnected();
+    m_saveButton->setEnabled(ready && document->dirty);
+    m_undoButton->setEnabled(ready && document->editor->document()->isUndoAvailable());
+    m_redoButton->setEnabled(ready && document->editor->document()->isRedoAvailable());
+    m_wrapButton->setEnabled(document && document->loaded);
+    const QSignalBlocker blocker(m_wrapButton);
+    m_wrapButton->setChecked(document && document->editor->lineWrapMode() != QPlainTextEdit::NoWrap);
+    static_cast<ElidedLabel *>(m_pathDisplay)->setText(document ? document->path : QString{});
+    m_documentState->setText(!document ? QString{} : document->busy ? QStringLiteral("处理中…")
+        : document->dirty ? QStringLiteral("未保存") : document->loaded ? QStringLiteral("已同步") : QStringLiteral("未读取"));
+    const bool dirty = document && document->dirty;
+    if (m_documentState->property("dirty").toBool() != dirty) {
+        m_documentState->setProperty("dirty", dirty);
+        m_documentState->style()->unpolish(m_documentState);
+        m_documentState->style()->polish(m_documentState);
+    }
+}
+
+void RemoteFileEditor::changeEvent(QEvent *event)
+{
+    QDialog::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
+        if (m_findPanel && m_findPanel->isVisible()) updateFindStatus();
+        updateChrome();
+    }
 }
 
 void RemoteFileEditor::updateTab(Document *document)
@@ -925,6 +1232,7 @@ void RemoteFileEditor::removeDocument(int index)
     const int next = qMin(index, m_documents.size() - 1);
     m_tabs->setCurrentIndex(next);
     m_stack->setCurrentIndex(next);
+    updateChrome();
 }
 
 void RemoteFileEditor::maybeFinishWindowClose()

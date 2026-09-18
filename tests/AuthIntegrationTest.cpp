@@ -152,6 +152,109 @@ class AuthIntegrationTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void directorySizeResult_data()
+    {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("complete") << QStringLiteral("normal");
+        QTest::newRow("permission-error-is-not-a-size") << QStringLiteral("error");
+        QTest::newRow("bounded-output") << QStringLiteral("oversized");
+    }
+
+    void directorySizeResult()
+    {
+        QFETCH(QString, mode);
+        LocalSshServer server;
+        QVERIFY(server.start({QStringLiteral("-directory-size-mode"), mode}));
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        worker.connectTo(fixtureProfile(server.port));
+        QSignalSpy result(&worker, &noxshell::Libssh2Worker::directorySizeCalculated);
+        worker.setDesiredDirectorySizeRequest(1);
+        worker.calculateDirectorySize(1, QStringLiteral("/synthetic"));
+        QTRY_COMPARE_WITH_TIMEOUT(result.size(), 1, 4000);
+        QCOMPARE(result.first().at(0).toULongLong(), quint64(1));
+        if (mode == QStringLiteral("normal")) {
+            QCOMPARE(result.first().at(2).toULongLong(), quint64(42 * 1024));
+            QVERIFY(result.first().at(3).toString().isEmpty());
+        } else QVERIFY(!result.first().at(3).toString().isEmpty());
+        worker.disconnectFromHost();
+    }
+
+    void directorySizeCancellationKeepsTerminalResponsive()
+    {
+        LocalSshServer server;
+        QVERIFY(server.start({QStringLiteral("-directory-size-mode"), QStringLiteral("mixed"),
+            QStringLiteral("-shell-mode"), QStringLiteral("echo")}));
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        worker.connectTo(fixtureProfile(server.port));
+        QSignalSpy result(&worker, &noxshell::Libssh2Worker::directorySizeCalculated);
+        QByteArray output;
+        connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived, &worker,
+            [&](const QByteArray &data) { output += data; });
+        worker.setDesiredDirectorySizeRequest(1);
+        worker.calculateDirectorySize(1, QStringLiteral("/wait"));
+        const auto countEvent = [&](const QString &name) {
+            server.readEvents();
+            return std::count_if(server.events.cbegin(), server.events.cend(), [&](const auto &event) {
+                return event.value("event").toString() == name;
+            });
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(countEvent(QStringLiteral("size_started")), 1, 2000);
+        worker.sendInput("terminal-remains-usable\n");
+        QTRY_VERIFY_WITH_TIMEOUT(output.contains("terminal-remains-usable"), 1000);
+        worker.setDesiredDirectorySizeRequest(2);
+        worker.calculateDirectorySize(2, QStringLiteral("/fast"));
+        QTRY_COMPARE_WITH_TIMEOUT(result.size(), 1, 2000);
+        QCOMPARE(result.first().at(0).toULongLong(), quint64(2));
+        QVERIFY(result.first().at(3).toString().isEmpty());
+        server.readEvents();
+        int stopped = -1, nextStarted = -1;
+        for (int index = 0; index < server.events.size(); ++index) {
+            const auto event = server.events.at(index);
+            if (event.value("event") == "size_stopped") stopped = index;
+            if (event.value("event") == "size_started" && !event.value("waiting").toBool()) nextStarted = index;
+        }
+        QVERIFY(stopped >= 0 && nextStarted > stopped);
+        worker.setDesiredDirectorySizeRequest(3);
+        worker.calculateDirectorySize(3, QStringLiteral("/wait"));
+        QTRY_COMPARE_WITH_TIMEOUT(countEvent(QStringLiteral("size_started")), 3, 2000);
+        worker.setDesiredDirectorySizeRequest(0);
+        QTRY_COMPARE_WITH_TIMEOUT(countEvent(QStringLiteral("size_stopped")), 2, 2000);
+        QCOMPARE(result.size(), 1);
+        worker.sendInput("terminal-after-cancel\n");
+        QTRY_VERIFY_WITH_TIMEOUT(output.contains("terminal-after-cancel"), 1000);
+        worker.disconnectFromHost();
+    }
+
+    void directorySizeChannelOpenDoesNotConflictWithMetrics()
+    {
+        LocalSshServer server;
+        QVERIFY(server.start({QStringLiteral("-directory-size-mode"), QStringLiteral("normal"),
+            QStringLiteral("-metrics-mode"), QStringLiteral("normal"),
+            QStringLiteral("-extra-channel-delay-ms"), QStringLiteral("350"),
+            QStringLiteral("-shell-mode"), QStringLiteral("echo")}));
+        noxshell::Libssh2Worker worker;
+        trustLocalFixture(worker);
+        worker.connectTo(fixtureProfile(server.port));
+        QSignalSpy sizes(&worker, &noxshell::Libssh2Worker::directorySizeCalculated);
+        QSignalSpy metrics(&worker, &noxshell::Libssh2Worker::metricsPayloadReceived);
+        QByteArray output;
+        connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived, &worker,
+            [&](const QByteArray &data) { output += data; });
+        worker.setDesiredDirectorySizeRequest(8);
+        worker.calculateDirectorySize(8, QStringLiteral("/synthetic"));
+        worker.collectMetrics(9); // The size channel is still awaiting OPEN_CONFIRMATION.
+        worker.sendInput("input-during-channel-open\n");
+        QTRY_VERIFY_WITH_TIMEOUT(output.contains("input-during-channel-open"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(sizes.size(), 1, 4000);
+        QTRY_COMPARE_WITH_TIMEOUT(metrics.size(), 1, 4000);
+        QCOMPARE(sizes.first().at(2).toULongLong(), quint64(42 * 1024));
+        QVERIFY(sizes.first().at(3).toString().isEmpty());
+        QVERIFY(metrics.first().at(1).toByteArray().contains("__CPU__"));
+        worker.disconnectFromHost();
+    }
+
     void initTestCase()
     {
         const auto server = qEnvironmentVariable("NOXSHELL_AUTH_TEST_SERVER");

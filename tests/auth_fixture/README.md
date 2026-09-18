@@ -43,6 +43,10 @@ and ignoring obsolete connection requests. It additionally covers:
 - Lightweight versus full metrics commands and continuing shell interaction after
   normal or oversized metrics output. `-metrics-mode` returns synthetic data;
   received command strings are never executed by the fixture.
+- Directory size success, partial/error and oversized output, EOF cancellation
+  before starting the next job, terminal responsiveness during scanning, and
+  delayed channel opens alongside metrics. `-directory-size-mode` simulates these
+  results without scanning any files or executing received command strings.
 
 Known limitation: when the server closes the TCP connection immediately after
 sending a large final burst, libssh2 1.11.1 can report a transport error before

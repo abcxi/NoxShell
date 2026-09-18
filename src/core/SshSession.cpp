@@ -49,6 +49,13 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     connect(this, &SshSession::collectMetricsRequested, m_worker, &Libssh2Worker::collectMetrics, Qt::QueuedConnection);
     connect(this, &SshSession::homeDirectoryRequested, m_worker, &Libssh2Worker::resolveHomeDirectory, Qt::QueuedConnection);
     connect(this, &SshSession::listDirectoryRequested, m_worker, &Libssh2Worker::listDirectory, Qt::QueuedConnection);
+    connect(this, &SshSession::directorySizeRequested, m_worker, &Libssh2Worker::calculateDirectorySize, Qt::QueuedConnection);
+    connect(m_worker, &Libssh2Worker::directorySizeCalculated, this,
+        [this](quint64 requestId, const QString &path, quint64 bytes, const QString &error) {
+            if (requestId != m_directorySizeRequest || !m_connected) return;
+            m_directorySizeRequest = 0;
+            emit directorySizeCalculated(requestId, path, bytes, error);
+        });
     connect(this, &SshSession::uploadFileRequested, m_worker, &Libssh2Worker::uploadFile, Qt::QueuedConnection);
     connect(this, &SshSession::downloadFileRequested, m_worker, &Libssh2Worker::downloadFile, Qt::QueuedConnection);
     connect(this, &SshSession::readFileRequested, m_worker, &Libssh2Worker::readFile, Qt::QueuedConnection);
@@ -316,6 +323,7 @@ void SshSession::rememberSuccessfulCredential()
 
 void SshSession::disconnectFromHost()
 {
+    cancelDirectorySize();
     m_waitingForPassword = false;
     m_credentialToRemember.reset();
     const bool wasActive = m_connected || m_connecting;
@@ -476,6 +484,39 @@ void SshSession::listDirectory(const QString &path)
         m_pendingDirectories.remove(normalized);
         emit directoryListed(normalized, demoEntriesFor(normalized));
     });
+}
+
+quint64 SshSession::calculateDirectorySize(const QString &path)
+{
+    cancelDirectorySize();
+    const auto request = nextFileRequestId();
+    m_directorySizeRequest = request;
+    m_worker->setDesiredDirectorySizeRequest(request);
+    if (!m_connected) {
+        QTimer::singleShot(0, this, [this, request, path] {
+            if (m_directorySizeRequest != request) return;
+            m_directorySizeRequest = 0;
+            emit directorySizeCalculated(request, path, 0, QStringLiteral("SSH 会话未连接"));
+        });
+    } else if (!m_demo) {
+        emit directorySizeRequested(request, path);
+    } else {
+        QTimer::singleShot(120, this, [this, request, path] {
+            if (m_directorySizeRequest != request || !m_connected) return;
+            m_directorySizeRequest = 0;
+            quint64 bytes = 0;
+            for (const auto &entry : demoEntriesFor(path)) if (!entry.directory) bytes += entry.size;
+            emit directorySizeCalculated(request, path, bytes, {});
+        });
+    }
+    return request;
+}
+
+void SshSession::cancelDirectorySize()
+{
+    m_directorySizeRequest = 0;
+    m_worker->setDesiredDirectorySizeRequest(0);
+    emit directorySizeCanceled();
 }
 
 void SshSession::requestHomeDirectory()

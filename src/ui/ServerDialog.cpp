@@ -1,4 +1,5 @@
 #include "ServerDialog.h"
+#include "CredentialInput.h"
 
 #include <QPointer>
 
@@ -134,8 +135,6 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_password = new QLineEdit;
     m_password->setObjectName(QStringLiteral("passwordEditor"));
     m_password->setEchoMode(QLineEdit::Password);
-    m_password->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
-        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
     m_password->setPlaceholderText(QStringLiteral("SSH 密码"));
     alignEditor(m_password);
     m_passwordReveal = m_password->addAction(QIcon(QStringLiteral(":/assets/eye.svg")), QLineEdit::TrailingPosition);
@@ -143,6 +142,9 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_passwordReveal->setCheckable(true);
     m_passwordReveal->setToolTip(QStringLiteral("显示或隐藏当前输入的密码"));
     passwordLayout->addWidget(m_password);
+    auto *passwordInputHint = new QLabel;
+    configureAsciiCredentialInput(m_password, passwordInputHint);
+    passwordLayout->addWidget(passwordInputHint);
     m_passwordHint = new QLabel;
     m_passwordHint->setObjectName(QStringLiteral("passwordSourceHint"));
     m_passwordHint->setWordWrap(true);
@@ -165,8 +167,6 @@ ServerDialog::ServerDialog(QWidget *parent)
     m_passphrase = new QLineEdit;
     m_passphrase->setObjectName(QStringLiteral("passphraseEditor"));
     m_passphrase->setEchoMode(QLineEdit::Password);
-    m_passphrase->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
-        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
     m_passphrase->setPlaceholderText(QStringLiteral("私钥口令，可选"));
     alignEditor(m_privateKey);
     alignEditor(m_publicKey);
@@ -174,6 +174,9 @@ ServerDialog::ServerDialog(QWidget *parent)
     keyForm->addRow(QStringLiteral("私钥"), privateRow);
     keyForm->addRow(QStringLiteral("公钥"), m_publicKey);
     keyForm->addRow(QStringLiteral("私钥口令"), m_passphrase);
+    auto *passphraseInputHint = new QLabel;
+    configureAsciiCredentialInput(m_passphrase, passphraseInputHint);
+    keyForm->addRow(passphraseInputHint);
 
     auto *agentPage = new QLabel(QStringLiteral("使用当前进程可访问的 SSH_AUTH_SOCK 中的身份。"));
     agentPage->setStyleSheet(QStringLiteral("color:#738297;padding:6px 0;"));
@@ -317,13 +320,13 @@ void ServerDialog::updatePasswordHint()
     m_passwordHint->setStyleSheet(QStringLiteral("color:#738297;font-size:11px;"));
     if (!m_password->text().isEmpty()) {
         m_passwordHint->setText(m_editing
-            ? QStringLiteral("连接测试将使用当前输入；保存后替换旧密码。字符和空格均按原样保留。")
-            : QStringLiteral("连接测试和保存将使用当前输入。字符和空格均按原样保留。"));
+            ? QStringLiteral("连接测试将使用当前输入；保存后替换旧密码。英文字符大小写和半角空格不变。")
+            : QStringLiteral("连接测试和保存将使用当前输入。英文字符大小写和半角空格不变。"));
         return;
     }
     m_passwordHint->setText(m_editing
         ? QStringLiteral("密码不会从 Keychain 回填；留空将沿用已保存密码。")
-        : QStringLiteral("请输入 SSH 密码；支持中文和特殊字符，输入内容不会自动转换。"));
+        : QStringLiteral("请输入 SSH 密码；仅转换本次输入，不改动已保存凭据。"));
 }
 
 void ServerDialog::validateAndAccept()

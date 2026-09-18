@@ -22,6 +22,7 @@
 #include <QApplication>
 #include <QActionGroup>
 #include <QClipboard>
+#include <QCloseEvent>
 #include <QDebug>
 #include <QEvent>
 #include <QGridLayout>
@@ -127,6 +128,14 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
 #endif
     setMinimumSize(1180, 720);
     resize(1440, 900);
+    connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+        if (state != Qt::ApplicationActive || !m_hiddenByClose || m_quitInProgress) return;
+        m_hiddenByClose = false;
+        setWindowState(windowState() & ~Qt::WindowMinimized);
+        show();
+        raise();
+        activateWindow();
+    });
 
     auto terminalAppearance = TerminalView::defaultAppearance();
     const QSettings settings;
@@ -1158,10 +1167,39 @@ void MainWindow::updateConnectionPresentation(const QString &serverId, bool conn
     }
 }
 
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    if (m_quitInProgress) {
+        event->accept();
+        return;
+    }
+    event->ignore();
+#ifdef Q_OS_MACOS
+    m_hiddenByClose = true;
+    hide(); // Dock activation restores this same window and its live sessions.
+#else
+    // Platforms without a Dock retain a normal, confirmed application exit.
+    QMetaObject::invokeMethod(qApp, &QCoreApplication::quit, Qt::QueuedConnection);
+#endif
+}
+
+bool MainWindow::confirmApplicationQuit()
+{
+    QMessageBox dialog(QMessageBox::Question, QStringLiteral("确认退出玄壳"),
+        QStringLiteral("退出将断开所有 SSH 会话，并停止进行中的传输。\n确认退出程序？"),
+        QMessageBox::Yes | QMessageBox::Cancel, this);
+    dialog.setObjectName(QStringLiteral("applicationQuitConfirmation"));
+    dialog.button(QMessageBox::Yes)->setText(QStringLiteral("退出程序"));
+    dialog.button(QMessageBox::Cancel)->setText(QStringLiteral("取消"));
+    dialog.setDefaultButton(QMessageBox::Cancel);
+    dialog.setEscapeButton(QMessageBox::Cancel);
+    return dialog.exec() == QMessageBox::Yes;
+}
+
 void MainWindow::requestMetrics()
 {
     // Keep background/minimized windows inexpensive without disconnecting SSH.
-    const int interval = isMinimized() || !isActiveWindow() || !m_monitorRail->isVisible() ? 5000 : 1000;
+    const int interval = !isVisible() || isMinimized() || !isActiveWindow() || !m_monitorRail->isVisible() ? 5000 : 1000;
     if (m_metricTimer->interval() != interval) m_metricTimer->setInterval(interval);
     if (!m_session || !m_session->isConnected()) return;
     m_session->requestMetrics();

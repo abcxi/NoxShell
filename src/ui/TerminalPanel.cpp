@@ -4,6 +4,7 @@
 #include "../core/SshSession.h"
 #include "../core/ServerRepository.h"
 #include "CommandHistoryPanel.h"
+#include "CredentialInput.h"
 #include "TerminalView.h"
 
 #include <QHBoxLayout>
@@ -84,14 +85,15 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
     m_connectionPassword = new QLineEdit;
     m_connectionPassword->setObjectName(QStringLiteral("terminalConnectionPassword"));
     m_connectionPassword->setEchoMode(QLineEdit::Password);
-    m_connectionPassword->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData
-        | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
     m_rememberPassword = new QCheckBox(QStringLiteral("记住密码（系统加密保存）"));
     m_rememberPassword->setObjectName(QStringLiteral("terminalRememberPassword"));
     m_rememberPassword->setChecked(true);
     m_passwordConnectButton = new QPushButton(QStringLiteral("连接"));
     m_passwordConnectButton->setObjectName(QStringLiteral("terminalPasswordConnectButton"));
     passwordLayout->addWidget(m_connectionPassword);
+    auto *passwordInputHint = new QLabel;
+    configureAsciiCredentialInput(m_connectionPassword, passwordInputHint);
+    passwordLayout->addWidget(passwordInputHint);
     passwordLayout->addWidget(m_rememberPassword);
     passwordLayout->addWidget(m_passwordConnectButton);
     m_passwordForm->hide();

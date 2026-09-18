@@ -3,6 +3,7 @@
 #include "../core/SshSession.h"
 
 #include <QFileInfo>
+#include <QDesktopServices>
 #include <QComboBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -10,6 +11,9 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSizePolicy>
+#include <QStyle>
+#include <QToolButton>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <utility>
@@ -153,10 +157,19 @@ void TransferQueuePanel::updateTask(const FileTransferTask &task)
         auto *cancel = new QPushButton(QStringLiteral("取消"));
         cancel->setObjectName(QStringLiteral("transferCancel"));
         cancel->setFixedSize(48, 24);
+        auto *openDirectory = new QToolButton;
+        openDirectory->setObjectName(QStringLiteral("transferOpenDirectory"));
+        openDirectory->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+        openDirectory->setIconSize(QSize(16, 16));
+        openDirectory->setFixedSize(26, 26);
+        openDirectory->setAutoRaise(true);
+        openDirectory->setCursor(Qt::PointingHandCursor);
+        openDirectory->setAccessibleName(QStringLiteral("打开所在目录"));
         top->addWidget(direction);
         top->addWidget(name, 1);
         top->addWidget(state);
         top->addWidget(cancel);
+        top->addWidget(openDirectory);
         auto *details = new QHBoxLayout;
         details->setSpacing(8);
         auto *amount = new QLabel;
@@ -176,6 +189,8 @@ void TransferQueuePanel::updateTask(const FileTransferTask &task)
             if (task.state == TransferState::Failed || task.state == TransferState::Canceled) m_session->retryTransfer(id);
             else m_session->cancelTransfer(id);
         });
+        connect(openDirectory, &QToolButton::clicked, this,
+            [this, id = task.id] { openDownloadDirectory(id); });
         m_list->setItemWidget(item, row);
     }
     const bool upload = task.operation == RemoteFileOperation::Upload;
@@ -207,9 +222,36 @@ void TransferQueuePanel::updateTask(const FileTransferTask &task)
     action->setText(retryable ? QStringLiteral("重试") : QStringLiteral("取消"));
     action->setEnabled(retryable || task.state == TransferState::Queued || task.state == TransferState::Running);
     action->setVisible(task.state != TransferState::Completed);
+    auto *openDirectory = row->findChild<QToolButton *>(QStringLiteral("transferOpenDirectory"));
+    const bool canOpenDirectory = task.operation == RemoteFileOperation::Download
+        && task.state == TransferState::Completed && QFileInfo(task.localPath).isAbsolute();
+    openDirectory->setVisible(canOpenDirectory);
+    openDirectory->setEnabled(canOpenDirectory);
+    openDirectory->setToolTip(canOpenDirectory
+        ? QStringLiteral("打开所在目录\n%1").arg(QFileInfo(task.localPath).absolutePath()) : QString{});
     item->setToolTip(task.message.isEmpty() ? path->text() : task.message);
     updateSummary();
     if (isNewTask) emit taskAdded();
+}
+
+void TransferQueuePanel::openDownloadDirectory(quint64 taskId)
+{
+    const auto found = m_tasks.constFind(taskId);
+    if (found == m_tasks.cend() || found->operation != RemoteFileOperation::Download
+        || found->state != TransferState::Completed || !QFileInfo(found->localPath).isAbsolute()) return;
+    const auto directory = QFileInfo(found->localPath).absolutePath();
+    QString error;
+    if (!QFileInfo(directory).isDir()) error = QStringLiteral("下载目录不存在或已移动");
+    else if (!QDesktopServices::openUrl(QUrl::fromLocalFile(directory))) error = QStringLiteral("无法打开下载目录");
+    if (error.isEmpty()) return;
+    // Keep failures in the task row; never execute the downloaded file or a shell
+    // command, and do not open a modal dialog from the transfer-queue popup.
+    auto *item = m_items.value(taskId, nullptr);
+    if (auto *row = item ? m_list->itemWidget(item) : nullptr) {
+        auto *path = row->findChild<QLabel *>(QStringLiteral("transferPath"));
+        path->setText(error);
+        path->setToolTip(QStringLiteral("%1\n%2").arg(error, directory));
+    }
 }
 
 void TransferQueuePanel::updateSummary()

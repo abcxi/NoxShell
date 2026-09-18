@@ -7,6 +7,8 @@
 #include <QHash>
 #include <QList>
 #include <QPair>
+#include <QPointer>
+#include <QPersistentModelIndex>
 #include <QStringList>
 
 class QLabel;
@@ -17,6 +19,7 @@ class QToolButton;
 class QAction;
 class QTreeWidgetItem;
 class QEvent;
+class QCheckBox;
 
 namespace noxshell {
 class SshSession;
@@ -25,6 +28,7 @@ class SshSession;
 namespace noxshell::ui {
 
 class RemoteFileEditor;
+class RemotePathEdit;
 class TransferQueuePanel;
 
 class FilePanel final : public QFrame {
@@ -32,6 +36,7 @@ class FilePanel final : public QFrame {
 
 public:
     explicit FilePanel(SshSession *session, QWidget *parent = nullptr);
+    ~FilePanel() override;
 
     void setServer(const ServerProfile &profile);
     void updateServer(const ServerProfile &profile);
@@ -40,6 +45,7 @@ public:
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
+    void changeEvent(QEvent *event) override;
 
 private:
     void navigateTo(const QString &path, bool addToHistory = true);
@@ -68,14 +74,19 @@ private:
     void updateActionState();
     void showFileLoading(const QString &detail);
     void hideFileLoading();
+    void cancelSizeCalculations();
+    void queueDirectorySize(QTreeWidgetItem *item);
+    void startNextDirectorySize();
+    void updateSizeCell(QTreeWidgetItem *item);
+    void applyFileSort(int index);
     [[nodiscard]] QTreeWidgetItem *selectedEntry() const;
     [[nodiscard]] QList<QTreeWidgetItem *> selectedEntries() const;
     static QString normalizePath(const QString &path);
 
-    SshSession *m_session{};
+    QPointer<SshSession> m_session;
     QLabel *m_serverLabel{};
     QLabel *m_statusLabel{};
-    QLineEdit *m_pathEdit{};
+    RemotePathEdit *m_pathEdit{};
     QTreeWidget *m_directoryTree{};
     QTreeWidget *m_tree{};
     QWidget *m_fileLoadingOverlay{};
@@ -84,6 +95,9 @@ private:
     QToolButton *m_upButton{};
     QToolButton *m_refreshButton{};
     QToolButton *m_transferQueueButton{};
+    QCheckBox *m_autoSize{};
+    int m_sortIndex{0};
+    QPersistentModelIndex m_pressedSizeAction;
     QMenu *m_contextMenu{};
     QMenu *m_transferQueueMenu{};
     QAction *m_downloadAction{};
@@ -115,6 +129,9 @@ private:
     int m_removeSucceeded{};
     QStringList m_removeFailures;
     QString m_postRefreshStatus;
+    QStringList m_sizeQueue;
+    QString m_sizeActivePath;
+    quint64 m_sizeRequest{};
 };
 
 } // namespace noxshell::ui

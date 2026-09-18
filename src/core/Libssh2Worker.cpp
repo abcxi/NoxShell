@@ -1,4 +1,5 @@
 #include "Libssh2Worker.h"
+#include "DirectorySizeCommand.h"
 #include "RemoteDirectoryFallback.h"
 
 #include <QCryptographicHash>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <utility>
 
 #ifdef Q_OS_WIN
 #define NOMINMAX
@@ -163,6 +165,9 @@ Libssh2Worker::Libssh2Worker(QObject *parent, int authenticationTimeoutMs, int i
     m_readTimer->setTimerType(Qt::PreciseTimer);
     m_readTimer->setInterval(16);
     connect(m_readTimer, &QTimer::timeout, this, &Libssh2Worker::drainChannel);
+    m_sizeTimer = new QTimer(this);
+    m_sizeTimer->setInterval(40);
+    connect(m_sizeTimer, &QTimer::timeout, this, &Libssh2Worker::advanceDirectorySize);
 }
 
 Libssh2Worker::~Libssh2Worker()
@@ -535,6 +540,7 @@ void Libssh2Worker::resizePty(int columns, int rows, int pixelWidth, int pixelHe
 
 void Libssh2Worker::collectMetrics(quint64 requestId)
 {
+    if (deferDuringSizeChannelSetup([=, this] { collectMetrics(requestId); })) return;
     if (!m_connected || !m_session) {
         emit metricsCollectionFailed(requestId, QStringLiteral("SSH 会话未连接"));
         return;
@@ -664,6 +670,7 @@ bool Libssh2Worker::runRemoteCommand(const QByteArray &command, QByteArray &outp
 
 void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
 {
+    if (deferDuringSizeChannelSetup([=, this] { listDirectory(requestId, path); })) return;
     if (!m_connected || !m_session) {
         emit directoryListingFailed(requestId, path, QStringLiteral("SSH 会话未连接"));
         return;
@@ -785,8 +792,141 @@ void Libssh2Worker::listDirectory(quint64 requestId, const QString &path)
     emit directoryListed(requestId, path, entries);
 }
 
+void Libssh2Worker::setDesiredDirectorySizeRequest(quint64 requestId)
+{
+    m_desiredSizeRequest.store(requestId, std::memory_order_relaxed);
+}
+
+bool Libssh2Worker::deferDuringSizeChannelSetup(std::function<void()> operation)
+{
+    if (m_sizePhase == SizePhase::Reading && m_sizeRequest != m_desiredSizeRequest.load(std::memory_order_relaxed))
+        advanceDirectorySize(); // Deliver cancellation before a blocking SFTP/metrics operation.
+    // libssh2's channel-open state belongs to the SESSION, not the channel.
+    // Another SFTP/exec open must never consume this pending open's reply.
+    // Reading an established size channel does not hold up other operations.
+    if (m_sizePhase == SizePhase::Idle || m_sizePhase == SizePhase::Reading) return false;
+    const auto generation = m_activeConnectionGeneration;
+    QTimer::singleShot(40, this, [this, generation, operation = std::move(operation)] {
+        if (m_connected && m_activeConnectionGeneration == generation && !connectionCanceled()) operation();
+    });
+    return true;
+}
+
+void Libssh2Worker::calculateDirectorySize(quint64 requestId, const QString &path)
+{
+    if (requestId != m_desiredSizeRequest.load(std::memory_order_relaxed)) return;
+    m_pendingSizeRequest = requestId;
+    m_pendingSizePath = path;
+    m_sizeTimer->start();
+    advanceDirectorySize();
+}
+
+void Libssh2Worker::advanceDirectorySize()
+{
+    if (m_sizePhase == SizePhase::Idle) {
+        if (!m_pendingSizeRequest || m_pendingSizeRequest != m_desiredSizeRequest.load(std::memory_order_relaxed)) {
+            m_pendingSizeRequest = 0;
+            m_sizeTimer->stop();
+            return;
+        }
+        m_sizeRequest = std::exchange(m_pendingSizeRequest, 0);
+        m_sizePath = std::exchange(m_pendingSizePath, {});
+        m_sizeCommand = detail::directorySizeCommand(m_sizePath);
+        m_sizeOutput.clear();
+        m_sizeError.clear();
+        m_sizeFailure.clear();
+        m_sizeBytes = 0;
+        m_sizeStopSent = false;
+        m_sizeClock.start();
+        if (!m_connected || !m_session || m_sizeCommand.isEmpty()) {
+            m_sizeFailure = QStringLiteral("会话未连接或目录路径无效");
+            finishDirectorySize();
+            return;
+        }
+        m_sizePhase = SizePhase::Opening;
+    }
+    if (!m_session || !m_connected) return; // cleanup owns all channels on disconnect.
+    if (m_sizePhase == SizePhase::Opening) {
+        m_sizeChannel = libssh2_channel_open_session(m_session);
+        if (!m_sizeChannel) {
+            if (libssh2_session_last_errno(m_session) == LIBSSH2_ERROR_EAGAIN) return;
+            m_sizeFailure = QStringLiteral("无法打开目录统计通道：%1").arg(lastSessionError());
+            finishDirectorySize();
+            return;
+        }
+        m_sizePhase = m_sizeRequest == m_desiredSizeRequest.load(std::memory_order_relaxed)
+            ? SizePhase::Starting : SizePhase::Closing;
+    }
+    if (m_sizePhase == SizePhase::Starting) {
+        // Keep this exact command buffer alive across nonblocking retries.
+        const int result = libssh2_channel_exec(m_sizeChannel, m_sizeCommand.constData());
+        if (result == LIBSSH2_ERROR_EAGAIN) return;
+        if (result != 0) {
+            m_sizeFailure = QStringLiteral("服务器不支持目录统计命令：%1").arg(lastSessionError());
+            m_sizePhase = SizePhase::Closing;
+        } else m_sizePhase = SizePhase::Reading;
+    }
+    if (m_sizePhase == SizePhase::Reading) {
+        if (m_sizeClock.elapsed() > 65000 && m_sizeFailure.isEmpty()) m_sizeFailure = QStringLiteral("计算超时，已停止");
+        if (!m_sizeStopSent && (m_sizeRequest != m_desiredSizeRequest.load(std::memory_order_relaxed)
+                || !m_sizeFailure.isEmpty())) m_sizePhase = SizePhase::SendingEof;
+    }
+    if (m_sizePhase == SizePhase::SendingEof) {
+        const int result = libssh2_channel_send_eof(m_sizeChannel);
+        if (result == LIBSSH2_ERROR_EAGAIN) return;
+        m_sizeStopSent = true;
+        m_sizePhase = result == 0 ? SizePhase::Reading : SizePhase::Closing;
+    }
+    if (m_sizePhase == SizePhase::Reading) {
+        std::array<char, 4096> buffer{};
+        for (int stream = 0; stream < 2; ++stream) {
+            auto &target = stream == 0 ? m_sizeOutput : m_sizeError;
+            const auto count = libssh2_channel_read_ex(m_sizeChannel, stream, buffer.data(), buffer.size());
+            if (count > 0) {
+                if (target.size() + count <= 32768) target.append(buffer.data(), count);
+                else m_sizeFailure = QStringLiteral("目录统计输出超出安全上限，已停止");
+            } else if (count < 0 && count != LIBSSH2_ERROR_EAGAIN) {
+                m_sizeFailure = QStringLiteral("读取统计结果失败：%1").arg(lastSessionError());
+                m_sizePhase = SizePhase::Closing;
+            }
+        }
+        if (libssh2_channel_eof(m_sizeChannel)) {
+            const int status = libssh2_channel_get_exit_status(m_sizeChannel);
+            if (m_sizeFailure.isEmpty() && (status != 0 || !m_sizeError.isEmpty())) {
+                m_sizeFailure = status == 124 || status == 137
+                    ? QStringLiteral("计算超过 60 秒，已停止")
+                    : QStringLiteral("无法完整计算（权限、挂载点或命令不支持）：%1")
+                        .arg(QString::fromUtf8(m_sizeError.left(512)).trimmed());
+            }
+            if (m_sizeFailure.isEmpty() && !detail::parseDirectorySize(m_sizeOutput, m_sizeBytes))
+                m_sizeFailure = QStringLiteral("服务器返回了无效的目录大小");
+            m_sizePhase = SizePhase::Closing;
+        }
+    }
+    if (m_sizePhase == SizePhase::Closing) {
+        if (libssh2_channel_close(m_sizeChannel) == LIBSSH2_ERROR_EAGAIN) return;
+        m_sizePhase = SizePhase::Freeing;
+    }
+    if (m_sizePhase == SizePhase::Freeing) {
+        if (libssh2_channel_free(m_sizeChannel) == LIBSSH2_ERROR_EAGAIN) return;
+        m_sizeChannel = nullptr;
+        finishDirectorySize();
+    }
+}
+
+void Libssh2Worker::finishDirectorySize()
+{
+    const auto request = m_sizeRequest;
+    m_sizeRequest = 0;
+    m_sizePhase = SizePhase::Idle;
+    // Obsolete jobs never publish a value into a newer directory view.
+    if (request == m_desiredSizeRequest.load(std::memory_order_relaxed))
+        emit directorySizeCalculated(request, m_sizePath, m_sizeBytes, m_sizeFailure);
+}
+
 void Libssh2Worker::resolveHomeDirectory(quint64 requestId)
 {
+    if (deferDuringSizeChannelSetup([=, this] { resolveHomeDirectory(requestId); })) return;
     if (!m_connected || !m_session) {
         emit homeDirectoryResolutionFailed(requestId, QStringLiteral("SSH 会话未连接"));
         return;
@@ -881,6 +1021,7 @@ void Libssh2Worker::endSftpOperation(LIBSSH2_SFTP *sftp)
 
 void Libssh2Worker::uploadFile(quint64 requestId, const QString &localPath, const QString &remotePath, quint64 bytesPerSecond)
 {
+    if (deferDuringSizeChannelSetup([=, this] { uploadFile(requestId, localPath, remotePath, bytesPerSecond); })) return;
     QFile local(localPath);
     if (!local.open(QIODevice::ReadOnly)) {
         emit fileOperationFailed(requestId, RemoteFileOperation::Upload, remotePath,
@@ -976,6 +1117,7 @@ void Libssh2Worker::uploadFile(quint64 requestId, const QString &localPath, cons
 
 void Libssh2Worker::downloadFile(quint64 requestId, const QString &remotePath, const QString &localPath, quint64 bytesPerSecond)
 {
+    if (deferDuringSizeChannelSetup([=, this] { downloadFile(requestId, remotePath, localPath, bytesPerSecond); })) return;
     m_cancelTransferId.store(0, std::memory_order_relaxed);
     LIBSSH2_SFTP *sftp = nullptr;
     if (!beginSftpOperation(requestId, RemoteFileOperation::Download, remotePath, sftp)) return;
@@ -1068,6 +1210,7 @@ void Libssh2Worker::downloadFile(quint64 requestId, const QString &remotePath, c
 
 void Libssh2Worker::readFile(quint64 requestId, const QString &remotePath, quint64 maxBytes)
 {
+    if (deferDuringSizeChannelSetup([=, this] { readFile(requestId, remotePath, maxBytes); })) return;
     if (!m_connected || !m_session) {
         emit remoteFileReadFailed(requestId, remotePath, QStringLiteral("SSH 会话未连接"));
         return;
@@ -1127,6 +1270,7 @@ void Libssh2Worker::readFile(quint64 requestId, const QString &remotePath, quint
 
 void Libssh2Worker::writeFile(quint64 requestId, const QString &remotePath, const QByteArray &data, bool overwrite)
 {
+    if (deferDuringSizeChannelSetup([=, this] { writeFile(requestId, remotePath, data, overwrite); })) return;
     if (!m_connected || !m_session) {
         emit remoteFileWriteFailed(requestId, remotePath, QStringLiteral("SSH 会话未连接"));
         return;
@@ -1203,6 +1347,7 @@ void Libssh2Worker::cancelTransfer(quint64 requestId)
 
 void Libssh2Worker::createDirectory(quint64 requestId, const QString &path)
 {
+    if (deferDuringSizeChannelSetup([=, this] { createDirectory(requestId, path); })) return;
     LIBSSH2_SFTP *sftp = nullptr;
     if (!beginSftpOperation(requestId, RemoteFileOperation::MakeDirectory, path, sftp)) return;
     const auto bytes = path.toUtf8();
@@ -1215,6 +1360,7 @@ void Libssh2Worker::createDirectory(quint64 requestId, const QString &path)
 
 void Libssh2Worker::renamePath(quint64 requestId, const QString &sourcePath, const QString &destinationPath)
 {
+    if (deferDuringSizeChannelSetup([=, this] { renamePath(requestId, sourcePath, destinationPath); })) return;
     LIBSSH2_SFTP *sftp = nullptr;
     if (!beginSftpOperation(requestId, RemoteFileOperation::Rename, sourcePath, sftp)) return;
     const auto source = sourcePath.toUtf8();
@@ -1233,6 +1379,7 @@ void Libssh2Worker::renamePath(quint64 requestId, const QString &sourcePath, con
 
 void Libssh2Worker::removePath(quint64 requestId, const QString &path, bool directory)
 {
+    if (deferDuringSizeChannelSetup([=, this] { removePath(requestId, path, directory); })) return;
     LIBSSH2_SFTP *sftp = nullptr;
     if (!beginSftpOperation(requestId, RemoteFileOperation::Remove, path, sftp)) return;
     const auto bytes = path.toUtf8();
@@ -1249,6 +1396,7 @@ void Libssh2Worker::removePath(quint64 requestId, const QString &path, bool dire
 void Libssh2Worker::changePermissions(quint64 requestId, const QString &path, quint32 permissions,
     bool recursive, PermissionScope scope)
 {
+    if (deferDuringSizeChannelSetup([=, this] { changePermissions(requestId, path, permissions, recursive, scope); })) return;
     LIBSSH2_SFTP *sftp = nullptr;
     if (!beginSftpOperation(requestId, RemoteFileOperation::ChangePermissions, path, sftp)) return;
 
@@ -1387,10 +1535,19 @@ void Libssh2Worker::cleanup()
     m_profile.keyPassphrase.clear();
     m_readTimer->stop();
     m_waitingForHostKey = false;
+    m_sizeTimer->stop();
+    m_pendingSizeRequest = m_sizeRequest = 0;
+    m_sizePhase = SizePhase::Idle;
     m_connected = false;
     m_directoryShellFallback = false;
     // Never block teardown on a peer that has already timed out.
     if (m_session) libssh2_session_set_blocking(m_session, 0);
+    if (m_sizeChannel) {
+        libssh2_channel_send_eof(m_sizeChannel);
+        libssh2_channel_close(m_sizeChannel);
+        libssh2_channel_free(m_sizeChannel);
+        m_sizeChannel = nullptr;
+    }
     if (m_channel) {
         libssh2_channel_send_eof(m_channel);
         libssh2_channel_close(m_channel);

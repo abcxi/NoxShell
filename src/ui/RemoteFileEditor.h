@@ -7,6 +7,7 @@ class QCloseEvent;
 class QEvent;
 class QLabel;
 class QLineEdit;
+class QPushButton;
 class QShortcut;
 class QStackedWidget;
 class QTabBar;
@@ -31,6 +32,7 @@ public:
 protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
+    void changeEvent(QEvent *event) override;
 
 private:
     struct Document;
@@ -44,6 +46,8 @@ private:
     void setBusy(Document *document, bool busy, const QString &message);
     void setDirty(Document *document, bool dirty);
     void updateTab(Document *document);
+    void updateChrome();
+    void updatePosition(Document *document);
     void installCloseButton(int index);
     bool requestCloseDocument(int index);
     void removeDocument(int index);
@@ -59,6 +63,12 @@ private:
     QString m_serverName;
     QTabBar *m_tabs{};
     QStackedWidget *m_stack{};
+    QLabel *m_pathDisplay{};
+    QLabel *m_documentState{};
+    QPushButton *m_saveButton{};
+    QToolButton *m_undoButton{};
+    QToolButton *m_redoButton{};
+    QToolButton *m_wrapButton{};
     QWidget *m_findPanel{};
     QWidget *m_replaceRow{};
     QLineEdit *m_findEdit{};
