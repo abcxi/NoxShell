@@ -120,7 +120,7 @@ bool installMacTitleBarControls(QMainWindow *window,
         bridge, @selector(toggleMonitor:));
     bridge.settingsButton = makeButton(symbolImage(@"gearshape", NSImageNameActionTemplate),
         bridge, @selector(openSettings:));
-    bridge.settingsButton.toolTip = @"终端显示设置";
+    bridge.settingsButton.toolTip = @"终端设置：外观与输入法";
     bridge.settingsButton.accessibilityLabel = bridge.settingsButton.toolTip;
     bridge.themeButton = makeButton(symbolImage(@"circle.lefthalf.filled", NSImageNameColorPanel),
         bridge, @selector(showThemeMenu:));

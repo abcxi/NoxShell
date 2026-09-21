@@ -1,5 +1,8 @@
 #include "TerminalView.h"
 #include "SearchMarkerScrollBar.h"
+#ifdef Q_OS_MACOS
+#include "MacTerminalInput.h"
+#endif
 
 #include <QApplication>
 #include <QClipboard>
@@ -12,6 +15,8 @@
 #include <QIcon>
 #include <QImage>
 #include <QInputMethodEvent>
+#include <QInputMethod>
+#include <QScopedValueRollback>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -70,6 +75,10 @@ TerminalView::TerminalView(QWidget *parent)
     setObjectName(QStringLiteral("terminalOutput"));
     setFocusPolicy(Qt::StrongFocus);
     setAttribute(Qt::WA_InputMethodEnabled);
+    setInputMethodHints(Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
+#ifdef Q_OS_MACOS
+    m_macInput = std::make_unique<MacTerminalInput>(this);
+#endif
     setAutoFillBackground(false);
     setMouseTracking(true);
     setAppearance(defaultAppearance());
@@ -80,6 +89,7 @@ TerminalView::TerminalView(QWidget *parent)
     m_scrollBar->setPageStep(m_model.rows());
     connect(m_scrollBar, &QScrollBar::valueChanged, this, [this] {
         if (m_lastMousePosition.x() >= 0) updateHoveredCommandBlock(m_lastMousePosition);
+        updateInputMethodGeometry();
         update();
     });
     connect(m_scrollBar, &SearchMarkerScrollBar::searchMarkerActivated, this, [this](int index) {
@@ -234,6 +244,7 @@ void TerminalView::setAppearance(const TerminalAppearance &appearance)
     setMinimumSize(static_cast<int>(m_cellWidth * 20) + kContentLeft + kContentRight + kScrollBarWidth,
         static_cast<int>(m_cellHeight * 6) + kContentTop + kContentBottom);
     if (m_scrollBar) updateGridSize();
+    updateInputMethodGeometry();
     update();
 }
 
@@ -247,6 +258,8 @@ void TerminalView::feedData(const QByteArray &data)
     feedText(m_decoder(data));
 }
 
+TerminalView::~TerminalView() = default;
+
 void TerminalView::feedText(const QString &text)
 {
     const bool followBottom = m_scrollBar->value() == m_scrollBar->maximum();
@@ -258,11 +271,13 @@ void TerminalView::feedText(const QString &text)
         if (!m_searchRefreshTimer->isActive()) m_searchRefreshTimer->start();
     }
     if (m_lastMousePosition.x() >= 0) updateHoveredCommandBlock(m_lastMousePosition);
+    updateInputMethodGeometry();
     update();
 }
 
 void TerminalView::clear()
 {
+    cancelPreedit();
     m_decoder.resetState();
     m_model.clear();
     clearSelection();
@@ -274,6 +289,7 @@ void TerminalView::clear()
 
 bool TerminalView::event(QEvent *event)
 {
+    if (event->type() == QEvent::EnabledChange && !isEnabled()) cancelPreedit();
     if (event->type() == QEvent::ShortcutOverride) {
         auto *keyEvent = static_cast<QKeyEvent *>(event);
         const bool commandModifier = keyEvent->modifiers().testFlag(Qt::MetaModifier)
@@ -393,13 +409,22 @@ void TerminalView::paintEvent(QPaintEvent *event)
         }
     }
 
-    if (m_hasFocus && m_model.cursorVisible() && firstLine == m_scrollBar->maximum()) {
+    if (m_preedit.isEmpty() && m_hasFocus && m_model.cursorVisible() && firstLine == m_scrollBar->maximum()) {
         const QRectF cursorRect(kContentLeft + m_model.cursorColumn() * m_cellWidth,
             kContentTop + m_model.cursorRow() * m_cellHeight + 2.0,
             2.0, qMax(2.0, m_cellHeight - 4.0));
         painter.fillRect(cursorRect, QColor(QStringLiteral("#7DB1DE")));
     }
-
+    if (!m_preedit.isEmpty() && m_hasFocus) {
+        QTextLayout layout;
+        const auto origin = layoutPreedit(layout);
+        const auto line = layout.lineAt(0);
+        painter.fillRect(QRectF(origin, QSizeF(line.naturalTextWidth() + 3, m_cellHeight)),
+            QColor(QStringLiteral("#17354A")));
+        painter.setPen(QColor(QStringLiteral("#E3F3FF")));
+        layout.draw(&painter, origin);
+        if (m_preeditCursorVisible) layout.drawCursor(&painter, origin, m_preeditCursor, 2);
+    }
 }
 
 void TerminalView::resizeEvent(QResizeEvent *event)
@@ -410,6 +435,7 @@ void TerminalView::resizeEvent(QResizeEvent *event)
     positionSearchBar();
     positionCommandBlockTools();
     updateGridSize();
+    updateInputMethodGeometry();
 }
 
 void TerminalView::positionSearchBar()
@@ -791,6 +817,14 @@ QByteArray TerminalView::keySequence(QKeyEvent *event) const
 
 void TerminalView::keyPressEvent(QKeyEvent *event)
 {
+    if (event->key() == Qt::Key_Escape) cancelPreedit();
+    else if (!m_preedit.isEmpty()
+        && (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
+        // Confirmation belongs to the IME, not to the remote shell/vi.
+        QGuiApplication::inputMethod()->commit();
+        event->accept();
+        return;
+    }
     const bool metaModifier = event->modifiers().testFlag(Qt::MetaModifier);
     const bool controlModifier = event->modifiers().testFlag(Qt::ControlModifier);
     const bool terminalShortcutModifier = metaModifier
@@ -1094,6 +1128,7 @@ void TerminalView::wheelEvent(QWheelEvent *event)
 void TerminalView::sendPaste(const QString &text)
 {
     if (text.isEmpty()) return;
+    cancelPreedit();
     clearSelection();
     trackTextForCommand(text);
     auto payload = text.toUtf8();
@@ -1103,6 +1138,7 @@ void TerminalView::sendPaste(const QString &text)
 
 void TerminalView::sendInterrupt()
 {
+    cancelPreedit();
     clearSelection();
     m_pendingCommand.clear();
     m_pendingCommandCursor = 0;
@@ -1127,12 +1163,20 @@ void TerminalView::selectAllText()
 void TerminalView::focusInEvent(QFocusEvent *event)
 {
     m_hasFocus = true;
+#ifdef Q_OS_MACOS
+    m_macInput->focusIn(m_appearance.autoEnglishInput);
+#endif
+    updateInputMethodGeometry();
     update();
     QWidget::focusInEvent(event);
 }
 
 void TerminalView::focusOutEvent(QFocusEvent *event)
 {
+    cancelPreedit();
+#ifdef Q_OS_MACOS
+    m_macInput->focusOut();
+#endif
     m_hasFocus = false;
     m_tabKeyDown = false;
     update();
@@ -1141,12 +1185,87 @@ void TerminalView::focusOutEvent(QFocusEvent *event)
 
 void TerminalView::inputMethodEvent(QInputMethodEvent *event)
 {
+    if (m_resettingInputMethod || !isEnabled()) {
+        event->accept();
+        return;
+    }
+    // The terminal is an insertion-only client. Never implement IME replacement
+    // by sending backspaces: those could delete unrelated text on the server.
     if (!event->commitString().isEmpty()) {
         clearSelection();
         trackTextForCommand(event->commitString());
         emit inputGenerated(event->commitString().toUtf8());
     }
+    m_preedit = event->preeditString();
+    m_preeditFormats.clear();
+    m_preeditCursor = m_preedit.size();
+    m_preeditCursorVisible = true;
+    for (const auto &attribute : event->attributes()) {
+        if (attribute.type == QInputMethodEvent::Cursor) {
+            m_preeditCursor = qBound(0, attribute.start, int(m_preedit.size()));
+            m_preeditCursorVisible = attribute.length != 0;
+        } else if (attribute.type == QInputMethodEvent::TextFormat) {
+            const int start = qBound(0, attribute.start, int(m_preedit.size()));
+            const int length = qBound(0, attribute.length, int(m_preedit.size()) - start);
+            m_preeditFormats.append({start, length, qvariant_cast<QTextFormat>(attribute.value).toCharFormat()});
+        }
+    }
+    if (!m_preedit.isEmpty()) {
+        clearSelection();
+        m_scrollBar->setValue(m_scrollBar->maximum());
+    }
+    updateInputMethodGeometry();
+    update();
     event->accept();
+}
+
+void TerminalView::cancelPreedit()
+{
+    if (m_resettingInputMethod) return;
+    // Cocoa reset can synchronously turn marked text into a commit. Suppress
+    // that callback so Esc/focus loss never sends unconfirmed text remotely.
+    QScopedValueRollback guard(m_resettingInputMethod, true);
+    if (hasFocus()) QGuiApplication::inputMethod()->reset();
+    m_preedit.clear();
+    m_preeditFormats.clear();
+    m_preeditCursor = 0;
+    updateInputMethodGeometry();
+    update();
+}
+
+QRectF TerminalView::terminalCursorRect() const
+{
+    const int firstLine = m_scrollBar ? m_scrollBar->value() : 0;
+    const int row = qBound(0, m_model.historyLineCount() + m_model.cursorRow() - firstLine, m_model.rows() - 1);
+    return QRectF(kContentLeft + m_model.cursorColumn() * m_cellWidth,
+        kContentTop + row * m_cellHeight, m_cellWidth, m_cellHeight);
+}
+
+QPointF TerminalView::layoutPreedit(QTextLayout &layout) const
+{
+    layout.setText(m_preedit);
+    layout.setFont(m_font);
+    QTextCharFormat underline;
+    underline.setFontUnderline(true);
+    auto formats = m_preeditFormats;
+    formats.prepend({0, int(m_preedit.size()), underline});
+    layout.setFormats(formats);
+    layout.beginLayout();
+    auto line = layout.createLine();
+    line.setNumColumns(m_preedit.size());
+    line.setPosition(QPointF(0, qMax(qreal(0), (m_cellHeight - line.height()) / 2)));
+    layout.endLayout();
+    const qreal right = width() - kContentRight - kScrollBarWidth - 3;
+    const qreal cursorX = line.cursorToX(m_preeditCursor);
+    // Shift a long preedit horizontally so its caret/candidate anchor stays visible.
+    const qreal x = qMin(terminalCursorRect().left(),
+        qMax(qreal(kContentLeft), right - line.naturalTextWidth()));
+    return {qMin(x, right - cursorX), terminalCursorRect().top()};
+}
+
+void TerminalView::updateInputMethodGeometry()
+{
+    if (hasFocus()) QGuiApplication::inputMethod()->update(Qt::ImCursorRectangle | Qt::ImAnchorRectangle);
 }
 
 void TerminalView::clearSelection()
@@ -1160,10 +1279,20 @@ void TerminalView::clearSelection()
 
 QVariant TerminalView::inputMethodQuery(Qt::InputMethodQuery query) const
 {
-    if (query == Qt::ImEnabled) return true;
-    if (query == Qt::ImCursorRectangle) {
-        return QRectF(kContentLeft + m_model.cursorColumn() * m_cellWidth,
-            kContentTop + m_model.cursorRow() * m_cellHeight, m_cellWidth, m_cellHeight);
+    if (query == Qt::ImEnabled) return isEnabled();
+    if (query == Qt::ImFont) return m_font;
+    if (query == Qt::ImHints) return QVariant::fromValue(inputMethodHints());
+    if (query == Qt::ImCursorPosition || query == Qt::ImAnchorPosition || query == Qt::ImAbsolutePosition) return 0;
+    if (query == Qt::ImSurroundingText || query == Qt::ImCurrentSelection
+        || query == Qt::ImTextBeforeCursor || query == Qt::ImTextAfterCursor) return QString();
+    if (query == Qt::ImCursorRectangle || query == Qt::ImAnchorRectangle) {
+        if (!m_preedit.isEmpty()) {
+            QTextLayout layout;
+            const auto origin = layoutPreedit(layout);
+            return QRectF(origin + QPointF(layout.lineAt(0).cursorToX(m_preeditCursor), 0),
+                QSizeF(2, m_cellHeight));
+        }
+        return terminalCursorRect();
     }
     return QWidget::inputMethodQuery(query);
 }

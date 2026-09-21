@@ -145,6 +145,8 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
         QStringLiteral("terminal/fontSize"), terminalAppearance.pointSize).toInt();
     terminalAppearance.lineSpacing = settings.value(
         QStringLiteral("terminal/lineSpacing"), terminalAppearance.lineSpacing).toDouble();
+    terminalAppearance.autoEnglishInput = settings.value(
+        QStringLiteral("terminal/autoEnglishInput"), true).toBool();
     TerminalView::setDefaultAppearance(terminalAppearance);
 #ifdef Q_OS_MACOS
     m_nativeTitleBarControls = QApplication::platformName() == QStringLiteral("cocoa");
@@ -299,8 +301,8 @@ QToolBar *MainWindow::createWindowToolbar()
     m_settingsButton->setIcon(QIcon(QStringLiteral(":/assets/settings.svg")));
     m_settingsButton->setIconSize(QSize(19, 19));
     m_settingsButton->setFixedSize(30, 28);
-    m_settingsButton->setToolTip(QStringLiteral("终端显示设置"));
-    m_settingsButton->setAccessibleName(QStringLiteral("终端显示设置"));
+    m_settingsButton->setToolTip(QStringLiteral("终端设置：外观与输入法"));
+    m_settingsButton->setAccessibleName(QStringLiteral("终端设置"));
 
     m_themeModeButton = new QToolButton;
     m_themeModeButton->setObjectName(QStringLiteral("themeModeButton"));
@@ -423,8 +425,8 @@ void MainWindow::showTerminalSettings()
         for (auto *terminal : terminals) terminal->setAppearance(appearance);
     };
     connect(&dialog, &TerminalSettingsDialog::appearancePreviewRequested, this,
-        [applyAppearance](const QString &family, int size, double spacing) {
-            applyAppearance({family, size, spacing});
+        [applyAppearance](const QString &family, int size, double spacing, bool autoEnglish) {
+            applyAppearance({family, size, spacing, autoEnglish});
         });
 
     if (dialog.exec() == QDialog::Accepted) {
@@ -434,6 +436,7 @@ void MainWindow::showTerminalSettings()
         settings.setValue(QStringLiteral("terminal/fontFamily"), selected.fontFamily);
         settings.setValue(QStringLiteral("terminal/fontSize"), selected.pointSize);
         settings.setValue(QStringLiteral("terminal/lineSpacing"), selected.lineSpacing);
+        settings.setValue(QStringLiteral("terminal/autoEnglishInput"), selected.autoEnglishInput);
     } else {
         applyAppearance(previous);
     }

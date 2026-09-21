@@ -1,6 +1,7 @@
 #include "TerminalSettingsDialog.h"
 
 #include <QDialogButtonBox>
+#include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QFontComboBox>
 #include <QFontDatabase>
@@ -17,7 +18,7 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     : QDialog(parent)
 {
     setObjectName(QStringLiteral("terminalSettingsDialog"));
-    setWindowTitle(QStringLiteral("终端显示设置"));
+    setWindowTitle(QStringLiteral("终端设置"));
     setModal(true);
     setMinimumWidth(420);
 
@@ -25,7 +26,7 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     layout->setContentsMargins(20, 18, 20, 16);
     layout->setSpacing(14);
 
-    auto *heading = new QLabel(QStringLiteral("SSH 终端外观"));
+    auto *heading = new QLabel(QStringLiteral("SSH 终端设置"));
     heading->setStyleSheet(QStringLiteral("font-size:16px;font-weight:650;"));
     auto *hint = new QLabel(QStringLiteral("设置会同步应用到所有已打开和之后新建的终端标签。"));
     hint->setObjectName(QStringLiteral("mutedLabel"));
@@ -62,6 +63,15 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     form->addRow(QStringLiteral("行间距"), m_lineSpacing);
     layout->addLayout(form);
 
+    m_autoEnglishInput = new QCheckBox(QStringLiteral("进入终端时自动切换英文输入"));
+    m_autoEnglishInput->setObjectName(QStringLiteral("terminalAutoEnglishInputCheck"));
+    m_autoEnglishInput->setChecked(appearance.autoEnglishInput);
+    m_autoEnglishInput->setToolTip(QStringLiteral("macOS：聚焦终端时切换到可用的英文键盘；仍可手动切回中文。离开终端时恢复原输入法，手动切换优先。"));
+#ifndef Q_OS_MACOS
+    m_autoEnglishInput->hide();
+#endif
+    layout->addWidget(m_autoEnglishInput);
+
     m_preview = new QLabel(QStringLiteral("root@noxshell:~$ ls -la\nSSH 终端字体预览  Aa  0123456789"));
     m_preview->setObjectName(QStringLiteral("terminalAppearancePreview"));
     m_preview->setMinimumHeight(86);
@@ -81,6 +91,7 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
     connect(m_fontFamily, &QFontComboBox::currentFontChanged, this, [this] { refreshPreview(); });
     connect(m_fontSize, &QSpinBox::valueChanged, this, [this] { refreshPreview(); });
     connect(m_lineSpacing, &QDoubleSpinBox::valueChanged, this, [this] { refreshPreview(); });
+    connect(m_autoEnglishInput, &QCheckBox::toggled, this, [this] { refreshPreview(); });
     connect(reset, &QPushButton::clicked, this, &TerminalSettingsDialog::restoreDefaults);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -89,7 +100,7 @@ TerminalSettingsDialog::TerminalSettingsDialog(const TerminalAppearance &appeara
 
 TerminalAppearance TerminalSettingsDialog::appearance() const
 {
-    return {m_fontFamily->currentFont().family(), m_fontSize->value(), m_lineSpacing->value()};
+    return {m_fontFamily->currentFont().family(), m_fontSize->value(), m_lineSpacing->value(), m_autoEnglishInput->isChecked()};
 }
 
 void TerminalSettingsDialog::refreshPreview()
@@ -102,7 +113,7 @@ void TerminalSettingsDialog::refreshPreview()
     font.setFixedPitch(true);
     m_preview->setFont(font);
     m_preview->setMinimumHeight(qMax(86, qRound(QFontMetricsF(font).height() * value.lineSpacing * 3.2)));
-    emit appearancePreviewRequested(value.fontFamily, value.pointSize, value.lineSpacing);
+    emit appearancePreviewRequested(value.fontFamily, value.pointSize, value.lineSpacing, value.autoEnglishInput);
 }
 
 void TerminalSettingsDialog::restoreDefaults()
@@ -111,6 +122,7 @@ void TerminalSettingsDialog::restoreDefaults()
     m_fontFamily->setCurrentFont(fixedFont);
     m_fontSize->setValue(12);
     m_lineSpacing->setValue(1.05);
+    m_autoEnglishInput->setChecked(true);
     refreshPreview();
 }
 

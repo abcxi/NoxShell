@@ -6,6 +6,8 @@
 #include <QRectF>
 #include <QStringDecoder>
 #include <QWidget>
+#include <QTextLayout>
+#include <memory>
 
 class QAction;
 class QContextMenuEvent;
@@ -20,11 +22,15 @@ class QTimer;
 namespace noxshell::ui {
 
 class SearchMarkerScrollBar;
+#ifdef Q_OS_MACOS
+class MacTerminalInput;
+#endif
 
 struct TerminalAppearance {
     QString fontFamily;
     int pointSize{12};
     qreal lineSpacing{1.05};
+    bool autoEnglishInput{true};
 
     friend bool operator==(const TerminalAppearance &, const TerminalAppearance &) = default;
 };
@@ -34,6 +40,7 @@ class TerminalView final : public QWidget {
 
 public:
     explicit TerminalView(QWidget *parent = nullptr);
+    ~TerminalView() override;
 
     static TerminalAppearance defaultAppearance();
     static void setDefaultAppearance(const TerminalAppearance &appearance);
@@ -99,6 +106,10 @@ private:
     };
 
     void updateGridSize();
+    void cancelPreedit();
+    void updateInputMethodGeometry();
+    [[nodiscard]] QRectF terminalCursorRect() const;
+    [[nodiscard]] QPointF layoutPreedit(QTextLayout &layout) const;
     void positionSearchBar();
     void rebuildSearchMatches(bool preserveCurrent, bool revealCurrent);
     void updateSearchCounter();
@@ -138,6 +149,14 @@ private:
     qreal m_ascent{};
     bool m_hasFocus{false};
     bool m_tabKeyDown{false};
+    QString m_preedit;
+    QList<QTextLayout::FormatRange> m_preeditFormats;
+    int m_preeditCursor{};
+    bool m_preeditCursorVisible{true};
+    bool m_resettingInputMethod{false};
+#ifdef Q_OS_MACOS
+    std::unique_ptr<MacTerminalInput> m_macInput;
+#endif
     SearchMarkerScrollBar *m_scrollBar{};
     QMenu *m_contextMenu{};
     QAction *m_findAction{};

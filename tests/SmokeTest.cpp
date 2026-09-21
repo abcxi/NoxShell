@@ -28,6 +28,7 @@
 #include "../src/ui/TerminalWorkspace.h"
 #include "../src/ui/TransferQueuePanel.h"
 #include "../src/ui/TerminalView.h"
+#include "../src/ui/TerminalInputSourceScope.h"
 #include "../src/ui/VtTerminalModel.h"
 
 #include <QApplication>
@@ -88,6 +89,12 @@
 #include <QtTest>
 
 #include <algorithm>
+
+#ifdef Q_OS_MACOS
+bool nativeProbeTerminalMarkText(QWidget *terminal, const QString &text);
+bool nativeProbeTerminalCommitText(QWidget *terminal, const QString &text);
+bool nativeProbeTerminalEscape(QWidget *terminal);
+#endif
 #include <functional>
 #include <utility>
 
@@ -1136,6 +1143,285 @@ private slots:
         QVERIFY(dialog.findChild<QSpinBox *>(QStringLiteral("terminalFontSizeSpin")));
         QVERIFY(dialog.findChild<QDoubleSpinBox *>(QStringLiteral("terminalLineSpacingSpin")));
         QVERIFY(dialog.findChild<QLabel *>(QStringLiteral("terminalAppearancePreview")));
+        auto *autoEnglish = dialog.findChild<QCheckBox *>(QStringLiteral("terminalAutoEnglishInputCheck"));
+        QVERIFY(autoEnglish);
+        QSignalSpy preview(&dialog, &noxshell::ui::TerminalSettingsDialog::appearancePreviewRequested);
+        autoEnglish->setChecked(false);
+        QVERIFY(!dialog.appearance().autoEnglishInput);
+        QVERIFY(!preview.isEmpty());
+        QCOMPARE(preview.last().at(3).toBool(), false);
+        dialog.findChild<QPushButton *>(QStringLiteral("terminalSettingsResetButton"))->click();
+        QVERIFY(dialog.appearance().autoEnglishInput);
+    }
+
+    void terminalPreeditIsVisibleButNeverSentUntilCommitted()
+    {
+        noxshell::ui::TerminalView view;
+        view.resize(640, 260);
+        view.show();
+        view.activateWindow();
+        view.setFocus();
+        QTest::qWait(30);
+        view.feedText(QStringLiteral("\x1b[?1049h\x1b[2J\x1b[Hvi buffer\r\n"));
+        const auto contents = view.plainText();
+        const auto before = view.grab().toImage();
+        QSignalSpy input(&view, &noxshell::ui::TerminalView::inputGenerated);
+        QSignalSpy commands(&view, &noxshell::ui::TerminalView::commandSubmitted);
+        QTextCharFormat marked;
+        marked.setBackground(Qt::darkBlue);
+        QInputMethodEvent composing(QStringLiteral("zhongwen"), {
+            {QInputMethodEvent::Cursor, 5, 1, {}},
+            {QInputMethodEvent::TextFormat, 0, 5, marked}});
+        QApplication::sendEvent(&view, &composing);
+        QVERIFY(view.grab().toImage() != before);
+        QCOMPARE(view.plainText(), contents);
+        QCOMPARE(input.count(), 0);
+        QCOMPARE(commands.count(), 0);
+
+        QInputMethodQueryEvent query(Qt::ImQueryInput | Qt::ImAbsolutePosition | Qt::ImTextBeforeCursor | Qt::ImTextAfterCursor);
+        QApplication::sendEvent(&view, &query);
+        QVERIFY(query.value(Qt::ImSurroundingText).isValid());
+        QVERIFY(query.value(Qt::ImSurroundingText).toString().isEmpty());
+        QCOMPARE(query.value(Qt::ImCursorPosition).toInt(), 0);
+        QVERIFY(query.value(Qt::ImCursorPosition).isValid());
+        QVERIFY(query.value(Qt::ImAnchorPosition).isValid());
+        QVERIFY(query.value(Qt::ImAbsolutePosition).isValid());
+        QVERIFY(view.rect().contains(query.value(Qt::ImCursorRectangle).toRectF().toAlignedRect()));
+
+        QInputMethodEvent committed;
+        committed.setCommitString(QStringLiteral("中文"));
+        QApplication::sendEvent(&view, &committed);
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.first().at(0).toByteArray(), QStringLiteral("中文").toUtf8());
+        QCOMPARE(view.plainText(), contents);
+        QCOMPARE(view.grab().toImage(), before);
+    }
+
+    void terminalPreeditCancelDoesNotLeakAndViKeysStillWork()
+    {
+        noxshell::ui::TerminalView view;
+        view.resize(640, 260);
+        view.show();
+        view.activateWindow();
+        view.setFocus();
+        QTest::qWait(20);
+        QSignalSpy input(&view, &noxshell::ui::TerminalView::inputGenerated);
+        const auto before = view.grab().toImage();
+        QInputMethodEvent composing(QStringLiteral("weiwancheng"), {});
+        QApplication::sendEvent(&view, &composing);
+        QTest::keyClick(&view, Qt::Key_Escape);
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.takeFirst().at(0).toByteArray(), QByteArray("\x1b"));
+        QCOMPARE(view.grab().toImage(), before);
+
+        QApplication::sendEvent(&view, &composing);
+        view.clear();
+        QCOMPARE(input.count(), 0);
+        QCOMPARE(view.grab().toImage(), before);
+        QApplication::sendEvent(&view, &composing);
+        view.setEnabled(false);
+        view.setEnabled(true);
+        view.setFocus();
+        QCOMPARE(input.count(), 0);
+        QCOMPARE(view.grab().toImage(), before);
+
+        QTest::keyClicks(&view, QStringLiteral("ihello"));
+        QTest::keyClick(&view, Qt::Key_Escape);
+        QTest::keyClicks(&view, QStringLiteral(":wq"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QByteArray bytes;
+        for (const auto &event : input) bytes += event.at(0).toByteArray();
+        QCOMPARE(bytes, QByteArray("ihello\x1b:wq\r"));
+    }
+
+    void terminalPreeditLongTextAndResizeKeepCandidateVisible()
+    {
+        noxshell::ui::TerminalView view;
+        view.resize(480, 180);
+        view.show();
+        view.setFocus();
+        view.feedText(QStringLiteral("\x1b[99;99H"));
+        QInputMethodEvent composing(QString(200, QChar('x')), {{QInputMethodEvent::Cursor, 198, 1, {}}});
+        QApplication::sendEvent(&view, &composing);
+        for (const int width : {640, 400}) {
+            view.resize(width, 240);
+            QInputMethodQueryEvent query(Qt::ImCursorRectangle);
+            QApplication::sendEvent(&view, &query);
+            QVERIFY(view.rect().contains(query.value(Qt::ImCursorRectangle).toRectF().toAlignedRect()));
+            QVERIFY(!view.grab().isNull());
+        }
+    }
+
+    void terminalPreeditConfirmationAndFocusLossStayLocal()
+    {
+        QWidget window;
+        auto *layout = new QVBoxLayout(&window);
+        auto *view = new noxshell::ui::TerminalView;
+        auto *other = new QLineEdit;
+        layout->addWidget(view);
+        layout->addWidget(other);
+        window.resize(640, 300);
+        window.show();
+        window.activateWindow();
+        view->setFocus();
+        QTest::qWait(30);
+        QSignalSpy input(view, &noxshell::ui::TerminalView::inputGenerated);
+        const auto before = view->grab().toImage();
+        QInputMethodEvent composing(QStringLiteral("unfinished"), {});
+        QApplication::sendEvent(view, &composing);
+        QTest::keyClick(view, Qt::Key_Return);
+        for (const auto &event : input) QVERIFY(!event.at(0).toByteArray().contains('\r'));
+        input.clear();
+        QApplication::sendEvent(view, &composing);
+        other->setFocus();
+        view->setFocus();
+        QCOMPARE(input.count(), 0);
+        QCOMPARE(view->grab().toImage(), before);
+        QApplication::sendEvent(view, &composing);
+        QTest::keyClick(view, Qt::Key_C, Qt::ControlModifier);
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.takeFirst().at(0).toByteArray(), QByteArray(1, '\x03'));
+        QApplication::sendEvent(view, &composing);
+        QApplication::clipboard()->setText(QStringLiteral("paste"));
+        view->feedText(QStringLiteral("\x1b[?2004h"));
+        QTest::keyClick(view, Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.first().at(0).toByteArray(), QByteArray("\x1b[200~paste\x1b[201~"));
+        QCOMPARE(view->grab().toImage(), before);
+    }
+
+    void terminalInputSettingPersistsAndCancelRestores()
+    {
+        if (QApplication::platformName() == QStringLiteral("cocoa"))
+            QSKIP("Uses the offscreen toolbar; native text input has its own probe");
+        const auto original = noxshell::ui::TerminalView::defaultAppearance();
+        QSettings settings;
+        const auto key = QStringLiteral("terminal/autoEnglishInput");
+        const auto stored = settings.value(key);
+        const auto cleanup = qScopeGuard([&] {
+            if (stored.isValid()) settings.setValue(key, stored); else settings.remove(key);
+            noxshell::ui::TerminalView::setDefaultAppearance(original);
+        });
+        settings.setValue(key, true);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto database = directory.filePath(QStringLiteral("settings.sqlite"));
+        {
+            noxshell::ui::MainWindow window(database);
+            auto *button = window.findChild<QToolButton *>(QStringLiteral("terminalSettingsButton"));
+            QVERIFY(button);
+            bool found = false;
+            QTimer::singleShot(0, &window, [&] {
+                auto *dialog = window.findChild<noxshell::ui::TerminalSettingsDialog *>();
+                if (!dialog) return;
+                auto *check = dialog->findChild<QCheckBox *>(QStringLiteral("terminalAutoEnglishInputCheck"));
+                found = check != nullptr;
+                if (check) check->setChecked(false);
+                dialog->accept();
+            });
+            button->click();
+            QVERIFY(found);
+            QVERIFY(!settings.value(key).toBool());
+            QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
+            QTimer::singleShot(0, &window, [&] {
+                auto *dialog = window.findChild<noxshell::ui::TerminalSettingsDialog *>();
+                if (!dialog) return;
+                dialog->findChild<QCheckBox *>(QStringLiteral("terminalAutoEnglishInputCheck"))->setChecked(true);
+                dialog->reject();
+            });
+            button->click();
+            QVERIFY(!settings.value(key).toBool());
+            QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
+        }
+        noxshell::ui::TerminalView::setDefaultAppearance(original);
+        noxshell::ui::MainWindow reopened(database);
+        QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
+    }
+
+    void terminalInputSourcePolicyRespectsManualChoiceAndFailures()
+    {
+        using namespace noxshell::ui;
+        QString current = QStringLiteral("pinyin");
+        QString ascii = QStringLiteral("abc");
+        QStringList selections;
+        bool succeeds = true;
+        TerminalInputSourceBackend backend{
+            [&] { return current; }, [&] { return current == ascii; }, [&] { return ascii; },
+            [&](const QString &source) { selections << source; if (succeeds) current = source; return succeeds; }};
+        TerminalInputSourceScope scope;
+        scope.enter(false, backend);
+        QVERIFY(selections.isEmpty());
+        scope.enter(true, backend);
+        QCOMPARE(current, ascii);
+        scope.enter(true, backend);
+        QCOMPARE(selections.size(), 1);
+        scope.leave(true, backend);
+        QCOMPARE(current, QStringLiteral("pinyin"));
+        scope.enter(true, backend);
+        current = QStringLiteral("manual-chinese");
+        scope.leave(true, backend);
+        QCOMPARE(current, QStringLiteral("manual-chinese"));
+        scope.enter(true, backend);
+        scope.leave(false, backend); // Never change another app's input source.
+        QCOMPARE(current, ascii);
+        selections.clear();
+        scope.enter(true, backend); // Already ASCII: no unnecessary selection.
+        scope.leave(true, backend);
+        QVERIFY(selections.isEmpty());
+        current = QStringLiteral("pinyin");
+        succeeds = false;
+        scope.enter(true, backend);
+        scope.leave(true, backend);
+        QCOMPARE(selections.size(), 1);
+        QCOMPARE(current, QStringLiteral("pinyin"));
+        selections.clear();
+        ascii.clear();
+        scope.enter(true, backend);
+        QVERIFY(selections.isEmpty());
+    }
+
+    void terminalNativeMarkedTextEscapeAndCommit()
+    {
+#ifdef Q_OS_MACOS
+        if (QApplication::platformName() != QStringLiteral("cocoa")) QSKIP("Requires native Cocoa text input");
+        noxshell::ui::TerminalView view;
+        view.resize(640, 260);
+        view.show();
+        view.activateWindow();
+        view.setFocus();
+        QVERIFY(QTest::qWaitForWindowActive(&view));
+        QSignalSpy input(&view, &noxshell::ui::TerminalView::inputGenerated);
+        const auto before = view.grab().toImage();
+        QVERIFY(nativeProbeTerminalMarkText(&view, QStringLiteral("pinyin")));
+        QCOMPARE(input.count(), 0);
+        QVERIFY(view.grab().toImage() != before);
+        QVERIFY(nativeProbeTerminalEscape(&view));
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.takeFirst().at(0).toByteArray(), QByteArray("\x1b"));
+        QCOMPARE(view.grab().toImage(), before);
+        QVERIFY(nativeProbeTerminalMarkText(&view, QStringLiteral("zhongwen")));
+        QVERIFY(nativeProbeTerminalCommitText(&view, QStringLiteral("中文")));
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.first().at(0).toByteArray(), QStringLiteral("中文").toUtf8());
+        input.clear();
+        // The native route must preserve Qt object filters: an open history
+        // panel consumes its first Esc; only the next Esc reaches the session.
+        class ConsumeEscape final : public QObject {
+            bool eventFilter(QObject *, QEvent *event) override {
+                return event->type() == QEvent::KeyPress
+                    && static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape;
+            }
+        } filter;
+        view.installEventFilter(&filter);
+        QVERIFY(nativeProbeTerminalEscape(&view));
+        QCOMPARE(input.count(), 0);
+        view.removeEventFilter(&filter);
+        QVERIFY(nativeProbeTerminalEscape(&view));
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.first().at(0).toByteArray(), QByteArray("\x1b"));
+#else
+        QSKIP("Requires macOS");
+#endif
     }
 
     void terminalViewReportsSubmittedCommandAfterEditing()
@@ -5497,6 +5783,9 @@ private slots:
 
 int main(int argc, char **argv)
 {
+    // Native probes exercise composition/Esc only; source policy uses a fake
+    // backend above, so tests never switch the user's real keyboard layout.
+    qputenv("NOXSHELL_DISABLE_TERMINAL_INPUT_SOURCE_SWITCHING", "1");
     noxshell::ui::Application app(argc, argv);
 #ifdef Q_OS_MACOS
     if (app.arguments().size() == 3 && app.arguments().at(1) == QStringLiteral("--silent-keychain-probe")) {

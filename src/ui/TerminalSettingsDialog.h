@@ -5,6 +5,7 @@
 #include <QDialog>
 
 class QDoubleSpinBox;
+class QCheckBox;
 class QFontComboBox;
 class QLabel;
 class QSpinBox;
@@ -20,7 +21,7 @@ public:
     [[nodiscard]] TerminalAppearance appearance() const;
 
 signals:
-    void appearancePreviewRequested(const QString &fontFamily, int pointSize, double lineSpacing);
+    void appearancePreviewRequested(const QString &fontFamily, int pointSize, double lineSpacing, bool autoEnglishInput);
 
 private:
     void refreshPreview();
@@ -29,6 +30,7 @@ private:
     QFontComboBox *m_fontFamily{};
     QSpinBox *m_fontSize{};
     QDoubleSpinBox *m_lineSpacing{};
+    QCheckBox *m_autoEnglishInput{};
     QLabel *m_preview{};
 };
 

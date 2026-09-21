@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.76 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.77 LANGUAGES CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -13,6 +13,9 @@ if(APPLE)
     set(NOXSHELL_MAC_SOURCES
         src/ui/MacTitleBarControls.h
         src/ui/MacTitleBarControls.mm
+        src/ui/MacTerminalInput.h
+        src/ui/MacTerminalInput.mm
+        src/ui/TerminalInputSourceScope.h
     )
     set(NOXSHELL_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/NoxShell.icns")
     set_source_files_properties("${NOXSHELL_APP_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
@@ -130,7 +133,7 @@ if(WIN32)
     target_link_libraries(NoxShell PRIVATE Advapi32 Ws2_32)
 endif()
 if(APPLE)
-    target_link_libraries(NoxShell PRIVATE "-framework Cocoa" "-framework Security")
+    target_link_libraries(NoxShell PRIVATE "-framework Cocoa" "-framework Security" "-framework Carbon")
 endif()
 
 include(CTest)
@@ -207,7 +210,7 @@ if(BUILD_TESTING)
     endif()
     if(APPLE)
         target_sources(NoxShellSmokeTest PRIVATE tests/MacLifecycleProbe.mm)
-        target_link_libraries(NoxShellSmokeTest PRIVATE "-framework Cocoa" "-framework Security")
+        target_link_libraries(NoxShellSmokeTest PRIVATE "-framework Cocoa" "-framework Security" "-framework Carbon")
     endif()
     add_test(NAME ui_smoke COMMAND NoxShellSmokeTest -v1)
     set_tests_properties(ui_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
