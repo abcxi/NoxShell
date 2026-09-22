@@ -4,21 +4,34 @@ set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/package-config.sh"
+noxshell_package_options "$@"
+if ((NOXSHELL_PACKAGE_HELP)); then
+    printf '%s\n' \
+        '用法：./script/package-release.sh [--local | --release]' \
+        '默认 --local：Release 优化构建、本地测试安装包，无证书时使用临时签名。' \
+        '--release：正式发布构建，macOS 必须配置 Developer ID 证书与 Team ID。' \
+        'macOS 最低版本默认根据 Qt 自动选择；可用 NOXSHELL_MACOS_DEPLOYMENT_TARGET 显式指定。' \
+        '两种模式都执行全量测试、依赖部署、完整性和启动检查；不会自动公证或上传。'
+    exit 0
+fi
 readonly VERSION="$(sed -nE 's/^project\(NoxShell VERSION ([0-9.]+).*/\1/p' "${PROJECT_DIR}/CMakeLists.txt")"
 readonly BUILD_DIR="${NOXSHELL_RELEASE_BUILD_DIR:-${PROJECT_DIR}/build-release}"
 readonly OUTPUT_DIR="${PROJECT_DIR}/output"
-readonly MACOS_DEPLOYMENT_TARGET="${NOXSHELL_MACOS_DEPLOYMENT_TARGET:-14.0}"
+MACOS_DEPLOYMENT_TARGET="${NOXSHELL_MACOS_DEPLOYMENT_TARGET:-14.0}"
 
 [[ -n "${VERSION}" ]] || { printf '无法读取项目版本。\n' >&2; exit 1; }
 if [[ "$(uname -s)" == Darwin ]]; then
     source "${SCRIPT_DIR}/macos-signing-config.sh"
     bash "${PROJECT_DIR}/tests/MacSigningConfigTest.sh"
-    # Fail before building rather than silently replacing the release identity.
-    noxshell_load_signing_config
-    if [[ "${NOXSHELL_SIGNING_MODE}" == developer-id ]]; then
-        bash "${SCRIPT_DIR}/test-macos-keychain-upgrade.sh"
-    fi
+    bash "${PROJECT_DIR}/tests/PackageConfigTest.sh"
+    noxshell_package_signing
+    readonly QT_PREFIX="${QT_ROOT:-$(brew --prefix qt)}"
+    export QT_ROOT="${QT_PREFIX}"
+    MACOS_DEPLOYMENT_TARGET="$(noxshell_qt_deployment_target "${QT_PREFIX}" "${NOXSHELL_MACOS_DEPLOYMENT_TARGET:-}")"
+    printf '根据构建依赖确认最低系统：macOS %s\n' "${MACOS_DEPLOYMENT_TARGET}"
 fi
+readonly MACOS_DEPLOYMENT_TARGET
 mkdir -p "${OUTPUT_DIR}"
 
 printf '构建并测试玄壳 v%s…\n' "${VERSION}"
@@ -40,7 +53,6 @@ case "$(uname -s)" in
     Darwin)
         readonly APP_PATH="${STAGE_DIR}/NoxShell.app"
         [[ -d "${APP_PATH}" ]] || { printf '安装阶段未生成应用包：%s\n' "${APP_PATH}" >&2; exit 1; }
-        readonly QT_PREFIX="${QT_ROOT:-$(brew --prefix qt)}"
         if [[ -x "${QT_PREFIX}/bin/qtpaths" ]]; then
             PLUGIN_ROOT="$("${QT_PREFIX}/bin/qtpaths" --plugin-dir)"
         elif [[ -x "${QT_PREFIX}/bin/qmake" ]]; then
@@ -70,6 +82,7 @@ case "$(uname -s)" in
         deploy_args=("${APP_PATH}" -no-plugins -always-overwrite -codesign=-)
         for plugin in "${local_plugins[@]}"; do deploy_args+=("-executable=${plugin}"); done
         "${QT_PREFIX}/bin/macdeployqt" "${deploy_args[@]}"
+        noxshell_check_bundle_minimum "${APP_PATH}" "${MACOS_DEPLOYMENT_TARGET}"
 
         readonly PLIST_PATH="${APP_PATH}/Contents/Info.plist"
         readonly BINARY_PATH="${APP_PATH}/Contents/MacOS/NoxShell"

@@ -58,7 +58,13 @@ ServerDialog::ServerDialog(QWidget *parent)
     layout->setContentsMargins(20, 18, 20, 16);
     layout->setSpacing(12);
 
-    auto *notice = new QLabel(QStringLiteral("服务器配置保存在 SQLite；密码和私钥口令写入 macOS Keychain，不会进入数据库。"));
+    auto *notice = new QLabel(QStringLiteral(
+#ifdef Q_OS_MACOS
+        "服务器配置保存在 SQLite；密码和私钥口令在 ~/.noxshell 本地加密保存，覆盖安装后继续使用。"
+#else
+        "服务器配置保存在 SQLite；密码和私钥口令写入系统凭据库，不会进入数据库。"
+#endif
+    ));
     notice->setObjectName(QStringLiteral("serverStorageNotice"));
     notice->setWordWrap(true);
     layout->addWidget(notice);
@@ -325,7 +331,7 @@ void ServerDialog::updatePasswordHint()
         return;
     }
     m_passwordHint->setText(m_editing
-        ? QStringLiteral("密码不会从 Keychain 回填；留空将沿用已保存密码。")
+        ? QStringLiteral("密码不会从凭据库回填；留空将沿用已保存密码。")
         : QStringLiteral("请输入 SSH 密码；仅转换本次输入，不改动已保存凭据。"));
 }
 
@@ -388,7 +394,7 @@ bool ServerDialog::prepareConnectionTestProfile(ServerProfile &candidate)
         candidate.keyPassphrase = storedSecret.keyPassphrase;
     }
 
-    // 测试必须使用窗口内当前输入，清空引用可避免 SshSession 用 Keychain 旧值覆盖它。
+    // 测试使用窗口内当前输入，避免 SshSession 用已存旧值覆盖它。
     candidate.credentialRef.clear();
     candidate.connectionMode = ConnectionMode::Ssh;
     candidate.state = ServerState::Offline;
@@ -412,7 +418,7 @@ void ServerDialog::testConnection()
     m_testButton->setEnabled(false);
     m_testButton->setText(QStringLiteral("测试中…"));
     const auto credentialSource = m_testUsesStoredPassword
-        ? QStringLiteral("Keychain 已保存密码")
+        ? QStringLiteral("凭据库已保存密码")
         : QStringLiteral("当前输入密码");
     m_testStatus->setText(QStringLiteral("正在测试 %1@%2:%3…（%4）")
         .arg(candidate.user, candidate.host).arg(candidate.port).arg(credentialSource));
@@ -465,7 +471,7 @@ void ServerDialog::testConnection()
             } else if (message.contains(QStringLiteral("失败")) || message.contains(QStringLiteral("阻断"))) {
                 auto displayMessage = message;
                 if (m_testUsesStoredPassword && message.contains(QStringLiteral("SSH 认证失败"))) {
-                    displayMessage += QStringLiteral("\n\n本次使用的是 Keychain 已保存密码。请在密码框重新输入其他客户端实际使用的密码后再测试；若其他客户端使用私钥，请切换认证方式。");
+                    displayMessage += QStringLiteral("\n\n本次使用的是凭据库已保存密码。请在密码框重新输入其他客户端实际使用的密码后再测试；若其他客户端使用私钥，请切换认证方式。");
                 }
                 finishTest(QStringLiteral("✕ 连接测试失败：%1").arg(displayMessage), QStringLiteral("#D54941"));
                 QMessageBox::critical(this, QStringLiteral("连接测试失败"), displayMessage);

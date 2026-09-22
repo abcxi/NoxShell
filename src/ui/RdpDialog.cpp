@@ -42,7 +42,11 @@ RdpDialog::RdpDialog(QWidget *parent)
     layout->setSpacing(12);
 
     auto *notice = new QLabel(QStringLiteral(
+#ifdef Q_OS_MACOS
+        "连接配置保存在 SQLite；Windows 密码在 ~/.noxshell 本地加密保存，覆盖安装后继续使用。"
+#else
         "连接配置保存在 SQLite；Windows 密码写入系统凭据库，不会进入数据库。"
+#endif
         "macOS 打开 Windows App 时会临时复制密码，便于在客户端粘贴。"));
     notice->setObjectName(QStringLiteral("serverStorageNotice"));
     notice->setWordWrap(true);

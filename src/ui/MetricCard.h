@@ -20,14 +20,20 @@ public:
     void setCoreValues(const QVector<double> &values);
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void changeEvent(QEvent *event) override;
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
     void applyProgressStyle();
     void rebuildCoreRows();
     void setCorePanelVisible(bool visible);
+    void updateDetailText();
+    QLabel *m_value{};
+    QLabel *m_detail{};
+    QString m_detailText;
     QProgressBar *m_progress{};
     QFrame *m_corePanel{};
     QGridLayout *m_coreLayout{};

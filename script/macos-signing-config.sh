@@ -17,14 +17,14 @@ noxshell_load_signing_config() {
         if [[ "${NOXSHELL_ALLOW_ADHOC_SIGNING:-0}" != 1 ]]; then
             printf '%s\n' \
                 '停止打包：未配置固定的 Developer ID Application 发布身份。' \
-                '临时签名/本地自签不能保证覆盖升级后继续读取 Keychain 密码。' \
+                '这是正式发布签名检查，不是编译错误；当前本地加密凭据不依赖应用签名。' \
                 '请设置证书 SHA-1（NOXSHELL_CODESIGN_IDENTITY）和 Apple Team ID（NOXSHELL_CODESIGN_TEAM_ID）。' \
-                '仅限开发测试时可显式设置 NOXSHELL_ALLOW_ADHOC_SIGNING=1；不能把该产物作为密码保持修复版。' >&2
+                '本地测试可显式设置 NOXSHELL_ALLOW_ADHOC_SIGNING=1；该产物未完成正式签名或公证。' >&2
             return 1
         fi
         NOXSHELL_SIGNING_MODE='adhoc-test'
         NOXSHELL_SIGN_ARGS=(--force --sign - --timestamp=none)
-        printf '警告：仅生成临时签名测试包；覆盖升级可能需要重新输入 SSH 密码。\n' >&2
+        printf '警告：仅生成临时签名测试包，未完成正式签名或公证。已保存到本地加密库的密码可跨版本使用；无法静默迁移的旧 Keychain 密码仍需补输一次。\n' >&2
         return 0
     fi
     if [[ ! "${identity}" =~ ^[[:xdigit:]]{40}$ || ! "${team}" =~ ^[A-Z0-9]{10}$ ]]; then

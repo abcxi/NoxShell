@@ -615,9 +615,10 @@ QWidget *MainWindow::createMetricStrip()
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto *content = new QWidget;
+    content->setObjectName(QStringLiteral("monitorScrollContent"));
     auto *layout = new QVBoxLayout(content);
     layout->setContentsMargins(10, 7, 10, 10);
-    layout->setSpacing(8);
+    layout->setSpacing(10);
 
     m_cpuCard = new MetricCard(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
     m_memoryCard = new MetricCard(QStringLiteral("内存"), QColor(QStringLiteral("#8B5CF6")));

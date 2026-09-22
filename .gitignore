@@ -9,3 +9,4 @@ output/*.msi
 output/*.zip
 output/*.tar.gz
 output/SHA256SUMS.txt
+output/*.sha256

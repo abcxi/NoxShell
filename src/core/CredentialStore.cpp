@@ -8,6 +8,7 @@
 #include <QStandardPaths>
 
 #ifdef Q_OS_MACOS
+#include "LocalCredentialVault.h"
 #include <Security/Security.h>
 #endif
 
@@ -175,43 +176,34 @@ bool readLinuxCredential(const QString &executable, const char *service, const Q
 CredentialStore::CredentialStore(QObject *parent)
     : QObject(parent)
 {
+#ifdef Q_OS_MACOS
+    m_vaultDirectory = LocalCredentialVault::defaultDirectory();
+    m_legacyReader = [](const QString &reference, QByteArray &payload, QString &error, bool &authorizationRequired) {
+        return readMacCredential(kServiceName, reference, payload, error, authorizationRequired);
+    };
+#endif
 }
+
+#ifdef Q_OS_MACOS
+CredentialStore::CredentialStore(QString vaultDirectory, QObject *parent) : CredentialStore(parent)
+{
+    m_vaultDirectory = std::move(vaultDirectory);
+}
+
+CredentialStore::CredentialStore(QString vaultDirectory, LegacyReader legacyReader, QObject *parent)
+    : QObject(parent), m_vaultDirectory(std::move(vaultDirectory)), m_legacyReader(std::move(legacyReader)) {}
+#endif
 
 bool CredentialStore::save(const QString &reference, const CredentialSecret &secret)
 {
     m_lastError.clear();
+    m_authorizationRequired = false;
     if (reference.trimmed().isEmpty()) {
         m_lastError = QStringLiteral("凭据引用不能为空");
         return false;
     }
 #ifdef Q_OS_MACOS
-    // Keep the existing service/account and payload format; do not migrate,
-    // delete or weaken ACLs. Never pass secrets in process arguments.
-    const MacCredentialInteraction interaction;
-    if (interaction.status() != errSecSuccess) {
-        m_lastError = macCredentialError(interaction.status());
-        return false;
-    }
-    MacCredentialQuery query(kServiceName, reference);
-    const auto payload = encodeSecret(secret);
-    const auto data = CFDataCreate(kCFAllocatorDefault,
-        reinterpret_cast<const UInt8 *>(payload.constData()), payload.size());
-    const void *keys[] = {kSecValueData};
-    const void *values[] = {data};
-    const auto attributes = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    auto status = SecItemUpdate(query.value, attributes);
-    if (status == errSecItemNotFound) {
-        CFDictionarySetValue(query.value, kSecValueData, data);
-        status = SecItemAdd(query.value, nullptr);
-    }
-    CFRelease(attributes);
-    CFRelease(data);
-    if (status != errSecSuccess) {
-        m_lastError = QStringLiteral("写入 macOS Keychain 失败：%1").arg(macCredentialError(status));
-        return false;
-    }
-    return true;
+    return LocalCredentialVault(m_vaultDirectory).save(reference, encodeSecret(secret), m_lastError);
 #elif defined(Q_OS_WIN)
     const auto target = QStringLiteral("%1/%2").arg(QString::fromLatin1(kServiceName), reference);
     const auto payload = encodeSecret(secret);
@@ -264,13 +256,36 @@ CredentialSecret CredentialStore::load(const QString &reference)
         return {};
     }
 #ifdef Q_OS_MACOS
-    QByteArray payload;
-    QString error;
-    if (!readMacCredential(kServiceName, reference, payload, error, m_authorizationRequired)) {
-        m_lastError = QStringLiteral("读取 macOS Keychain 失败：%1").arg(error);
+    LocalCredentialVault vault(m_vaultDirectory);
+    auto result = vault.load(reference);
+    if (result.status == LocalCredentialVault::Status::Missing && m_legacyReader) {
+        QByteArray payload;
+        QString error;
+        if (!m_legacyReader(reference, payload, error, m_authorizationRequired)) {
+            m_lastError = QStringLiteral("旧密码无法静默迁移，请重新输入一次 SSH 密码并勾选记住。%1").arg(error);
+            return {};
+        }
+        const auto doc = QJsonDocument::fromJson(QByteArray::fromBase64(payload));
+        if (!doc.isObject() || !doc.object().value("password").isString()
+            || !doc.object().value("keyPassphrase").isString()) {
+            m_lastError = QStringLiteral("旧凭据内容无效，未迁移");
+            return {};
+        }
+        // A concurrent save/delete wins over this migration. Re-read its result.
+        if (!vault.save(reference, payload, m_lastError, true)) return {};
+        result = vault.load(reference);
+    }
+    if (result.status != LocalCredentialVault::Status::Found) {
+        m_lastError = result.error.isEmpty() ? QStringLiteral("未找到已保存的本地凭据，请输入 SSH 密码") : result.error;
         return {};
     }
-    return decodeSecret(payload);
+    const auto doc = QJsonDocument::fromJson(QByteArray::fromBase64(result.payload));
+    if (!doc.isObject() || !doc.object().value("password").isString()
+        || !doc.object().value("keyPassphrase").isString()) {
+        m_lastError = QStringLiteral("本地凭据内容格式无效");
+        return {};
+    }
+    return decodeSecret(result.payload);
 #elif defined(Q_OS_WIN)
     QByteArray payload;
     DWORD error = ERROR_SUCCESS;
@@ -302,20 +317,10 @@ CredentialSecret CredentialStore::load(const QString &reference)
 bool CredentialStore::remove(const QString &reference)
 {
     m_lastError.clear();
+    m_authorizationRequired = false;
     if (reference.trimmed().isEmpty()) return true;
 #ifdef Q_OS_MACOS
-    const MacCredentialInteraction interaction;
-    if (interaction.status() != errSecSuccess) {
-        m_lastError = macCredentialError(interaction.status());
-        return false;
-    }
-    MacCredentialQuery query(kServiceName, reference);
-    const auto status = SecItemDelete(query.value);
-    if (status != errSecSuccess && status != errSecItemNotFound) {
-        m_lastError = QStringLiteral("删除 macOS Keychain 凭据失败：%1").arg(macCredentialError(status));
-        return false;
-    }
-    return true;
+    return LocalCredentialVault(m_vaultDirectory).remove(reference, m_lastError);
 #elif defined(Q_OS_WIN)
     const auto target = QStringLiteral("%1/%2").arg(QString::fromLatin1(kServiceName), reference);
     if (!CredDeleteW(reinterpret_cast<const wchar_t *>(target.utf16()), CRED_TYPE_GENERIC, 0)) {

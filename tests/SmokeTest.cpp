@@ -18,6 +18,7 @@
 #include "../src/ui/HostSidebar.h"
 #include "../src/ui/MainWindow.h"
 #include "../src/ui/MetricCard.h"
+#include "../src/ui/NetworkRateChart.h"
 #include "../src/ui/RemoteFileEditor.h"
 #include "../src/ui/RemotePathEdit.h"
 #include "../src/ui/RdpDialog.h"
@@ -66,6 +67,7 @@
 #include <QProcess>
 #include <QRadioButton>
 #include <QScrollBar>
+#include <QScrollArea>
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSqlDatabase>
@@ -623,13 +625,12 @@ private slots:
         QCOMPARE(view.searchMatchCount(), 0);
     }
 
-    void nativeCredentialRoundTripWithSyntheticEntryOnly()
+    void localCredentialRoundTripWithSyntheticEntryOnly()
     {
 #ifdef Q_OS_MACOS
-        if (!qEnvironmentVariableIsSet("NOXSHELL_TEST_NATIVE_KEYCHAIN")) {
-            QSKIP("Native Keychain test is opt-in and uses one unique synthetic entry only");
-        }
-        noxshell::CredentialStore store;
+        QTemporaryDir vaultDirectory;
+        QVERIFY(vaultDirectory.isValid());
+        noxshell::CredentialStore store(vaultDirectory.path(), noxshell::CredentialStore::LegacyReader{}, nullptr);
         const auto reference = QStringLiteral("noxshell-test-owned-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
         const auto cleanup = qScopeGuard([&] { store.remove(reference); });
         // Each step runs in a fresh bounded process: verifies storage across app
@@ -637,17 +638,17 @@ private slots:
         for (const auto &operation : {"create", "read", "read", "read", "update", "read-updated", "delete", "delete"}) {
             QProcess probe;
             probe.start(QCoreApplication::applicationFilePath(),
-                {QStringLiteral("--owned-keychain-probe"), reference, QString::fromLatin1(operation)});
+                {QStringLiteral("--owned-vault-probe"), reference, QString::fromLatin1(operation), vaultDirectory.path()});
             if (!probe.waitForFinished(5000)) {
                 probe.kill();
                 probe.waitForFinished(1000);
-                QFAIL("Silent native Keychain operation exceeded five seconds");
+                QFAIL("Local vault operation exceeded five seconds");
             }
             QCOMPARE(probe.exitStatus(), QProcess::NormalExit);
             QVERIFY2(probe.exitCode() == 0, qPrintable(QStringLiteral("%1: exit %2").arg(QString::fromLatin1(operation)).arg(probe.exitCode())));
         }
 #else
-        QSKIP("macOS-only native Keychain backend");
+        QSKIP("macOS-only local credential backend");
 #endif
     }
 
@@ -686,8 +687,10 @@ private slots:
         // A separate bounded process catches accidental dialogs/hangs without
         // blocking the test runner or skipping cleanup of the synthetic item.
         QProcess probe;
+        QTemporaryDir vaultDirectory;
+        QVERIFY(vaultDirectory.isValid());
         probe.start(QCoreApplication::applicationFilePath(),
-            {QStringLiteral("--silent-keychain-probe"), reference});
+            {QStringLiteral("--silent-keychain-probe"), reference, vaultDirectory.path()});
         if (!probe.waitForFinished(5000)) {
             probe.kill();
             probe.waitForFinished(1000);
@@ -695,7 +698,7 @@ private slots:
         }
         QCOMPARE(probe.exitStatus(), QProcess::NormalExit);
         QCOMPARE(probe.exitCode(), 0);
-        noxshell::CredentialStore store;
+        noxshell::CredentialStore store(vaultDirectory.filePath(QStringLiteral("missing")), nullptr);
         runSecurity({QStringLiteral("delete-generic-password"), QStringLiteral("-s"),
             QStringLiteral("com.noxshell.ops.ssh"), QStringLiteral("-a"), reference});
         QVERIFY(store.load(reference).password.isEmpty());
@@ -1306,8 +1309,9 @@ private slots:
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
         const auto database = directory.filePath(QStringLiteral("settings.sqlite"));
+        MemoryCredentialStore credentials;
         {
-            noxshell::ui::MainWindow window(database);
+            noxshell::ui::MainWindow window(database, nullptr, &credentials);
             auto *button = window.findChild<QToolButton *>(QStringLiteral("terminalSettingsButton"));
             QVERIFY(button);
             bool found = false;
@@ -1334,7 +1338,7 @@ private slots:
             QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
         }
         noxshell::ui::TerminalView::setDefaultAppearance(original);
-        noxshell::ui::MainWindow reopened(database);
+        noxshell::ui::MainWindow reopened(database, nullptr, &credentials);
         QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
     }
 
@@ -2203,7 +2207,7 @@ private slots:
     void metricCardUsesThinTrackAndExpandsCpuCoresOnHover()
     {
         noxshell::ui::MetricCard card(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
-        card.resize(220, 38);
+        card.resize(220, 44);
         card.setValue(QStringLiteral("36.3%"), QStringLiteral("内核态 15.8%"), 36);
         card.setCoreValues({12.0, 34.0, 56.0, 78.0});
         card.show();
@@ -2213,9 +2217,24 @@ private slots:
         auto *corePanel = card.findChild<QFrame *>(QStringLiteral("metricCorePanel"));
         QVERIFY(summaryProgress);
         QVERIFY(corePanel);
-        QCOMPARE(summaryProgress->height(), 24);
+        QCOMPARE(summaryProgress->height(), 4);
+        QVERIFY(!summaryProgress->isTextVisible());
+        auto *value = card.findChild<QLabel *>(QStringLiteral("metricValue"));
+        auto *detail = card.findChild<QLabel *>(QStringLiteral("metricDetail"));
+        auto *title = card.findChild<QLabel *>(QStringLiteral("metricTitle"));
+        QVERIFY(value);
+        QVERIFY(detail);
+        QVERIFY(title);
+        QCOMPARE(value->text(), QStringLiteral("36.3%"));
+        QCOMPARE(detail->text(), QStringLiteral("内核态 15.8%"));
+        QCOMPARE(title->geometry().center().y(), detail->geometry().center().y());
+        QCOMPARE(value->geometry().center().y(), detail->geometry().center().y());
+        QVERIFY(title->geometry().right() < detail->geometry().left());
+        QVERIFY(detail->geometry().right() < value->geometry().left());
+        QVERIFY(detail->alignment() & Qt::AlignLeft);
+        QVERIFY(detail->geometry().bottom() < summaryProgress->geometry().top());
         QVERIFY(summaryProgress->format().contains(QStringLiteral("36.3%")));
-        QVERIFY(summaryProgress->styleSheet().contains(QStringLiteral("stop:0.39")));
+        QVERIFY(summaryProgress->styleSheet().contains(QStringLiteral("border-radius:2px")));
         QEvent initialLeaveEvent(QEvent::Leave);
         QApplication::sendEvent(&card, &initialLeaveEvent);
         QVERIFY(!corePanel->isVisible());
@@ -2223,7 +2242,7 @@ private slots:
         QEnterEvent enterEvent(QPointF(10, 10), QPointF(10, 10), QPointF(10, 10));
         QApplication::sendEvent(&card, &enterEvent);
         QVERIFY(corePanel->isVisible());
-        QVERIFY(card.height() > 38);
+        QVERIFY(card.height() > 44);
         const auto coreProgresses = corePanel->findChildren<QProgressBar *>(QStringLiteral("metricCoreProgress"));
         QCOMPARE(coreProgresses.size(), 4);
         for (int index = 1; index < coreProgresses.size(); ++index) {
@@ -2245,7 +2264,24 @@ private slots:
         QEvent leaveEvent(QEvent::Leave);
         QApplication::sendEvent(&card, &leaveEvent);
         QVERIFY(!corePanel->isVisible());
-        QCOMPARE(card.height(), 38);
+        QCOMPARE(card.height(), 44);
+
+        // A changing numeric value must reallocate inline detail space even
+        // when the card width stays unchanged between live samples.
+        const auto longDetail = QStringLiteral("内核态 99.9% · 较长说明用于验证省略");
+        const int cardWidth = card.width();
+        card.setValue(QStringLiteral("100.0%"), longDetail, 100);
+        QCoreApplication::processEvents();
+        const int narrowDetailWidth = detail->width();
+        QCOMPARE(detail->toolTip(), longDetail);
+        QVERIFY(detail->fontMetrics().horizontalAdvance(detail->text()) <= detail->width());
+        QVERIFY(detail->geometry().right() < value->geometry().left());
+        card.setValue(QStringLiteral("1%"), longDetail, 1);
+        QCoreApplication::processEvents();
+        QCOMPARE(card.width(), cardWidth);
+        QVERIFY(detail->width() > narrowDetailWidth);
+        QVERIFY(detail->fontMetrics().horizontalAdvance(detail->text()) <= detail->width());
+        QCOMPARE(value->text(), QStringLiteral("1%"));
     }
 
     void parsesLinuxMetricsAndCalculatesCpuDelta()
@@ -2382,7 +2418,7 @@ private slots:
         QVERIFY(panel.findChild<QFrame *>(QStringLiteral("fileSystemSectionCard")));
         QCOMPARE(interfaces->count(), 3);
         QCOMPARE(interfaces->currentText(), QStringLiteral("全部网卡"));
-        QVERIFY(interfaces->width() >= 112);
+        QVERIFY(interfaces->width() >= 100);
         QVERIFY(upload->text().contains(QStringLiteral("33.0 KB/s")));
         QVERIFY(panel.findChild<QWidget *>(QStringLiteral("networkRateChart")));
         interfaces->setCurrentIndex(interfaces->findData(QStringLiteral("eth0")));
@@ -2394,6 +2430,129 @@ private slots:
         QCOMPARE(fileSystems->topLevelItem(0)->text(0), QStringLiteral("/"));
         QCOMPARE(fileSystems->verticalScrollBarPolicy(), Qt::ScrollBarAlwaysOff);
         QVERIFY(fileSystems->height() >= 24 + fileSystems->topLevelItemCount() * 21);
+    }
+
+    void networkChartUsesTimeWindowAndKeepsSamplesUnchanged()
+    {
+        noxshell::ui::SystemDetailPanel panel;
+        auto *widget = panel.findChild<QWidget *>(QStringLiteral("networkRateChart"));
+        auto *chart = static_cast<noxshell::ui::NetworkRateChart *>(widget);
+        QVERIFY(chart);
+        noxshell::MetricSample sample;
+        const auto start = QDateTime::fromMSecsSinceEpoch(100000);
+        for (int i = 0; i <= 20; ++i) {
+            sample.capturedAt = start.addSecs(i * 5);
+            sample.networkRates = {{QStringLiteral("eth0"), 1000.0 + i, 2000.0 + i}};
+            panel.setSample(sample);
+        }
+        QCOMPARE(chart->rates().size(), 13); // 60 seconds, not 60 samples (300 seconds).
+        QCOMPARE(chart->rates().first().timestampMs, sample.capturedAt.addSecs(-60).toMSecsSinceEpoch());
+        QCOMPARE(chart->rates().last().upload, 2020.0);
+        panel.setSample(sample);
+        QCOMPARE(chart->rates().size(), 13); // Repainting the same sample must not append a point.
+        sample.capturedAt = start;
+        panel.setSample(sample);
+        QCOMPARE(chart->rates().size(), 1); // Clock/reset going backwards does not draw backwards.
+        panel.reset(QStringLiteral("未连接"));
+        QVERIFY(chart->rates().isEmpty());
+
+        chart->resize(236, 92);
+        chart->setRates({{100000, 100, 80}, {120000, 900, 500}, {140000, 200, 100}, {160000, 1200, 900}}, 160000);
+        QCOMPARE(chart->rates().at(1).upload, 900.0); // No numeric smoothing or peak loss.
+        const auto rendered = chart->grab().toImage();
+        int coloredPixels = 0;
+        for (int y = 8; y < 72; ++y) for (int x = 49; x < 226; ++x) {
+            const auto color = rendered.pixelColor(x, y);
+            if (color.blue() > color.red() + 45 || color.green() > color.red() + 45) ++coloredPixels;
+        }
+        QVERIFY(coloredPixels > 200); // A connected curve, not just one end marker.
+    }
+
+    void monitorRailVisualLayout_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::addColumn<int>("railWidth");
+        for (const bool dark : {false, true}) for (const int width : {236, 252, 360})
+            QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(dark ? "dark" : "light").arg(width))) << dark << width;
+    }
+
+    void monitorRailVisualLayout()
+    {
+        QFETCH(bool, dark);
+        QFETCH(int, railWidth);
+        const auto previous = noxshell::ui::isApplicationDarkTheme();
+        auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previous
+            ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light); });
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("preview.sqlite")), nullptr, &credentials);
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        window.resize(1000, 1000);
+        auto *rail = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
+        QVERIFY(rail);
+        rail->setFixedWidth(railWidth);
+        window.findChild<QLabel *>(QStringLiteral("serverAddress"))->setText(QStringLiteral("203.0.113.8"));
+        window.findChild<QLabel *>(QStringLiteral("monitorUptimeValue"))->setText(QStringLiteral("704 天 23 小时"));
+        auto *summary = window.findChild<QFrame *>(QStringLiteral("monitorMetricSummary"));
+        auto rows = summary->findChildren<noxshell::ui::MetricCard *>(QStringLiteral("metricRow"), Qt::FindDirectChildrenOnly);
+        QCOMPARE(rows.size(), 3);
+        rows[0]->setValue(QStringLiteral("19.1%"), QStringLiteral("内核态 2.0%"), 19);
+        rows[1]->setValue(QStringLiteral("25.9%"), QStringLiteral("0.5 / 2.0 GiB"), 26);
+        rows[2]->setValue(QStringLiteral("0.15"), QStringLiteral("1m / 1 核 · 5m 0.17"), 15);
+        auto *panel = window.findChild<noxshell::ui::SystemDetailPanel *>();
+        noxshell::MetricSample sample;
+        const auto start = QDateTime::fromMSecsSinceEpoch(100000);
+        sample.processes = {
+            {20790, "root", 3.0, 2.0, 1024, "sshd"}, {22046, "root", 1.5, 4.0, 2048, "worker"},
+            {22038, "root", 0.5, 1.0, 1024, "nginx"}, {22035, "root", 0.4, 1.0, 1024, "cache"}};
+        for (const auto &path : {"/", "/dev", "/dev/shm", "/run", "/run/user/0", "/sys/fs/cgroup"})
+            sample.disks.append({"ext4", QString::fromLatin1(path), 40ULL << 30, 3ULL << 30, 37ULL << 30, 8});
+        for (int i = 0; i <= 60; ++i) {
+            sample.capturedAt = start.addSecs(i);
+            const double peak = i % 15 == 0 ? 50000 : 0;
+            sample.networkRates = {{"eth0", 10000.0 + (i % 12) * 3000 + peak, 8000.0 + (i % 9) * 2400 + peak}};
+            panel->setSample(sample);
+        }
+        window.show();
+        QTest::qWait(25);
+        for (auto *row : rows) {
+            auto *detail = row->findChild<QLabel *>(QStringLiteral("metricDetail"));
+            auto *title = row->findChild<QLabel *>(QStringLiteral("metricTitle"));
+            auto *value = row->findChild<QLabel *>(QStringLiteral("metricValue"));
+            auto *progress = row->findChild<QProgressBar *>(QStringLiteral("metricProgress"));
+            QCOMPARE(row->height(), 44);
+            QCOMPARE(title->geometry().center().y(), detail->geometry().center().y());
+            QCOMPARE(value->geometry().center().y(), detail->geometry().center().y());
+            QVERIFY(title->geometry().right() < detail->geometry().left());
+            QVERIFY(detail->geometry().right() < value->geometry().left());
+            QVERIFY(value->width() >= value->sizeHint().width());
+            QVERIFY(detail->fontMetrics().horizontalAdvance(detail->text()) <= detail->width());
+            QVERIFY(detail->geometry().bottom() < progress->geometry().top());
+            QVERIFY(progress->width() > 120);
+        }
+        const auto *network = panel->findChild<QFrame *>(QStringLiteral("networkSectionCard"));
+        QVERIFY(panel->findChildren<QLabel *>(QStringLiteral("networkRateCaption")).isEmpty());
+        const auto *upload = panel->findChild<QLabel *>(QStringLiteral("networkUploadRate"));
+        const auto *download = panel->findChild<QLabel *>(QStringLiteral("networkDownloadRate"));
+        QCOMPARE(upload->y(), download->y());
+        QCOMPARE(upload->parentWidget(), download->parentWidget());
+        QVERIFY(upload->parentWidget()->height() <= 24);
+        QCOMPARE(upload->accessibleName(), QStringLiteral("上传速率"));
+        QCOMPARE(download->accessibleName(), QStringLiteral("下载速率"));
+        const auto *processes = panel->findChild<QTreeWidget *>(QStringLiteral("realtimeProcessList"));
+        QCOMPARE(network->mapTo(rail, QPoint()).x(), summary->mapTo(rail, QPoint()).x());
+        QCOMPARE(network->width(), summary->width());
+        QVERIFY(processes->columnWidth(0) >= 60);
+        QVERIFY(processes->topLevelItem(0)->textAlignment(1) & Qt::AlignRight);
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_MONITOR_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) QVERIFY(rail->grab().save(QDir(screenshots).filePath(
+            QStringLiteral("monitor-%1-%2.png").arg(dark ? "dark" : "light").arg(railWidth))));
+        rows[0]->setValue(QStringLiteral("--"), QStringLiteral("等待连接：这是一段用于验证窄窗口省略与提示的较长状态说明").repeated(3), 0);
+        QCoreApplication::processEvents();
+        auto *detail = rows[0]->findChild<QLabel *>(QStringLiteral("metricDetail"));
+        QVERIFY(detail->text().size() < detail->toolTip().size());
+        QVERIFY(rows[0]->width() <= railWidth);
     }
 
     void parsesLegacyMemoryAvailabilityFallback()
@@ -4330,7 +4489,8 @@ private slots:
             QVERIFY(repository.recordSuccessfulLogin(servers.at(0).id, QDateTime::currentDateTime().addSecs(-120)));
             QVERIFY(repository.recordSuccessfulLogin(servers.at(2).id, QDateTime::currentDateTime().addSecs(-30)));
         }
-        noxshell::ui::MainWindow window(databasePath);
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(databasePath, nullptr, &credentials);
         window.show();
         QTest::qWait(50);
         QVERIFY(window.isVisible());
@@ -4485,24 +4645,24 @@ private slots:
             QStringLiteral("metricRow"), Qt::FindDirectChildrenOnly);
         QCOMPARE(metricRows.size(), 3);
         for (auto *metricRow : metricRows) {
-            QCOMPARE(metricRow->height(), 38);
+            QCOMPARE(metricRow->height(), 44);
             auto *progress = metricRow->findChild<QProgressBar *>();
             QVERIFY(progress);
             QCOMPARE(progress->orientation(), Qt::Horizontal);
-            QCOMPARE(progress->height(), 24);
-            QVERIFY(progress->isTextVisible());
+            QCOMPARE(progress->height(), 4);
+            QVERIFY(!progress->isTextVisible());
         }
         metricRows.at(0)->setCoreValues({12.0, 34.0, 56.0, 78.0});
         QEnterEvent metricEnterEvent(QPointF(10, 10), QPointF(10, 10), QPointF(10, 10));
         QApplication::sendEvent(metricRows.at(0), &metricEnterEvent);
         QCoreApplication::processEvents();
-        QVERIFY(metricRows.at(0)->height() > 38);
+        QVERIFY(metricRows.at(0)->height() > 44);
         QVERIFY(metricRows.at(0)->geometry().bottom() < metricRows.at(1)->geometry().top());
         QVERIFY(metricRows.at(1)->geometry().bottom() < metricRows.at(2)->geometry().top());
         QEvent metricLeaveEvent(QEvent::Leave);
         QApplication::sendEvent(metricRows.at(0), &metricLeaveEvent);
         QCoreApplication::processEvents();
-        QCOMPARE(metricRows.at(0)->height(), 38);
+        QCOMPARE(metricRows.at(0)->height(), 44);
         QVERIFY(monitorDetails->isVisible());
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 0);
         QVERIFY(!window.findChild<QComboBox *>(QStringLiteral("historyRange")));
@@ -5373,6 +5533,72 @@ private slots:
         QCOMPARE(workspace.sessionCount(), 0);
     }
 
+    void localRememberedCredentialSurvivesRepositoryAndSessionRestart()
+    {
+#ifdef Q_OS_MACOS
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto database = directory.filePath(QStringLiteral("local-restart.sqlite3"));
+        const auto vault = directory.filePath(QStringLiteral("vault"));
+        const auto password = QStringLiteral("synthetic-upgrade-once");
+        QString savedReference;
+        {
+            noxshell::ServerRepository repository(database, false);
+            QVERIFY(repository.initialize());
+            noxshell::CredentialStore credentials(vault, noxshell::CredentialStore::LegacyReader{}, nullptr);
+            noxshell::ServerProfile profile;
+            profile.id = QStringLiteral("local-restart");
+            profile.name = profile.id;
+            profile.host = QStringLiteral("192.0.2.10");
+            profile.user = QStringLiteral("test");
+            profile.connectionMode = noxshell::ConnectionMode::Ssh;
+            profile.credentialRef = QStringLiteral("old-unreadable-reference");
+            QVERIFY(repository.saveServer(profile));
+            noxshell::SshSession session(&repository, &credentials);
+            QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+            QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+            QSignalSpy prompts(&session, &noxshell::SshSession::passwordRequired);
+            QSignalSpy notices(&session, &noxshell::SshSession::credentialSaveNotice);
+            session.connectTo(profile);
+            QCOMPARE(prompts.size(), 1);
+            session.connectWithPassword(password, true);
+            QCOMPARE(requests.size(), 1);
+            // Simulated authentication result; transport is disconnected above.
+            const auto generation = requests.last().at(1).toULongLong();
+            QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+                Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("SSH 已连接")), Q_ARG(quint64, generation)));
+            QCOMPARE(notices.size(), 0);
+            savedReference = repository.loadServers().first().credentialRef;
+            QVERIFY(savedReference != profile.credentialRef);
+            QCOMPARE(credentials.load(savedReference).password, password);
+        }
+        // No shared store/session/repository objects and no cached password.
+        for (int restart = 0; restart < 2; ++restart) {
+            noxshell::ServerRepository repository(database, false);
+            QVERIFY(repository.initialize());
+            int legacyCalls = 0;
+            noxshell::CredentialStore credentials(vault, [&](const QString &, QByteArray &, QString &, bool &) { ++legacyCalls; return false; });
+            const auto profile = repository.loadServers().first();
+            QCOMPARE(profile.credentialRef, savedReference);
+            QVERIFY(profile.password.isEmpty());
+            noxshell::SshSession session(&repository, &credentials);
+            QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+            QSignalSpy requests(&session, &noxshell::SshSession::connectRequested);
+            QSignalSpy prompts(&session, &noxshell::SshSession::passwordRequired);
+            session.connectTo(profile);
+            QCOMPARE(prompts.size(), 0);
+            QCOMPARE(legacyCalls, 0);
+            QCOMPARE(requests.size(), 1);
+            QCOMPARE(qvariant_cast<noxshell::ServerProfile>(requests.first().at(0)).password, password);
+        }
+        QFile databaseFile(database);
+        QVERIFY(databaseFile.open(QIODevice::ReadOnly));
+        QVERIFY(!databaseFile.readAll().contains(password.toUtf8()));
+#else
+        QSKIP("macOS-only local credential backend");
+#endif
+    }
+
     void credentialFailureIsVisibleAndCanBeRetried()
     {
         MemoryCredentialStore credentials;
@@ -5659,7 +5885,7 @@ private slots:
         QVERIFY(directory.isValid());
         noxshell::ServerRepository repository(directory.filePath(QStringLiteral("dialog-test.sqlite3")), false);
         QVERIFY(repository.initialize());
-        noxshell::CredentialStore credentialStore;
+        MemoryCredentialStore credentialStore;
 
         noxshell::ui::ServerDialog addDialog;
         auto *addTestButton = addDialog.findChild<QPushButton *>(QStringLiteral("dialogTestConnectionButton"));
@@ -5776,7 +6002,7 @@ private slots:
         QVERIFY(fingerprintEditor->text().isEmpty());
         QVERIFY(editDialog.profile().expectedFingerprint.isEmpty());
         QVERIFY(fingerprintEditor->placeholderText().contains(QStringLiteral("重新确认")));
-        QVERIFY(editDialog.findChild<QLabel *>(QStringLiteral("passwordSourceHint"))->text().contains(QStringLiteral("Keychain")));
+        QVERIFY(editDialog.findChild<QLabel *>(QStringLiteral("passwordSourceHint"))->text().contains(QStringLiteral("凭据库")));
         QCOMPARE(editDialog.findChild<QPushButton *>(QStringLiteral("primaryButton"))->text(), QStringLiteral("保存修改"));
     }
 };
@@ -5788,13 +6014,13 @@ int main(int argc, char **argv)
     qputenv("NOXSHELL_DISABLE_TERMINAL_INPUT_SOURCE_SWITCHING", "1");
     noxshell::ui::Application app(argc, argv);
 #ifdef Q_OS_MACOS
-    if (app.arguments().size() == 3 && app.arguments().at(1) == QStringLiteral("--silent-keychain-probe")) {
+    if (app.arguments().size() == 4 && app.arguments().at(1) == QStringLiteral("--silent-keychain-probe")) {
         const auto reference = app.arguments().at(2);
         if (!reference.startsWith(QStringLiteral("noxshell-test-legacy-"))
             || QUuid(reference.mid(21)).isNull()) return 2;
         Boolean before = false;
         if (SecKeychainGetUserInteractionAllowed(&before) != errSecSuccess || !before) return 3;
-        noxshell::CredentialStore store;
+        noxshell::CredentialStore store(app.arguments().at(3), nullptr);
         QElapsedTimer elapsed;
         elapsed.start();
         for (int attempt = 0; attempt < 3; ++attempt) {
@@ -5811,12 +6037,12 @@ int main(int argc, char **argv)
         if (SecKeychainGetUserInteractionAllowed(&after) != errSecSuccess || after != before) return 8;
         return elapsed.elapsed() < 2000 ? 0 : 6;
     }
-    if (app.arguments().size() == 4 && app.arguments().at(1) == QStringLiteral("--owned-keychain-probe")) {
+    if (app.arguments().size() == 5 && app.arguments().at(1) == QStringLiteral("--owned-vault-probe")) {
         const auto reference = app.arguments().at(2);
         if (!reference.startsWith(QStringLiteral("noxshell-test-owned-")) || QUuid(reference.mid(20)).isNull()) return 2;
         Boolean before = false;
         if (SecKeychainGetUserInteractionAllowed(&before) != errSecSuccess || !before) return 3;
-        noxshell::CredentialStore store;
+        noxshell::CredentialStore store(app.arguments().at(4), noxshell::CredentialStore::LegacyReader{}, nullptr);
         const auto operation = app.arguments().at(3);
         const auto password = QStringLiteral(" synthetic \"你好\" $(); ");
         const auto passphrase = QStringLiteral("synthetic-passphrase");

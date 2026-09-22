@@ -27,7 +27,7 @@
 
 ![玄壳 SSH 运维工作区](docs/images/noxshell-workspace.png)
 
-> 截图使用本地演示会话生成，不包含真实服务器凭据。当前源码版本：`v0.2.77`（本地测试版本，尚未发布；已发布版本以 Releases 为准）。
+> 截图使用本地演示会话生成，不包含真实服务器凭据。当前源码版本：`v0.2.79`（本地测试版本，尚未发布；已发布版本以 Releases 为准）。
 
 本轮的采样频率、安全措施和已知边界见 [性能与安全说明](docs/PERFORMANCE_AND_SAFETY.md)。
 
@@ -35,7 +35,7 @@
 
 | 一站式运维 | 原生桌面体验 | 会话互不干扰 | 安全保存凭据 |
 | --- | --- | --- | --- |
-| 终端、监控、文件和编辑器同屏协作 | C++20 + Qt 6，界面紧凑、启动迅速 | 每个标签拥有独立 SSH 连接与配置快照 | 密码和私钥口令进入系统凭据库，不写入 SQLite |
+| 终端、监控、文件和编辑器同屏协作 | C++20 + Qt 6，界面紧凑、启动迅速 | 每个标签拥有独立 SSH 连接与配置快照 | 密码和私钥口令加密保存，不写入主机 SQLite |
 
 玄壳适合需要同时管理 Linux 服务器和 Windows 电脑、频繁查看资源状态、编辑配置文件和传输文件的开发与运维人员。它不试图把功能藏进层层页面，而是把最常用的操作放在一个可拖动、可收起的工作区内。
 
@@ -54,7 +54,7 @@
 - 新建连接时可选择 SSH 终端或 Windows 远程桌面，并在同一主机列表中分组、搜索、复制和编辑。
 - 支持自定义 RDP 端口和 `Administrator`、`DOMAIN\\user` 等 Windows 用户名。
 - Windows 调用系统自带的 `mstsc`；macOS 生成临时 `.rdp` 配置并调用已安装的 Microsoft Windows App。
-- Windows 密码保存在 macOS Keychain 或 Windows Credential Manager，不进入 SQLite、`.rdp` 文件或进程参数；macOS 连接时临时复制到剪贴板并在 60 秒后清除。
+- Windows 密码保存在 macOS 本地加密库或 Windows Credential Manager，不进入主机 SQLite、`.rdp` 文件或进程参数；macOS 连接时临时复制到剪贴板并在 60 秒后清除。
 - RDP 主机会显示独立协议标识；双击或右键“打开远程桌面”即可启动。
 
 ### SSH 终端
@@ -109,8 +109,8 @@
 - 已知主机指纹严格绑定 `IP/域名:端口`，目标变化时不会错误复用旧指纹。
 - 支持密码、私钥、SSH Agent，以及自动协商 `keyboard-interactive` / `password` 认证。
 - 密码/私钥口令输入框使用英文半角：常见中文及全角标点自动转换，汉字等非英文字符会拦截并提示；显示密码、粘贴及连接失败后补填的规则一致。只处理新输入，已保存凭据不变。
-- 密码和私钥口令分别保存在 macOS Keychain 或 Windows Credential Manager；SQLite 只保存凭据引用。
-- RDP 地址、端口、用户名和分组保存在 SQLite；密码只进入系统凭据库。
+- macOS 密码和私钥口令保存在固定 `~/.noxshell` 本地加密库，覆盖安装保留；Windows 使用 Credential Manager，Linux 使用 Secret Service。SQLite 只保存凭据引用。
+- RDP 地址、端口、用户名和分组保存在 SQLite；密码进入对应平台的加密凭据库。
 
 ## 下载
 
@@ -140,9 +140,9 @@
 
 - 服务器配置、监控历史、告警、传输状态和 `known_hosts` 记录保存在 Qt SQLite 数据库。
 - 数据库默认位于系统应用数据目录，文件名为 `noxshell-ops.sqlite3`。
-- 系统凭据服务名为 `com.noxshell.ops.ssh`，密码与私钥口令不会写入数据库。
-- macOS 凭据读写及删除均不弹系统授权框。旧密码无法读取时，在终端内填写 SSH 密码；勾选记住后，仅在连接成功时新建系统加密条目并更新引用，不修改旧条目的权限。若加密存储不可写，本次 SSH 连接仍可继续，但密码不会被记住。
-- 覆盖升级后的密码保持还依赖稳定的正式签名。正式打包现要求固定 Apple Developer ID 团队并通过跨构建 Keychain 测试，缺失身份时停止；临时签名及本地自签不能保证这一点。旧临时签名条目切换身份后可能仍需重输一次 SSH 密码。配置与测试见 [发布检查清单](docs/RELEASE.md)。
+- macOS 使用 `~/.noxshell/credentials.enc` 与随机 `master.key`，AES-256-GCM 加密、目录 0700、文件 0600。普通覆盖安装不依赖签名身份即可复用；删除用户数据或丢失密钥不能恢复密码。
+- 旧服务 `com.noxshell.ops.ssh` 仅供按需静默迁移；不可读旧密码需要补输一次并记住，不弹系统授权框。新保存不再写入 Keychain。连接成功但保存失败会明确提示，不假称已经记住。
+- 本地密钥与密文同属当前用户，能同时读取两者的程序可解密，安全隔离弱于 Keychain。使用前请了解[安全边界与备份说明](docs/LOCAL_CREDENTIALS.md)。正式签名、公证与首次安装安全提示仍独立存在，见[发布检查清单](docs/RELEASE.md)。
 - 日志位于应用数据目录的 `logs/noxshell-ops.log`，单文件 5 MiB 后轮换并保留 3 份。
 - 日志会对常见密码、口令、令牌和 Authorization 字段进行脱敏。
 
@@ -152,12 +152,12 @@
 - libssh2：SSH、PTY、exec channel 和 SFTP
 - Qt SQLite：配置、历史、告警和传输状态
 - Linux 指标来源：`/proc/stat`、`/proc/meminfo`、`/proc/loadavg`、`/proc/net/dev`、`df -Pk`
-- macOS Keychain / Windows Credential Manager：系统级凭据保存
+- macOS OpenSSL AES-256-GCM 本地凭据库 / Windows Credential Manager / Linux Secret Service
 - CMake、CTest、CPack、NSIS、GitHub Actions：构建、测试和发布
 
 ## 本地构建
 
-要求：CMake 3.25+、C++20 编译器、Qt 6.5+（Core、Gui、Network、Sql、Svg、Widgets）、libssh2 1.11+。
+要求：CMake 3.25+、C++20 编译器、Qt 6.5+（Core、Gui、Network、Sql、Svg、Widgets）、libssh2 1.11+；macOS 另需 OpenSSL Crypto。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -181,13 +181,13 @@ open build/NoxShell.app
 
 脚本会自动定位 Qt 并复用 `build` 中的 CMake 缓存，只编译发生变化的文件；使用 `--clean` 可重新生成构建目录。
 
-生成 Release 包：
+生成本地安装包（Release 优化构建）：
 
 ```bash
 ./script/package-release.sh
 ```
 
-macOS 默认生成 LZMA 压缩的 `.dmg`。Windows 使用 CPack + NSIS 生成安装版 `.exe`，同时保留免安装 `.zip`。
+macOS 默认生成本地测试 `.dmg`，无证书时使用临时签名，无需额外设置环境变量；最低系统版本按 Qt 依赖自动选择，并检查全部部署依赖。正式发布使用 `./script/package-release.sh --release`，必须配置 Developer ID；两种模式均执行测试与启动检查，不自动公证或上传。Windows 使用 CPack + NSIS 生成安装版 `.exe`，同时保留免安装 `.zip`。
 
 `.github/workflows/release.yml` 支持手动运行，也会在推送与 `CMakeLists.txt` 版本一致的 `v*` 标签时，自动构建：
 

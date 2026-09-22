@@ -85,7 +85,13 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
     m_connectionPassword = new QLineEdit;
     m_connectionPassword->setObjectName(QStringLiteral("terminalConnectionPassword"));
     m_connectionPassword->setEchoMode(QLineEdit::Password);
-    m_rememberPassword = new QCheckBox(QStringLiteral("记住密码（系统加密保存）"));
+    m_rememberPassword = new QCheckBox(QStringLiteral(
+#ifdef Q_OS_MACOS
+        "记住密码（本地加密，升级保留）"
+#else
+        "记住密码（系统加密保存）"
+#endif
+    ));
     m_rememberPassword->setObjectName(QStringLiteral("terminalRememberPassword"));
     m_rememberPassword->setChecked(true);
     m_passwordConnectButton = new QPushButton(QStringLiteral("连接"));

@@ -158,9 +158,9 @@ QString applicationStyleSheet(bool dark)
         QFrame#hostSidebar { border-right: 1px solid #DFE6EF; }
         QFrame#monitorIdentity { border-bottom: 1px solid #E4EAF1; }
         QFrame#statusBar { border-top: 1px solid #DFE6EF; }
-        QWidget#monitorRail { background: white; border-right: 1px solid #DDE5EE; }
+        QWidget#monitorRail { background:#F4F7FB; border-right:1px solid #E2E8F0; }
         QWidget#operationsWorkspace, QWidget#terminalWorkspacePane, QWidget#fileWorkspacePane { background: #F3F6FA; }
-        QScrollArea#monitorScrollArea, QScrollArea#monitorScrollArea QWidget { background: white; }
+        QScrollArea#monitorScrollArea, QWidget#monitorScrollContent { background:#F4F7FB; }
         QListWidget { background: white; border: 0; outline: 0; padding: 5px; }
         QListWidget::item { border-radius: 4px; padding: 8px 7px; margin: 1px 0; }
         QListWidget::item:selected { color: #0052D9; background: #E8F3FF; border: 1px solid #CCE3FF; }
@@ -190,7 +190,7 @@ QString applicationStyleSheet(bool dark)
         QMenu::item:selected { color: #0052D9; background: #E8F3FF; }
         QMenu::indicator { left: 8px; }
         QFrame#filePanel {
-            background: white; border: 1px solid #E1E7EF; border-radius: 5px;
+            background:white; border:1px solid #E1E7EF; border-radius:8px;
         }
         QWidget#fileToolbar { border-bottom:1px solid #E5EAF0; background:#FBFCFD; }
         QLabel#fileWorkspacePlaceholder { color:#8B9AAF; background:#FBFCFD; }
@@ -232,16 +232,16 @@ QString applicationStyleSheet(bool dark)
             background: white; border: 1px solid #E1E7EF; border-radius: 5px;
         }
         QFrame#monitorSystemSummary { background: transparent; border: 0; border-bottom: 1px solid #EEF2F6; }
-        QLabel#monitorSystemTitle { color: #173553; font-size: 12px; font-weight: 650; }
-        QLabel#monitorSystemCaption { color: #8794A5; font-size: 10px; }
-        QLabel#monitorUptimeValue { color: #173553; font-size: 12px; font-weight: 650; }
-        QFrame#metricRow { background: transparent; border: 0; border-bottom: 1px solid #EEF2F6; }
+        QLabel#monitorSystemTitle { color:#263E55; font-size:12px; font-weight:600; }
+        QLabel#monitorSystemCaption { color:#738398; font-size:11px; }
+        QLabel#monitorUptimeValue { color:#263E55; font-size:11px; font-weight:500; }
+        QFrame#metricRow { background:transparent; border:0; }
         QFrame#metricRow[lastRow="true"] { border-bottom: 0; }
         QLabel#metricTitle { color: #5F6F82; font-size: 12px; }
-        QLabel#metricValue { color: #1C324B; font-size: 17px; font-weight: 650; }
-        QLabel#metricDetail { color: #8794A5; font-size: 10px; }
+        QLabel#metricValue { color:#243B53; font-size:15px; font-weight:600; }
+        QLabel#metricDetail { color:#78899B; font-size:11px; }
         QFrame#metricCorePanel { background:#F8FAFC; border:0; border-top:1px solid #EEF2F6; }
-        QLabel#metricCoreName, QLabel#metricCoreValue, QLabel#metricCoreMore { color:#708297; font-size:9px; }
+        QLabel#metricCoreName, QLabel#metricCoreValue, QLabel#metricCoreMore { color:#708297; font-size:10px; }
         QLabel#hostItemName { color:#20344B; font-weight:650; }
         QLabel#hostItemAddress { color:#60748A; font-size:12px; }
         QPushButton#credentialSettingsButton {
@@ -254,36 +254,36 @@ QString applicationStyleSheet(bool dark)
         QTreeWidget#hostList::branch { background:transparent; }
         QFrame#systemDetailPanel { border:0; background:transparent; }
         QFrame#networkSectionCard, QFrame#processSectionCard, QFrame#fileSystemSectionCard {
-            border:1px solid #D7E1EB; border-radius:5px; background:#FFFFFF;
+            border:1px solid #E1E7EF; border-radius:8px; background:#FFFFFF;
         }
-        QLabel#detailSectionTitle { font-weight:650; color:#173553; }
+        QLabel#detailSectionTitle { font-size:12px; font-weight:600; color:#263E55; }
         QLabel#detailMuted { color:#8B9AAF; font-size:10px; }
-        QWidget#networkRateRow { background:#F7FAFC; border-radius:3px; }
-        QLabel#networkUploadRate { color:#D94841; font-weight:650; }
-        QLabel#networkDownloadRate { color:#008858; font-weight:650; }
-        QComboBox#networkInterfaceCombo { min-height:27px; padding:0 2px 0 8px; }
+        QWidget#networkRateRow { background:transparent; }
+        QLabel#networkUploadRate { color:#427AE3; font-size:14px; font-weight:600; }
+        QLabel#networkDownloadRate { color:#129D86; font-size:14px; font-weight:600; }
+        QComboBox#networkInterfaceCombo { min-height:25px; padding:0 2px 0 8px; font-size:11px; }
         QComboBox#networkInterfaceCombo::drop-down { width:26px; border:0; border-left:1px solid #E1E7EF; }
         QComboBox#networkInterfaceCombo::down-arrow { image:url(:/assets/chevron-down.svg); width:12px; height:12px; }
         QComboBox#networkInterfaceCombo QAbstractItemView { outline:0; padding:3px; }
         QComboBox#networkInterfaceCombo QAbstractItemView::item { min-height:26px; padding:0 7px; border-radius:3px; }
         QTabBar#processMetricTabs::tab {
-            min-width:44px; min-height:25px; max-height:25px; padding:0 5px;
-            color:#60758B; background:#F5F8FB; font-size:10px;
+            min-width:40px; min-height:27px; max-height:27px; padding:0 5px;
+            color:#60758B; background:#F3F6FA; font-size:11px; border:0; border-radius:5px;
         }
         QTabBar#processMetricTabs::tab:selected {
-            color:#006EFF; background:#FFFFFF; border-bottom:2px solid #006EFF;
+            color:#296FD6; background:#E9F1FF; border:0; font-weight:600;
         }
         QTreeWidget#realtimeProcessList, QTreeWidget#fileSystemUsageList {
-            border:1px solid #E2E8F0; background:#FFFFFF; alternate-background-color:#F8FAFC;
-            font-size:10px;
+            border:0; background:#FFFFFF; alternate-background-color:#F7F9FC;
+            font-size:11px;
         }
         QTreeWidget#realtimeProcessList::item, QTreeWidget#fileSystemUsageList::item {
-            min-height:21px; max-height:21px; padding:0 3px;
+            min-height:24px; max-height:24px; padding:0 4px; border:0;
         }
         QTreeWidget#realtimeProcessList QHeaderView::section,
         QTreeWidget#fileSystemUsageList QHeaderView::section {
-            height:22px; background:#F5F8FB; border:0; border-bottom:1px solid #E2E8F0;
-            padding:0 4px; color:#738297; font-size:9px;
+            height:24px; background:#FFFFFF; border:0;
+            padding:0 4px; color:#8190A2; font-size:10px; font-weight:400;
         }
     )QSS");
     style += QStringLiteral(R"QSS(
@@ -607,9 +607,8 @@ QString applicationStyleSheet(bool dark)
         QMenu { color:#DCE6F0; background:#1A232D; border-color:#3A4654; }
         QMenu::item:selected { color:white; background:#174E78; }
         QToolTip { color:#E8F0F7; background:#202B36; border:1px solid #465566; }
-        QFrame#hostSidebar, QFrame#statusBar, QFrame#monitorIdentity,
-        QWidget#monitorRail, QScrollArea#monitorScrollArea,
-        QScrollArea#monitorScrollArea QWidget { background: #171F28; }
+        QFrame#hostSidebar, QFrame#statusBar, QFrame#monitorIdentity { background:#171F28; }
+        QWidget#monitorRail, QScrollArea#monitorScrollArea, QWidget#monitorScrollContent { background:#111A24; }
         QFrame#hostSidebar, QWidget#monitorRail { border-color: #2B3744; }
         QFrame#monitorIdentity, QFrame#statusBar { border-color: #2B3744; }
         QListWidget, QTreeWidget, QTreeView, QTableView {
@@ -674,16 +673,18 @@ QString applicationStyleSheet(bool dark)
         QTreeWidget#hostList { background:#171F28; }
         QTreeWidget#hostList::item:selected { color:#FFFFFF; background:#174E78; }
         QPushButton#credentialSettingsButton { color:#8FA0B2; border-top-color:#303D4A; }
-        QWidget#networkRateRow { background:#1C2631; }
+        QWidget#networkRateRow { background:transparent; }
+        QLabel#networkUploadRate { color:#7BAAFF; }
+        QLabel#networkDownloadRate { color:#54CDB5; }
         QComboBox#networkInterfaceCombo::drop-down { border-left-color:#354252; }
         QTabBar#processMetricTabs::tab { color:#91A3B6; background:#1C2631; }
-        QTabBar#processMetricTabs::tab:selected { color:#70B7FF; background:#171F28; border-bottom-color:#3F9BFF; }
+        QTabBar#processMetricTabs::tab:selected { color:#8ABBFF; background:#243950; border:0; }
         QTreeWidget#realtimeProcessList, QTreeWidget#fileSystemUsageList {
-            background:#151D25; alternate-background-color:#1A232D; border-color:#303D4A;
+            background:#171F28; alternate-background-color:#1C2733; border:0;
         }
         QTreeWidget#realtimeProcessList QHeaderView::section,
         QTreeWidget#fileSystemUsageList QHeaderView::section {
-            color:#8FA0B2; background:#1C2631; border-bottom-color:#303D4A;
+            color:#91A3B6; background:#171F28; border:0;
         }
         QFrame#transferQueuePanel, QFrame#transferQueuePanel[popup="true"] {
             background:#18212B; border-color:#303D4A;

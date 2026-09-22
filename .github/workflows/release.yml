@@ -66,9 +66,6 @@ jobs:
         env:
           NOXSHELL_MACOS_DEPLOYMENT_TARGET: "14.0"
           QT_UI_JOBS: "4"
-          # Untagged builds are explicitly test artifacts. Never publish another
-          # ad-hoc release as a fix for password persistence across upgrades.
-          NOXSHELL_ALLOW_ADHOC_SIGNING: ${{ startsWith(github.ref, 'refs/tags/') && '0' || '1' }}
           NOXSHELL_CODESIGN_IDENTITY: ${{ vars.NOXSHELL_CODESIGN_IDENTITY }}
           NOXSHELL_CODESIGN_TEAM_ID: ${{ vars.NOXSHELL_CODESIGN_TEAM_ID }}
         run: |
@@ -79,7 +76,12 @@ jobs:
           cmake -S . -B build-release -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
             -DBUILD_TESTING=ON -DNOXSHELL_BUILD_AUTH_INTEGRATION_TESTS=ON
           export NOXSHELL_AUTH_TEST_SERVER="$PWD/build-release/noxshell-auth-fixture"
-          ./script/package-release.sh
+          # Tags require Developer ID; untagged artifacts are local test builds.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            ./script/package-release.sh --release
+          else
+            ./script/package-release.sh --local
+          fi
           test -f "output/玄壳-v${{ needs.validate-version.outputs.version }}-macOS-${{ matrix.arch }}.dmg"
 
       - name: Upload macOS package

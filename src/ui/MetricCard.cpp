@@ -7,16 +7,18 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QProgressBar>
+#include <QResizeEvent>
 #include <QVBoxLayout>
 
 namespace noxshell::ui {
+namespace { constexpr int kSummaryHeight = 44; }
 
 MetricCard::MetricCard(const QString &title, const QColor &accent, QWidget *parent)
     : QFrame(parent)
     , m_accent(accent)
 {
     setObjectName(QStringLiteral("metricRow"));
-    setFixedHeight(38);
+    setFixedHeight(kSummaryHeight);
     setProperty("accent", accent.name());
 
     auto *layout = new QVBoxLayout(this);
@@ -25,26 +27,41 @@ MetricCard::MetricCard(const QString &title, const QColor &accent, QWidget *pare
 
     auto *summaryRow = new QWidget;
     summaryRow->setObjectName(QStringLiteral("metricSummaryRow"));
-    summaryRow->setFixedHeight(38);
-    auto *summaryLayout = new QHBoxLayout(summaryRow);
-    summaryLayout->setContentsMargins(10, 6, 10, 6);
-    summaryLayout->setSpacing(8);
+    summaryRow->setFixedHeight(kSummaryHeight);
+    auto *summaryLayout = new QVBoxLayout(summaryRow);
+    summaryLayout->setContentsMargins(12, 7, 12, 9);
+    summaryLayout->setSpacing(3);
+    auto *valueRow = new QHBoxLayout;
+    valueRow->setSpacing(6);
 
     auto *titleLabel = new QLabel(title);
     titleLabel->setObjectName(QStringLiteral("metricTitle"));
-    titleLabel->setFixedWidth(34);
+    titleLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    m_value = new QLabel(QStringLiteral("--"));
+    m_value->setObjectName(QStringLiteral("metricValue"));
+    m_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_value->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    m_detail = new QLabel;
+    m_detail->setObjectName(QStringLiteral("metricDetail"));
+    m_detail->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_detail->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_detail->setMinimumWidth(0);
+    m_detail->installEventFilter(this);
+    valueRow->addWidget(titleLabel);
+    valueRow->addWidget(m_detail, 1);
+    valueRow->addWidget(m_value);
+    summaryLayout->addLayout(valueRow);
 
     m_progress = new QProgressBar;
     m_progress->setObjectName(QStringLiteral("metricProgress"));
     m_progress->setRange(0, 100);
-    m_progress->setTextVisible(true);
-    m_progress->setAlignment(Qt::AlignCenter);
-    m_progress->setFixedHeight(24);
+    m_progress->setTextVisible(false);
+    m_progress->setFixedHeight(4);
     m_progress->setOrientation(Qt::Horizontal);
+    m_progress->setAccessibleName(title);
     applyProgressStyle();
 
-    summaryLayout->addWidget(titleLabel);
-    summaryLayout->addWidget(m_progress, 1);
+    summaryLayout->addWidget(m_progress);
     layout->addWidget(summaryRow);
 
     m_corePanel = new QFrame;
@@ -69,13 +86,9 @@ void MetricCard::applyProgressStyle()
     if (!m_progress) return;
     const bool dark = isApplicationDarkTheme();
     m_progress->setStyleSheet(QStringLiteral(
-        "QProgressBar{border:0;background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        "stop:0 transparent,stop:0.38 transparent,stop:0.39 %1,stop:0.61 %1,stop:0.62 transparent,stop:1 transparent);"
-        "color:%2;font-size:10px;font-weight:600;text-align:center;selection-color:%2;}"
-        "QProgressBar::chunk{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        "stop:0 transparent,stop:0.38 transparent,stop:0.39 %3,stop:0.61 %3,stop:0.62 transparent,stop:1 transparent);}")
-        .arg(dark ? QStringLiteral("#283440") : QStringLiteral("#EDF1F5"),
-            dark ? QStringLiteral("#E2EBF4") : QStringLiteral("#1C324B"), m_accent.name()));
+        "QProgressBar{border:0;border-radius:2px;background:%1;}"
+        "QProgressBar::chunk{border:0;border-radius:2px;background:%2;}")
+        .arg(dark ? QStringLiteral("#2B3948") : QStringLiteral("#EAF0F6"), m_accent.name()));
 
     if (!m_corePanel) return;
     for (auto *progress : m_corePanel->findChildren<QProgressBar *>(QStringLiteral("metricCoreProgress"))) {
@@ -88,8 +101,12 @@ void MetricCard::applyProgressStyle()
 
 void MetricCard::setValue(const QString &value, const QString &detail, int progress)
 {
+    m_value->setText(value);
+    m_detailText = detail;
+    updateDetailText();
     m_progress->setFormat(detail.isEmpty() ? value : QStringLiteral("%1  %2").arg(value, detail));
-    m_progress->setToolTip(detail);
+    setToolTip(m_progress->format());
+    m_progress->setAccessibleDescription(m_progress->format());
     m_progress->setValue(qBound(0, progress, 100));
 }
 
@@ -168,7 +185,7 @@ void MetricCard::setCorePanelVisible(bool visible)
     visible = visible && !m_coreValues.isEmpty();
     m_corePanel->setVisible(visible);
     const int panelHeight = visible ? m_corePanel->sizeHint().height() : 0;
-    setFixedHeight(38 + panelHeight);
+    setFixedHeight(kSummaryHeight + panelHeight);
     updateGeometry();
     if (parentWidget() && parentWidget()->layout()) {
         parentWidget()->layout()->invalidate();
@@ -186,6 +203,30 @@ void MetricCard::leaveEvent(QEvent *event)
 {
     setCorePanelVisible(false);
     QFrame::leaveEvent(event);
+}
+
+void MetricCard::updateDetailText()
+{
+    // The value keeps its natural width; only the inline secondary text elides.
+    m_detail->setText(m_detail->fontMetrics().elidedText(m_detailText, Qt::ElideRight,
+        qMax(0, m_detail->contentsRect().width())));
+    m_detail->setToolTip(m_detailText);
+    m_detail->setAccessibleName(m_detailText);
+}
+
+bool MetricCard::eventFilter(QObject *watched, QEvent *event)
+{
+    // Values may gain digits without the card itself resizing. Re-elide after
+    // layout assigns the detail label its new width, also after font changes.
+    if (watched == m_detail && (event->type() == QEvent::Resize || event->type() == QEvent::FontChange))
+        updateDetailText();
+    return QFrame::eventFilter(watched, event);
+}
+
+void MetricCard::resizeEvent(QResizeEvent *event)
+{
+    QFrame::resizeEvent(event);
+    updateDetailText();
 }
 
 } // namespace noxshell::ui

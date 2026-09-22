@@ -20,6 +20,14 @@ NoxShell 使用 libssh2 提供 SSH 与 SFTP 能力。
 - 许可：BSD 风格许可证
 - 许可原文：https://libssh2.org/license.html
 
-## 项目资源
+## OpenSSL 3
+
+macOS 本地凭据库使用 OpenSSL 的 Crypto 库生成安全随机密钥并进行 AES-256-GCM 认证加密。
+
+- 版权所有：The OpenSSL Project Authors
+- 许可：Apache License 2.0
+- 许可原文：https://github.com/openssl/openssl/blob/openssl-3.0/LICENSE.txt
+
+## 项目原创资源
 
 除非文件旁另有明确声明，本仓库原创的源代码、文档与项目资源按根目录 `LICENSE` 授权。项目名称“玄壳 / NoxShell”及图标不因 Apache License 2.0 自动授予商标权。

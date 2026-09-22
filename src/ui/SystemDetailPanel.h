@@ -1,10 +1,10 @@
 #pragma once
 
 #include "../core/LinuxMetrics.h"
+#include "NetworkRateChart.h"
 
 #include <QFrame>
 #include <QHash>
-#include <QPointF>
 
 class QComboBox;
 class QLabel;
@@ -12,8 +12,6 @@ class QTabBar;
 class QTreeWidget;
 
 namespace noxshell::ui {
-
-class NetworkRateChart;
 
 class SystemDetailPanel final : public QFrame {
     Q_OBJECT
@@ -38,7 +36,7 @@ private:
     QTreeWidget *m_fileSystemList{};
     QLabel *m_emptyHint{};
     MetricSample m_sample;
-    QHash<QString, QVector<QPointF>> m_networkHistory;
+    QHash<QString, QVector<NetworkRatePoint>> m_networkHistory;
 };
 
 } // namespace noxshell::ui

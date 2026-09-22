@@ -252,7 +252,8 @@ void SshSession::connectToImpl(const ServerProfile &profile, bool suppliedSecret
             m_connecting = false;
             m_waitingForPassword = true;
             emit connectionChanged(false, QStringLiteral("已存密码不可读取，请输入此服务器的 SSH 密码"));
-            if (lifetime && attempt == m_connectionAttempt) emit passwordRequired(QStringLiteral("已存密码暂不可读取，请输入服务器凭据。无需 Mac 密码。"));
+            if (lifetime && attempt == m_connectionAttempt) emit passwordRequired(
+                m_credentialStore->lastError() + QStringLiteral("\n请输入服务器凭据。无需 Mac 密码。"));
             return;
         }
         if (request.password.isEmpty()) request.password = secret.password;
@@ -306,7 +307,7 @@ void SshSession::rememberSuccessfulCredential()
             || saved.credentialRef != m_profile.credentialRef || saved.connectionMode != m_profile.connectionMode) return;
         const auto reference = QStringLiteral("server/%1/%2").arg(saved.id, QUuid::createUuid().toString(QUuid::WithoutBraces));
         if (!m_credentialStore->save(reference, secret)) {
-            emit credentialSaveNotice(QStringLiteral("已连接；密码仅用于本次连接，系统加密存储当前不可写"));
+            emit credentialSaveNotice(QStringLiteral("已连接；密码未记住：%1").arg(m_credentialStore->lastError()));
             return;
         }
         if (!m_repository->replaceCredentialReference(saved, reference)) {

@@ -3,6 +3,7 @@
 #include "ui/MainWindow.h"
 #include "core/AppLogger.h"
 #include "core/ServerRepository.h"
+#include "core/CredentialStore.h"
 
 #include <QApplication>
 #include <QFont>
@@ -38,6 +39,24 @@ int main(int argc, char *argv[])
             noxshell::ServerRepository probe(database, false);
             if (!probe.initialize()) return 3;
         }
+#ifdef Q_OS_MACOS
+        // Exercise the deployed crypto library/provider as well. Only this
+        // temporary directory and synthetic data; never read a legacy Keychain.
+        const auto vaultPath = testData.filePath(QStringLiteral("vault"));
+        const auto reference = QStringLiteral("startup-synthetic-only");
+        const noxshell::CredentialSecret expected{QStringLiteral("synthetic-startup-password"), QStringLiteral("synthetic-passphrase")};
+        {
+            noxshell::CredentialStore store(vaultPath, noxshell::CredentialStore::LegacyReader{}, nullptr);
+            if (!store.save(reference, expected)) return 4;
+        }
+        {
+            noxshell::CredentialStore store(vaultPath, noxshell::CredentialStore::LegacyReader{}, nullptr);
+            const auto loaded = store.load(reference);
+            if (!store.lastError().isEmpty() || loaded.password != expected.password
+                || loaded.keyPassphrase != expected.keyPassphrase) return 5;
+        }
+        std::puts("NOXSHELL_LOCAL_VAULT_SMOKE_OK");
+#endif
         noxshell::ui::MainWindow window(database);
         window.show();
         QTimer::singleShot(500, &app, [&app] {

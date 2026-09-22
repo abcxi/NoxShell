@@ -4,9 +4,10 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.77 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.79 LANGUAGES CXX)
 
 if(APPLE)
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 20)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
@@ -75,6 +76,9 @@ set(NOXSHELL_CORE_SOURCES
     src/core/SshSession.cpp
     src/core/SshSession.h
 )
+if(APPLE)
+    list(APPEND NOXSHELL_CORE_SOURCES src/core/LocalCredentialVault.cpp src/core/LocalCredentialVault.h)
+endif()
 
 qt_add_executable(NoxShell
     src/main.cpp
@@ -113,6 +117,8 @@ qt_add_executable(NoxShell
     src/ui/ServerDialog.h
     src/ui/SystemDetailPanel.cpp
     src/ui/SystemDetailPanel.h
+    src/ui/NetworkRateChart.cpp
+    src/ui/NetworkRateChart.h
     src/ui/TerminalPanel.cpp
     src/ui/TerminalPanel.h
     src/ui/TerminalSettingsDialog.cpp
@@ -133,13 +139,26 @@ if(WIN32)
     target_link_libraries(NoxShell PRIVATE Advapi32 Ws2_32)
 endif()
 if(APPLE)
-    target_link_libraries(NoxShell PRIVATE "-framework Cocoa" "-framework Security" "-framework Carbon")
+    target_link_libraries(NoxShell PRIVATE OpenSSL::Crypto "-framework Cocoa" "-framework Security" "-framework Carbon")
 endif()
 
 include(CTest)
 option(NOXSHELL_BUILD_AUTH_INTEGRATION_TESTS "Build local SSH authentication regression tests" OFF)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
+    if(APPLE)
+        set(NOXSHELL_VAULT_SOURCES src/core/LocalCredentialVault.cpp src/core/CredentialStore.cpp src/core/CredentialStore.h)
+        foreach(build A B)
+            qt_add_executable(NoxShellVaultProbe${build} tests/LocalVaultProbe.cpp ${NOXSHELL_VAULT_SOURCES})
+            target_compile_definitions(NoxShellVaultProbe${build} PRIVATE NOXSHELL_VAULT_BUILD="${build}")
+            target_link_libraries(NoxShellVaultProbe${build} PRIVATE Qt6::Core OpenSSL::Crypto "-framework Security" "-framework CoreFoundation")
+        endforeach()
+        qt_add_executable(NoxShellLocalVaultTest tests/LocalVaultTest.cpp ${NOXSHELL_VAULT_SOURCES})
+        target_link_libraries(NoxShellLocalVaultTest PRIVATE Qt6::Core Qt6::Test OpenSSL::Crypto "-framework Security" "-framework CoreFoundation")
+        add_dependencies(NoxShellLocalVaultTest NoxShellVaultProbeA NoxShellVaultProbeB)
+        add_test(NAME local_credential_vault COMMAND NoxShellLocalVaultTest -v1)
+        set_tests_properties(local_credential_vault PROPERTIES TIMEOUT 60)
+    endif()
     if(NOXSHELL_BUILD_AUTH_INTEGRATION_TESTS)
         qt_add_executable(NoxShellAuthIntegrationTest
             tests/AuthIntegrationTest.cpp
@@ -189,6 +208,8 @@ if(BUILD_TESTING)
         src/ui/ServerDialog.h
         src/ui/SystemDetailPanel.cpp
         src/ui/SystemDetailPanel.h
+        src/ui/NetworkRateChart.cpp
+        src/ui/NetworkRateChart.h
         src/ui/TerminalPanel.cpp
         src/ui/TerminalPanel.h
         src/ui/TerminalSettingsDialog.cpp
@@ -210,7 +231,7 @@ if(BUILD_TESTING)
     endif()
     if(APPLE)
         target_sources(NoxShellSmokeTest PRIVATE tests/MacLifecycleProbe.mm)
-        target_link_libraries(NoxShellSmokeTest PRIVATE "-framework Cocoa" "-framework Security" "-framework Carbon")
+        target_link_libraries(NoxShellSmokeTest PRIVATE OpenSSL::Crypto "-framework Cocoa" "-framework Security" "-framework Carbon")
     endif()
     add_test(NAME ui_smoke COMMAND NoxShellSmokeTest -v1)
     set_tests_properties(ui_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
