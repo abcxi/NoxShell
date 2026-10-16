@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ServerProfile.h"
+#include "SavedCredential.h"
 #include "LinuxMetrics.h"
 #include "MetricHistory.h"
 #include "MonitoringData.h"
@@ -51,6 +52,9 @@ public:
     [[nodiscard]] QStringList loadServerGroups();
     bool saveServer(ServerProfile &profile);
     bool replaceCredentialReference(const ServerProfile &expected, const QString &reference);
+    [[nodiscard]] QVector<SavedCredential> loadSavedCredentials();
+    bool saveSavedCredential(const SavedCredential &value, const SavedCredential *expected = nullptr);
+    bool deleteSavedCredential(const SavedCredential &expected);
     bool saveServerGroup(const QString &name);
     bool renameServerGroup(const QString &oldName, const QString &newName);
     bool deleteServerGroup(const QString &name);
@@ -64,7 +68,7 @@ public:
     bool recordCommand(const QString &serverId, const QString &command,
         const QDateTime &executedAt = QDateTime::currentDateTime());
     [[nodiscard]] QVector<CommandHistoryEntry> loadCommandHistory(
-        bool favoritesOnly = false, int limit = 200);
+        bool favoritesOnly = false, int limit = 200, const QString &keyword = {});
     bool setCommandFavorite(qint64 id, bool favorite);
     bool setCommandNote(qint64 id, const QString &note);
     bool deleteCommandHistory(qint64 id);

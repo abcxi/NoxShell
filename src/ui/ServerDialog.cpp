@@ -1,5 +1,6 @@
 #include "ServerDialog.h"
 #include "CredentialInput.h"
+#include "CredentialChoice.h"
 
 #include <QPointer>
 
@@ -138,6 +139,8 @@ ServerDialog::ServerDialog(QWidget *parent)
     auto *passwordLayout = new QVBoxLayout(passwordPage);
     passwordLayout->setContentsMargins(0, 0, 0, 0);
     passwordLayout->setSpacing(4);
+    m_credentialChoice = new CredentialChoice;
+    passwordLayout->addWidget(m_credentialChoice);
     m_password = new QLineEdit;
     m_password->setObjectName(QStringLiteral("passwordEditor"));
     m_password->setEchoMode(QLineEdit::Password);
@@ -218,6 +221,7 @@ ServerDialog::ServerDialog(QWidget *parent)
         m_passwordReveal->setToolTip(visible ? QStringLiteral("隐藏密码") : QStringLiteral("显示密码"));
     });
     connect(m_password, &QLineEdit::textChanged, this, &ServerDialog::updatePasswordHint);
+    connect(m_credentialChoice, &QComboBox::currentIndexChanged, this, &ServerDialog::updateCredentialChoice);
     connect(browse, &QPushButton::clicked, this, &ServerDialog::choosePrivateKey);
     connect(m_testButton, &QPushButton::clicked, this, &ServerDialog::testConnection);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -242,8 +246,10 @@ ServerDialog::ServerDialog(const ServerProfile &profile, QWidget *parent)
     };
     connect(m_host, &QLineEdit::textChanged, this, clearFingerprintForChangedEndpoint);
     connect(m_port, &QSpinBox::valueChanged, this, clearFingerprintForChangedEndpoint);
-    m_password->setPlaceholderText(QStringLiteral("留空则沿用现有密码"));
-    m_passphrase->setPlaceholderText(QStringLiteral("留空则沿用现有私钥口令"));
+    m_password->setPlaceholderText(profile.credentialRef.isEmpty() ? QStringLiteral("SSH 密码")
+        : QStringLiteral("●●●●●● 已保存 · 输入可替换"));
+    m_passphrase->setPlaceholderText(profile.credentialRef.isEmpty() ? QStringLiteral("私钥口令，可选")
+        : QStringLiteral("已有保存凭据 · 留空沿用私钥口令"));
     if (auto *buttons = findChild<QDialogButtonBox *>()) {
         buttons->button(QDialogButtonBox::Save)->setText(QStringLiteral("保存修改"));
     }
@@ -269,6 +275,16 @@ ServerProfile ServerDialog::profile() const
     result.expectedFingerprint = m_fingerprint->text().trimmed();
     result.id = m_original.id;
     result.credentialRef = m_original.credentialRef;
+    if (result.authentication == AuthenticationMethod::Password) {
+        if (const auto chosen = m_credentialChoice->selection()) {
+            result.user = chosen->user;
+            result.password.clear();
+            result.keyPassphrase.clear();
+            result.credentialRef = chosen->credentialRef;
+        } else if (m_original.credentialRef.startsWith(QLatin1String("managed/"))) {
+            result.credentialRef.clear();
+        }
+    }
     return result;
 }
 
@@ -276,6 +292,8 @@ void ServerDialog::setConnectionServices(ServerRepository *repository, Credentia
 {
     m_repository = repository;
     m_credentialStore = credentialStore;
+    m_credentialChoice->setRepository(repository, m_original.credentialRef);
+    updateCredentialChoice();
     m_testButton->setEnabled(m_repository && m_credentialStore);
 }
 
@@ -312,6 +330,23 @@ void ServerDialog::populate(const ServerProfile &profile)
 void ServerDialog::updateAuthenticationPage()
 {
     m_authPages->setCurrentIndex(m_authentication->currentIndex());
+    updateCredentialChoice();
+}
+
+void ServerDialog::updateCredentialChoice()
+{
+    if (!m_credentialChoice || !m_password || !m_passwordHint) return;
+    const auto chosen = m_credentialChoice->selection();
+    const bool useSaved = chosen && m_authentication->currentData().toInt() == static_cast<int>(AuthenticationMethod::Password);
+    m_user->setEnabled(!useSaved);
+    m_password->setEnabled(!useSaved);
+    m_passwordReveal->setEnabled(!useSaved);
+    if (useSaved) {
+        m_user->setText(chosen->user);
+        m_password->clear();
+        m_passwordReveal->setChecked(false);
+    }
+    updatePasswordHint();
 }
 
 void ServerDialog::choosePrivateKey()
@@ -323,22 +358,33 @@ void ServerDialog::choosePrivateKey()
 void ServerDialog::updatePasswordHint()
 {
     if (!m_passwordHint || !m_password) return;
+    const auto chosen = m_credentialChoice ? m_credentialChoice->selection() : std::nullopt;
+    const bool saved = chosen || (!m_original.credentialRef.isEmpty()
+        && !m_original.credentialRef.startsWith(QLatin1String("managed/"))
+        && m_original.authentication == AuthenticationMethod::Password);
+    m_password->setPlaceholderText(saved ? QStringLiteral("●●●●●● 已保存 · 输入可替换") : QStringLiteral("SSH 密码"));
     m_passwordHint->setStyleSheet(QStringLiteral("color:#738297;font-size:11px;"));
+    if (chosen) {
+        m_passwordHint->setText(QStringLiteral("● 已选择“%1” · 密码已保存，将在连接时读取。可切换到手动输入。").arg(chosen->name));
+        return;
+    }
     if (!m_password->text().isEmpty()) {
         m_passwordHint->setText(m_editing
             ? QStringLiteral("连接测试将使用当前输入；保存后替换旧密码。英文字符大小写和半角空格不变。")
             : QStringLiteral("连接测试和保存将使用当前输入。英文字符大小写和半角空格不变。"));
         return;
     }
-    m_passwordHint->setText(m_editing
-        ? QStringLiteral("密码不会从凭据库回填；留空将沿用已保存密码。")
+    m_passwordHint->setText(saved
+        ? QStringLiteral("● 已保存密码 · 留空保持原密码；输入新密码可替换。")
         : QStringLiteral("请输入 SSH 密码；仅转换本次输入，不改动已保存凭据。"));
 }
 
 void ServerDialog::validateAndAccept()
 {
     const auto value = profile();
-    if (!validateProfile(value, m_editing)) return;
+    const bool stored = !value.credentialRef.isEmpty() && (value.authentication == m_original.authentication
+        || m_credentialChoice->selection().has_value());
+    if (!validateProfile(value, stored)) return;
     accept();
 }
 
@@ -348,7 +394,7 @@ bool ServerDialog::validateProfile(const ServerProfile &value, bool allowStoredP
         QMessageBox::warning(this, QStringLiteral("字段不完整"), QStringLiteral("主机名称、主机/IP 和用户名不能为空。"));
         return false;
     }
-    if (!allowStoredPassword && value.authentication == AuthenticationMethod::Password && value.password.isEmpty()) {
+    if (!allowStoredPassword && value.credentialRef.isEmpty() && value.authentication == AuthenticationMethod::Password && value.password.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("缺少密码"), QStringLiteral("密码认证需要输入 SSH 密码。"));
         return false;
     }
@@ -370,10 +416,11 @@ bool ServerDialog::prepareConnectionTestProfile(ServerProfile &candidate)
     const bool sameAuthentication = candidate.authentication == m_original.authentication;
     const bool samePrivateKey = candidate.authentication != AuthenticationMethod::PrivateKey
         || candidate.privateKeyPath == m_original.privateKeyPath;
-    if (needsStoredSecret && m_editing && sameAuthentication && samePrivateKey
-        && m_credentialStore && !m_original.credentialRef.isEmpty()) {
+    const bool useChosen = candidate.authentication == AuthenticationMethod::Password && m_credentialChoice->selection().has_value();
+    if (needsStoredSecret && (useChosen || (m_editing && sameAuthentication && samePrivateKey))
+        && m_credentialStore && !candidate.credentialRef.isEmpty()) {
         const QPointer<ServerDialog> lifetime(this);
-        storedSecret = m_credentialStore->load(m_original.credentialRef);
+        storedSecret = m_credentialStore->load(candidate.credentialRef);
         if (!lifetime) return false;
         if (!m_credentialStore->lastError().isEmpty()) {
             m_testStatus->setText(QStringLiteral("已存密码暂不可读取，请在上方输入 SSH 密码或私钥口令后测试；无需 Mac 密码。"));

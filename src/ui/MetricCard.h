@@ -7,6 +7,8 @@ class QEnterEvent;
 class QGridLayout;
 class QLabel;
 class QProgressBar;
+class QTimer;
+class QHideEvent;
 
 namespace noxshell::ui {
 
@@ -15,6 +17,7 @@ class MetricCard final : public QFrame {
 
 public:
     explicit MetricCard(const QString &title, const QColor &accent, QWidget *parent = nullptr);
+    ~MetricCard() override;
 
     void setValue(const QString &value, const QString &detail, int progress);
     void setCoreValues(const QVector<double> &values);
@@ -25,11 +28,13 @@ protected:
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
 
 private:
     void applyProgressStyle();
     void rebuildCoreRows();
     void setCorePanelVisible(bool visible);
+    void scheduleCorePanelHide();
     void updateDetailText();
     QLabel *m_value{};
     QLabel *m_detail{};
@@ -37,6 +42,9 @@ private:
     QProgressBar *m_progress{};
     QFrame *m_corePanel{};
     QGridLayout *m_coreLayout{};
+    QTimer *m_coreHideTimer{};
+    bool m_cardHovered{false};
+    bool m_corePanelHovered{false};
     QVector<QProgressBar *> m_coreProgressBars;
     QVector<QLabel *> m_coreValueLabels;
     QVector<double> m_coreValues;

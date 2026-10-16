@@ -19,6 +19,7 @@ class ServerRepository;
 }
 
 namespace noxshell::ui {
+class CredentialChoice;
 
 class ServerDialog final : public QDialog {
     Q_OBJECT
@@ -38,6 +39,7 @@ private:
     void validateAndAccept();
     void testConnection();
     void updatePasswordHint();
+    void updateCredentialChoice();
     [[nodiscard]] bool validateProfile(const ServerProfile &profile, bool allowStoredPassword);
     [[nodiscard]] bool prepareConnectionTestProfile(ServerProfile &profile);
     void populate(const ServerProfile &profile);
@@ -51,6 +53,7 @@ private:
     QComboBox *m_authentication{};
     QStackedWidget *m_authPages{};
     QLineEdit *m_password{};
+    CredentialChoice *m_credentialChoice{};
     QAction *m_passwordReveal{};
     QLabel *m_passwordHint{};
     QLineEdit *m_privateKey{};

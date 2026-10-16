@@ -25,6 +25,7 @@ public:
     bool selectServerById(const QString &serverId);
     void addServer(const ServerProfile &profile);
     bool updateServer(const ServerProfile &profile);
+    void refreshServers(const QVector<ServerProfile> &profiles);
     bool setServerState(const QString &serverId, ServerState state);
     bool removeServer(const QString &id);
     void addGroup(const QString &name);

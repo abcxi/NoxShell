@@ -49,7 +49,7 @@ public:
 
     void feedData(const QByteArray &data);
     void feedText(const QString &text);
-    void clear();
+    void clear(bool resetModes = false);
     void clearSelection();
     [[nodiscard]] QString plainText() const { return m_model.plainText(); }
     [[nodiscard]] QString selectedText() const;
@@ -68,6 +68,7 @@ public slots:
     void findPrevious();
 
 signals:
+    void fullScreenModeChanged(bool enabled);
     void inputGenerated(const QByteArray &data);
     void commandSubmitted(const QString &command);
     void terminalSizeChanged(int columns, int rows, int pixelWidth, int pixelHeight);
@@ -165,6 +166,7 @@ private:
     QAction *m_selectAllAction{};
     QFrame *m_searchBar{};
     QTimer *m_searchRefreshTimer{};
+    QTimer *m_hoverRefreshTimer{};
     QLineEdit *m_searchInput{};
     QLabel *m_searchCounter{};
     QToolButton *m_searchPrevious{};

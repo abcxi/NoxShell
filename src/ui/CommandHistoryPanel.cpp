@@ -13,6 +13,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QTabBar>
+#include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -43,6 +44,22 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
     m_tabs->setExpanding(false);
     m_tabs->addTab(QStringLiteral("历史"));
     m_tabs->addTab(QStringLiteral("收藏"));
+    m_search = new QLineEdit;
+    m_search->setObjectName(QStringLiteral("commandHistorySearch"));
+    m_search->setPlaceholderText(QStringLiteral("搜索命令 / 备注"));
+    m_search->setAccessibleName(QStringLiteral("搜索命令记录"));
+    m_search->setToolTip(QStringLiteral("按关键词筛选命令和备注；回车立即搜索"));
+    m_search->setMinimumWidth(110);
+    m_search->setMaximumWidth(260);
+    m_clearSearchButton = new QToolButton;
+    m_clearSearchButton->setObjectName(QStringLiteral("commandHistoryClearSearchButton"));
+    m_clearSearchButton->setText(QString::fromUtf8("×"));
+    m_clearSearchButton->setToolTip(QStringLiteral("清除搜索，显示完整列表"));
+    m_clearSearchButton->setAccessibleName(QStringLiteral("清除命令搜索"));
+    m_clearSearchButton->setEnabled(false);
+    m_searchTimer = new QTimer(this);
+    m_searchTimer->setSingleShot(true);
+    m_searchTimer->setInterval(150);
     m_clearButton = new QToolButton;
     m_clearButton->setObjectName(QStringLiteral("commandHistoryClearButton"));
     m_clearButton->setText(QStringLiteral("清空"));
@@ -55,6 +72,8 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
     header->addWidget(scope);
     header->addWidget(m_tabs);
     header->addStretch();
+    header->addWidget(m_search, 1);
+    header->addWidget(m_clearSearchButton);
     header->addWidget(m_clearButton);
     header->addWidget(closeButton);
     layout->addLayout(header);
@@ -88,6 +107,17 @@ CommandHistoryPanel::CommandHistoryPanel(ServerRepository *repository, QWidget *
     m_deleteAction->setObjectName(QStringLiteral("commandHistoryDeleteAction"));
 
     connect(m_tabs, &QTabBar::currentChanged, this, [this] { refresh(); });
+    connect(m_searchTimer, &QTimer::timeout, this, &CommandHistoryPanel::refresh);
+    connect(m_search, &QLineEdit::textChanged, this, [this](const QString &text) {
+        m_clearSearchButton->setEnabled(!text.isEmpty());
+        if (text.isEmpty()) refresh();
+        else m_searchTimer->start();
+    });
+    connect(m_search, &QLineEdit::returnPressed, this, &CommandHistoryPanel::refresh);
+    connect(m_clearSearchButton, &QToolButton::clicked, this, [this] {
+        m_search->clear();
+        m_search->setFocus();
+    });
     connect(m_clearButton, &QToolButton::clicked, this, &CommandHistoryPanel::clearCurrentView);
     connect(closeButton, &QToolButton::clicked, this, &CommandHistoryPanel::closeRequested);
     connect(m_tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int column) {
@@ -137,10 +167,11 @@ void CommandHistoryPanel::recordCommand(const QString &command)
 
 void CommandHistoryPanel::refresh()
 {
+    m_searchTimer->stop();
     m_tree->clear();
     if (!m_repository) return;
     const bool favoritesOnly = m_tabs->currentIndex() == 1;
-    const auto entries = m_repository->loadCommandHistory(favoritesOnly, 300);
+    const auto entries = m_repository->loadCommandHistory(favoritesOnly, 300, m_search->text());
     for (const auto &entry : entries) {
         auto *item = new QTreeWidgetItem(m_tree, {
             entry.favorite ? QStringLiteral("★") : QStringLiteral("☆"),

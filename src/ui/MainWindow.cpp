@@ -625,9 +625,8 @@ QWidget *MainWindow::createMetricStrip()
     m_loadCard = new MetricCard(QStringLiteral("负载"), QColor(QStringLiteral("#00A870")));
     auto *summary = new QFrame;
     summary->setObjectName(QStringLiteral("monitorMetricSummary"));
-    // CPU hover details temporarily increase the first metric row. The summary
-    // must be allowed to follow its layout's size hint or the core rows are
-    // compressed over the memory/load rows.
+    // Core details use a floating panel. Summary rows keep their fixed heights
+    // so hovering cannot change the monitor scroll range or move other cards.
     summary->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
     auto *summaryLayout = new QVBoxLayout(summary);
     summaryLayout->setContentsMargins(0, 0, 0, 0);
@@ -679,6 +678,21 @@ QWidget *MainWindow::createTerminalWorkspace()
     layout->setSpacing(0);
     m_terminalWorkspace = new TerminalWorkspace(m_repository, m_credentialStore);
     m_terminalWorkspace->setServerManager(m_sidebar);
+    connect(m_terminalWorkspace, &TerminalWorkspace::savedCredentialsChanged, this, [this] {
+        QHash<QString, ServerProfile> runtime;
+        for (const auto &profile : m_sidebar->servers()) runtime.insert(profile.id, profile);
+        auto saved = m_repository->loadServers();
+        bool changed = false;
+        for (auto &profile : saved) {
+            const auto previous = runtime.constFind(profile.id);
+            if (previous == runtime.cend()) continue;
+            profile.state = previous->state;
+            if (previous->user == profile.user && previous->credentialRef == profile.credentialRef) continue;
+            changed = true;
+            m_terminalWorkspace->updateServer(profile);
+        }
+        if (changed) m_sidebar->refreshServers(saved);
+    });
     connect(m_terminalWorkspace, &TerminalWorkspace::homePageVisibilityChanged,
         this, &MainWindow::updateFileWorkspaceVisibility);
     layout->addWidget(m_terminalWorkspace);
@@ -952,7 +966,10 @@ void MainWindow::duplicateServer(const ServerProfile &profile)
     duplicate.credentialRef.clear();
     duplicate.name = QStringLiteral("%1 副本").arg(profile.name);
     duplicate.state = ServerState::Offline;
-    if (duplicate.connectionMode != ConnectionMode::Rdp
+    if (sourceCredentialRef.startsWith(QLatin1String("managed/"))) {
+        duplicate.credentialRef = sourceCredentialRef;
+        duplicate.password.clear(); duplicate.keyPassphrase.clear();
+    } else if (duplicate.connectionMode != ConnectionMode::Rdp
         && duplicate.authentication != AuthenticationMethod::SshAgent && !sourceCredentialRef.isEmpty()) {
         const auto secret = m_credentialStore->load(sourceCredentialRef);
         duplicate.password = secret.password;
@@ -964,6 +981,22 @@ void MainWindow::duplicateServer(const ServerProfile &profile)
 bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret, const ServerProfile *originalProfile)
 {
     if (profile.id.isEmpty()) profile.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (profile.authentication == AuthenticationMethod::Password && profile.password.isEmpty()
+        && profile.credentialRef.startsWith(QLatin1String("managed/"))) {
+        bool found = false;
+        for (const auto &entry : m_repository->loadSavedCredentials()) {
+            if (entry.credentialRef != profile.credentialRef) continue;
+            profile.user = entry.user;
+            found = true;
+            break;
+        }
+        if (!found || !m_repository->saveServer(profile)) {
+            QMessageBox::critical(this, QStringLiteral("保存连接失败"),
+                found ? m_repository->lastError() : QStringLiteral("所选账密已发生变化，请重新选择。"));
+            return false;
+        }
+        return true;
+    }
     if (profile.connectionMode == ConnectionMode::Rdp) {
         CredentialSecret secret;
         if (!profile.password.isEmpty()) secret.password = profile.password;
@@ -991,6 +1024,7 @@ bool MainWindow::persistProfile(ServerProfile &profile, bool preserveEmptySecret
     const bool samePrivateKey = profile.authentication != AuthenticationMethod::PrivateKey
         || (originalProfile && originalProfile->privateKeyPath == profile.privateKeyPath);
     const bool canPreserveSecret = preserveEmptySecret && originalProfile && sameAuthentication && samePrivateKey
+        && profile.credentialRef == originalProfile->credentialRef
         && !originalProfile->credentialRef.isEmpty();
     if (canPreserveSecret && profile.authentication != AuthenticationMethod::SshAgent
         && profile.password.isEmpty() && profile.keyPassphrase.isEmpty()) {
@@ -1053,6 +1087,7 @@ void MainWindow::addRdpServer()
 void MainWindow::addRdpServerInGroup(const QString &group)
 {
     RdpDialog dialog(this);
+    dialog.setConnectionRepository(m_repository);
     dialog.setAvailableGroups(m_repository->loadServerGroups());
     dialog.setInitialGroup(group);
     if (dialog.exec() != QDialog::Accepted) return;
@@ -1065,6 +1100,7 @@ void MainWindow::editServer(const ServerProfile &sourceProfile)
     if (sourceProfile.id.isEmpty()) return;
     if (sourceProfile.connectionMode == ConnectionMode::Rdp) {
         RdpDialog dialog(sourceProfile, this);
+        dialog.setConnectionRepository(m_repository);
         dialog.setAvailableGroups(m_repository->loadServerGroups());
         if (dialog.exec() != QDialog::Accepted) return;
         auto profile = dialog.profile();
@@ -1104,7 +1140,8 @@ void MainWindow::deleteServer(const ServerProfile &removedProfile)
         QMessageBox::critical(this, QStringLiteral("删除失败"), m_repository->lastError());
         return;
     }
-    if (!removedProfile.credentialRef.isEmpty()) m_credentialStore->remove(removedProfile.credentialRef);
+    if (!removedProfile.credentialRef.isEmpty() && !removedProfile.credentialRef.startsWith(QLatin1String("managed/")))
+        m_credentialStore->remove(removedProfile.credentialRef);
     m_sidebar->removeServer(removedProfile.id);
     if (m_currentServer.id == removedProfile.id) {
         m_currentServer = {};
@@ -1206,6 +1243,10 @@ void MainWindow::requestMetrics()
     const int interval = !isVisible() || isMinimized() || !isActiveWindow() || !m_monitorRail->isVisible() ? 5000 : 1000;
     if (m_metricTimer->interval() != interval) m_metricTimer->setInterval(interval);
     if (!m_session || !m_session->isConnected()) return;
+    if (m_session->terminalFullScreen()) {
+        m_sampleStatus->setText(QStringLiteral("终端全屏操作 · 暂缓采样"));
+        return;
+    }
     m_session->requestMetrics();
 }
 

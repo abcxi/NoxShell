@@ -9,6 +9,11 @@
 #include <QProgressBar>
 #include <QResizeEvent>
 #include <QVBoxLayout>
+#include <QApplication>
+#include <QGuiApplication>
+#include <QHideEvent>
+#include <QScreen>
+#include <QTimer>
 
 namespace noxshell::ui {
 namespace { constexpr int kSummaryHeight = 44; }
@@ -64,15 +69,27 @@ MetricCard::MetricCard(const QString &title, const QColor &accent, QWidget *pare
     summaryLayout->addWidget(m_progress);
     layout->addWidget(summaryRow);
 
-    m_corePanel = new QFrame;
+    m_corePanel = new QFrame(this, Qt::ToolTip | Qt::FramelessWindowHint | Qt::WindowDoesNotAcceptFocus);
     m_corePanel->setObjectName(QStringLiteral("metricCorePanel"));
-    m_corePanel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_corePanel->setAttribute(Qt::WA_ShowWithoutActivating);
+    m_corePanel->setFocusPolicy(Qt::NoFocus);
+    m_corePanel->installEventFilter(this);
     m_coreLayout = new QGridLayout(m_corePanel);
-    m_coreLayout->setContentsMargins(10, 3, 10, 7);
+    m_coreLayout->setContentsMargins(10, 8, 10, 8);
     m_coreLayout->setHorizontalSpacing(0);
     m_coreLayout->setVerticalSpacing(3);
     m_corePanel->hide();
-    layout->addWidget(m_corePanel);
+    m_coreHideTimer = new QTimer(this);
+    m_coreHideTimer->setSingleShot(true);
+    m_coreHideTimer->setInterval(120);
+    connect(m_coreHideTimer, &QTimer::timeout, this, [this] {
+        if (!m_cardHovered && !m_corePanelHovered) setCorePanelVisible(false);
+    });
+}
+
+MetricCard::~MetricCard()
+{
+    if (qApp) qApp->removeEventFilter(this);
 }
 
 void MetricCard::changeEvent(QEvent *event)
@@ -165,6 +182,7 @@ void MetricCard::rebuildCoreRows()
         layout->addWidget(progress, 1);
         layout->addWidget(value);
         m_coreLayout->addWidget(core, index, 0);
+        core->show();
         m_coreProgressBars.append(progress);
         m_coreValueLabels.append(value);
     }
@@ -173,6 +191,7 @@ void MetricCard::rebuildCoreRows()
         more->setObjectName(QStringLiteral("metricCoreMore"));
         more->setAlignment(Qt::AlignCenter);
         m_coreLayout->addWidget(more, count, 0);
+        more->show();
     }
     applyProgressStyle();
     m_coreLayout->invalidate();
@@ -182,26 +201,49 @@ void MetricCard::rebuildCoreRows()
 
 void MetricCard::setCorePanelVisible(bool visible)
 {
-    visible = visible && !m_coreValues.isEmpty();
-    m_corePanel->setVisible(visible);
-    const int panelHeight = visible ? m_corePanel->sizeHint().height() : 0;
-    setFixedHeight(kSummaryHeight + panelHeight);
-    updateGeometry();
-    if (parentWidget() && parentWidget()->layout()) {
-        parentWidget()->layout()->invalidate();
-        parentWidget()->layout()->activate();
+    if (m_coreHideTimer) m_coreHideTimer->stop();
+    visible = visible && !m_coreValues.isEmpty() && isVisible();
+    if (!visible) {
+        if (qApp) qApp->removeEventFilter(this);
+        m_corePanelHovered = false;
+        m_corePanel->hide();
+        return;
     }
+    // A separate, non-activating window never participates in the monitor
+    // layout, so opening/closing or refreshing cores cannot change scrollbars.
+    const auto anchor = mapToGlobal(QPoint(0, height()));
+    auto *targetScreen = QGuiApplication::screenAt(anchor);
+    if (!targetScreen) targetScreen = screen();
+    const auto available = targetScreen->availableGeometry();
+    m_corePanel->setFixedWidth(qMin(qMax(180, width()), available.width()));
+    m_corePanel->setFixedHeight(qMin(m_coreLayout->sizeHint().height(), available.height()));
+    const int x = qBound(available.left(), anchor.x(), available.right() - m_corePanel->width() + 1);
+    int y = anchor.y() + 3;
+    if (y + m_corePanel->height() > available.bottom() + 1)
+        y = mapToGlobal(QPoint(0, 0)).y() - m_corePanel->height() - 3;
+    y = qBound(available.top(), y, available.bottom() - m_corePanel->height() + 1);
+    m_corePanel->move(x, y);
+    m_corePanel->show();
+    m_corePanel->raise();
+    qApp->installEventFilter(this);
+}
+
+void MetricCard::scheduleCorePanelHide()
+{
+    if (m_corePanel->isVisible()) m_coreHideTimer->start();
 }
 
 void MetricCard::enterEvent(QEnterEvent *event)
 {
     QFrame::enterEvent(event);
+    m_cardHovered = true;
     setCorePanelVisible(true);
 }
 
 void MetricCard::leaveEvent(QEvent *event)
 {
-    setCorePanelVisible(false);
+    m_cardHovered = false;
+    scheduleCorePanelHide();
     QFrame::leaveEvent(event);
 }
 
@@ -216,11 +258,38 @@ void MetricCard::updateDetailText()
 
 bool MetricCard::eventFilter(QObject *watched, QEvent *event)
 {
+    // The core popover replaces the ordinary delayed tooltip on CPU cards.
+    if (watched == this && event->type() == QEvent::ToolTip && !m_coreValues.isEmpty()) return true;
     // Values may gain digits without the card itself resizing. Re-elide after
     // layout assigns the detail label its new width, also after font changes.
     if (watched == m_detail && (event->type() == QEvent::Resize || event->type() == QEvent::FontChange))
         updateDetailText();
+    if (watched == m_corePanel) {
+        if (event->type() == QEvent::Enter) {
+            m_corePanelHovered = true;
+            m_coreHideTimer->stop();
+        } else if (event->type() == QEvent::Leave) {
+            m_corePanelHovered = false;
+            scheduleCorePanelHide();
+        }
+    }
+    if (m_corePanel && m_corePanel->isVisible()) {
+        const auto type = event->type();
+        const auto *widget = qobject_cast<QWidget *>(watched);
+        const bool ancestorChanged = widget && (widget == this || widget->isAncestorOf(this))
+            && (type == QEvent::Move || type == QEvent::Resize || type == QEvent::Hide);
+        if (type == QEvent::Wheel || type == QEvent::ApplicationDeactivate || ancestorChanged
+            || (watched == window() && type == QEvent::WindowDeactivate))
+            setCorePanelVisible(false);
+    }
     return QFrame::eventFilter(watched, event);
+}
+
+void MetricCard::hideEvent(QHideEvent *event)
+{
+    m_cardHovered = false;
+    setCorePanelVisible(false);
+    QFrame::hideEvent(event);
 }
 
 void MetricCard::resizeEvent(QResizeEvent *event)

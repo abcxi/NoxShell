@@ -50,6 +50,7 @@ signals:
     void commandSubmitted(const QString &serverId, const QString &command);
     void fileWorkspaceToggleRequested();
     void homePageVisibilityChanged(bool visible);
+    void savedCredentialsChanged();
 
 private:
     Q_INVOKABLE bool prepareTabContextMenu(int index);

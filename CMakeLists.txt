@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.79 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.82 LANGUAGES CXX)
 
 if(APPLE)
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
@@ -73,6 +73,9 @@ set(NOXSHELL_CORE_SOURCES
     src/core/ServerProfile.h
     src/core/ServerRepository.cpp
     src/core/ServerRepository.h
+    src/core/SavedCredential.h
+    src/core/SavedCredentialManager.cpp
+    src/core/SavedCredentialManager.h
     src/core/SshSession.cpp
     src/core/SshSession.h
 )
@@ -115,6 +118,10 @@ qt_add_executable(NoxShell
     src/ui/SearchMarkerScrollBar.h
     src/ui/ServerDialog.cpp
     src/ui/ServerDialog.h
+    src/ui/CredentialChoice.cpp
+    src/ui/CredentialChoice.h
+    src/ui/CredentialManagerPanel.cpp
+    src/ui/CredentialManagerPanel.h
     src/ui/SystemDetailPanel.cpp
     src/ui/SystemDetailPanel.h
     src/ui/NetworkRateChart.cpp
@@ -206,6 +213,10 @@ if(BUILD_TESTING)
         src/ui/SearchMarkerScrollBar.h
         src/ui/ServerDialog.cpp
         src/ui/ServerDialog.h
+        src/ui/CredentialChoice.cpp
+        src/ui/CredentialChoice.h
+        src/ui/CredentialManagerPanel.cpp
+        src/ui/CredentialManagerPanel.h
         src/ui/SystemDetailPanel.cpp
         src/ui/SystemDetailPanel.h
         src/ui/NetworkRateChart.cpp

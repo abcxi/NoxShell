@@ -4,6 +4,8 @@
 
 class QAction;
 class QMenu;
+class QLineEdit;
+class QTimer;
 class QTabBar;
 class QToolButton;
 class QTreeWidget;
@@ -41,6 +43,9 @@ private:
     QString m_serverId;
     QTabBar *m_tabs{};
     QTreeWidget *m_tree{};
+    QLineEdit *m_search{};
+    QTimer *m_searchTimer{};
+    QToolButton *m_clearSearchButton{};
     QToolButton *m_clearButton{};
     QMenu *m_menu{};
     QAction *m_executeAction{};

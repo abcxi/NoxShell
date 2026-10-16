@@ -37,14 +37,15 @@ public:
     [[nodiscard]] int cursorColumn() const { return m_cursorColumn; }
     [[nodiscard]] int cursorRow() const { return m_cursorRow; }
     [[nodiscard]] bool cursorVisible() const { return m_cursorVisible; }
+    [[nodiscard]] int cursorStyle() const { return m_cursorStyle; }
     [[nodiscard]] bool reverseVideo() const { return m_reverseVideo; }
     [[nodiscard]] bool applicationCursorKeys() const { return m_applicationCursorKeys; }
     [[nodiscard]] bool bracketedPaste() const { return m_bracketedPaste; }
     [[nodiscard]] bool alternateScreen() const { return m_alternateScreen; }
     [[nodiscard]] MouseTracking mouseTracking() const { return m_mouseTracking; }
     [[nodiscard]] bool sgrMouseEncoding() const { return m_sgrMouseEncoding; }
-    [[nodiscard]] int historyLineCount() const { return m_scrollback.size(); }
-    [[nodiscard]] int documentLineCount() const { return m_scrollback.size() + m_rows; }
+    [[nodiscard]] int historyLineCount() const { return m_alternateScreen ? 0 : m_scrollback.size(); }
+    [[nodiscard]] int documentLineCount() const { return historyLineCount() + m_rows; }
     [[nodiscard]] const TerminalCell &cell(int row, int column) const;
     [[nodiscard]] const TerminalCell &documentCell(int line, int column) const;
     [[nodiscard]] QString documentLineText(int line, bool trimRight = true) const;
@@ -91,6 +92,7 @@ private:
     int m_scrollBottom{};
     bool m_wrapPending{false};
     bool m_cursorVisible{true};
+    int m_cursorStyle{6};
     bool m_reverseVideo{false};
     bool m_applicationCursorKeys{false};
     bool m_bracketedPaste{false};

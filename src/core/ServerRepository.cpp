@@ -81,6 +81,11 @@ bool ServerRepository::initialize()
 bool ServerRepository::migrate()
 {
     QSqlQuery query(m_database);
+    if (!query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS saved_credentials ("
+            "id TEXT PRIMARY KEY,name TEXT NOT NULL,user_name TEXT NOT NULL,credential_ref TEXT NOT NULL UNIQUE)"))) {
+        setError(QStringLiteral("创建密码管理"), query.lastError().text());
+        return false;
+    }
     if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS servers ("
             "id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22,"
@@ -385,6 +390,76 @@ bool ServerRepository::replaceCredentialReference(const ServerProfile &expected,
     return query.numRowsAffected() == 1;
 }
 
+QVector<SavedCredential> ServerRepository::loadSavedCredentials()
+{
+    m_lastError.clear();
+    QVector<SavedCredential> result;
+    QSqlQuery query(m_database);
+    if (!query.exec(QStringLiteral("SELECT id,name,user_name,credential_ref FROM saved_credentials ORDER BY name COLLATE NOCASE,id"))) {
+        setError(QStringLiteral("读取密码管理"), query.lastError().text());
+        return result;
+    }
+    while (query.next()) result.append({query.value(0).toString(), query.value(1).toString(),
+        query.value(2).toString(), query.value(3).toString()});
+    return result;
+}
+
+bool ServerRepository::saveSavedCredential(const SavedCredential &value, const SavedCredential *expected)
+{
+    m_lastError.clear();
+    if (!m_database.transaction()) { setError(QStringLiteral("保存账密"), m_database.lastError().text()); return false; }
+    QSqlQuery query(m_database);
+    if (expected) {
+        query.prepare(QStringLiteral("UPDATE saved_credentials SET name=?,user_name=?,credential_ref=? "
+            "WHERE id=? AND name=? AND user_name=? AND credential_ref=?"));
+        query.addBindValue(value.name); query.addBindValue(value.user); query.addBindValue(value.credentialRef);
+        query.addBindValue(expected->id); query.addBindValue(expected->name);
+        query.addBindValue(expected->user); query.addBindValue(expected->credentialRef);
+    } else {
+        query.prepare(QStringLiteral("INSERT INTO saved_credentials(id,name,user_name,credential_ref) VALUES(?,?,?,?)"));
+        query.addBindValue(value.id); query.addBindValue(value.name);
+        query.addBindValue(value.user); query.addBindValue(value.credentialRef);
+    }
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        setError(QStringLiteral("保存账密（可能已被其他窗口修改）"), query.lastError().text());
+        m_database.rollback(); return false;
+    }
+    if (expected) {
+        query.prepare(QStringLiteral("UPDATE servers SET user_name=?,credential_ref=?,updated_at=? "
+            "WHERE credential_ref=? AND authentication=?"));
+        query.addBindValue(value.user); query.addBindValue(value.credentialRef);
+        query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+        query.addBindValue(expected->credentialRef);
+        query.addBindValue(static_cast<int>(AuthenticationMethod::Password));
+        if (!query.exec()) {
+            setError(QStringLiteral("更新关联连接"), query.lastError().text());
+            m_database.rollback(); return false;
+        }
+    }
+    if (!m_database.commit()) {
+        setError(QStringLiteral("提交账密更新"), m_database.lastError().text());
+        m_database.rollback(); return false;
+    }
+    return true;
+}
+
+bool ServerRepository::deleteSavedCredential(const SavedCredential &expected)
+{
+    m_lastError.clear();
+    QSqlQuery query(m_database);
+    // Enforce non-use in SQL as well as in the UI. A stale window cannot remove
+    // a credential that another window has just attached to a server.
+    query.prepare(QStringLiteral("DELETE FROM saved_credentials WHERE id=? AND credential_ref=? AND name=? AND user_name=? "
+        "AND NOT EXISTS (SELECT 1 FROM servers WHERE credential_ref=?)"));
+    query.addBindValue(expected.id); query.addBindValue(expected.credentialRef);
+    query.addBindValue(expected.name); query.addBindValue(expected.user); query.addBindValue(expected.credentialRef);
+    if (!query.exec() || query.numRowsAffected() != 1) {
+        setError(QStringLiteral("无法删除：账密仍被连接使用，或记录已发生变化"), query.lastError().text());
+        return false;
+    }
+    return true;
+}
+
 bool ServerRepository::saveServerGroup(const QString &name)
 {
     const auto normalized = name.trimmed();
@@ -633,14 +708,20 @@ bool ServerRepository::recordCommand(const QString &serverId, const QString &com
     return true;
 }
 
-QVector<CommandHistoryEntry> ServerRepository::loadCommandHistory(bool favoritesOnly, int limit)
+QVector<CommandHistoryEntry> ServerRepository::loadCommandHistory(bool favoritesOnly, int limit, const QString &keyword)
 {
+    m_lastError.clear();
     QVector<CommandHistoryEntry> result;
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
         "SELECT id,server_id,server_name,command,note,favorite,executed_at FROM command_history "
-        "WHERE (?=0 OR favorite=1) ORDER BY executed_at DESC,id DESC LIMIT ?"));
+        "WHERE (?=0 OR favorite=1) AND (?='' OR instr(lower(command),lower(?))>0 "
+        "OR instr(lower(note),lower(?))>0) ORDER BY executed_at DESC,id DESC LIMIT ?"));
     query.addBindValue(favoritesOnly ? 1 : 0);
+    const auto search = keyword.trimmed();
+    query.addBindValue(nonNullText(search));
+    query.addBindValue(nonNullText(search));
+    query.addBindValue(nonNullText(search));
     query.addBindValue(qBound(1, limit, 500));
     if (!query.exec()) {
         setError(QStringLiteral("读取命令历史"), query.lastError().text());

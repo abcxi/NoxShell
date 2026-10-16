@@ -9,6 +9,8 @@
 #include "../src/core/RemoteDirectoryFallback.h"
 #include "../src/core/SshSession.h"
 #include "../src/core/ServerRepository.h"
+#include "../src/core/SavedCredentialManager.h"
+#include "../src/ui/CredentialManagerPanel.h"
 #include "../src/ui/AppTheme.h"
 #include "../src/ui/Application.h"
 #include "../src/ui/CommandHistoryPanel.h"
@@ -38,6 +40,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QContextMenuEvent>
+#include <QCursor>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QEventLoop>
@@ -68,6 +71,7 @@
 #include <QRadioButton>
 #include <QScrollBar>
 #include <QScrollArea>
+#include <QScreen>
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSqlDatabase>
@@ -88,6 +92,7 @@
 #include <QTreeWidgetItemIterator>
 #include <QUrl>
 #include <QUuid>
+#include <QWheelEvent>
 #include <QtTest>
 
 #include <algorithm>
@@ -881,6 +886,362 @@ private slots:
         QVERIFY(!sanitized.contains(QStringLiteral("BearerValue")));
         QVERIFY(!sanitized.contains(QStringLiteral("ey.secret.token")));
         QVERIFY(sanitized.contains(QStringLiteral("<redacted>")));
+    }
+
+    void savedCredentialsRotateAtomicallyAndKeepSharedConnections()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("saved.sqlite")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore store;
+        noxshell::SavedCredentialManager manager(&repository, &store);
+        QSignalSpy changed(&manager, &noxshell::SavedCredentialManager::changed);
+        noxshell::SavedCredential account{{}, QStringLiteral("测试 root"), QStringLiteral("root"), {}};
+        QVERIFY(manager.save(account, QStringLiteral("synthetic-A!")));
+        QVERIFY(account.credentialRef.startsWith(QStringLiteral("managed/")));
+        QCOMPARE(store.loadCalls, 0);
+        const auto original = account;
+        auto server = noxshell::ServerProfile{};
+        server.name = QStringLiteral("shared-A"); server.host = QStringLiteral("192.0.2.5");
+        server.user = account.user; server.connectionMode = noxshell::ConnectionMode::Ssh;
+        server.credentialRef = account.credentialRef;
+        QVERIFY(repository.saveServer(server));
+        server.id.clear(); server.name = QStringLiteral("shared-B");
+        QVERIFY(repository.saveServer(server));
+        QVERIFY(!manager.remove(account));
+        QVERIFY(store.secrets.contains(account.credentialRef));
+
+        store.failSaves = true;
+        account.name = QStringLiteral("改名");
+        QVERIFY(!manager.save(account, QStringLiteral("synthetic-B!"), &original));
+        QCOMPARE(repository.loadSavedCredentials().first().credentialRef, original.credentialRef);
+        store.failSaves = false;
+        account.user = QStringLiteral("admin");
+        QVERIFY(manager.save(account, QStringLiteral("synthetic-B!"), &original));
+        QVERIFY(!store.secrets.contains(original.credentialRef));
+        QCOMPARE(store.secrets.value(account.credentialRef).password, QStringLiteral("synthetic-B!"));
+        const auto servers = repository.loadServers();
+        QCOMPARE(servers.size(), 2);
+        for (const auto &saved : servers) { QCOMPARE(saved.credentialRef, account.credentialRef); QCOMPARE(saved.user, account.user); }
+        const auto faultConnection = QUuid::createUuid().toString();
+        {
+            auto database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), faultConnection);
+            database.setDatabaseName(repository.databasePath());
+            QVERIFY(database.open());
+            QSqlQuery fault(database);
+            QVERIFY(fault.exec(QStringLiteral("CREATE TRIGGER fail_rotation BEFORE UPDATE OF credential_ref ON servers "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic rollback test'); END")));
+            const auto beforeFault = account;
+            const auto secretsBeforeFault = store.secrets.size();
+            auto failedUpdate = account;
+            failedUpdate.user = QStringLiteral("should-not-commit");
+            QVERIFY(!manager.save(failedUpdate, QStringLiteral("synthetic-rejected!"), &beforeFault));
+            QCOMPARE(repository.loadSavedCredentials().first().credentialRef, account.credentialRef);
+            QCOMPARE(repository.loadServers().first().credentialRef, account.credentialRef);
+            QCOMPARE(repository.loadServers().first().user, account.user);
+            QCOMPARE(store.secrets.size(), secretsBeforeFault);
+            QVERIFY(fault.exec(QStringLiteral("DROP TRIGGER fail_rotation")));
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(faultConnection);
+        auto stale = original;
+        const auto count = store.secrets.size();
+        QVERIFY(!manager.save(stale, QStringLiteral("synthetic-stale!"), &original));
+        QCOMPARE(store.secrets.size(), count); // Only the failed new version is cleaned up.
+        QCOMPARE(repository.loadSavedCredentials().first().credentialRef, account.credentialRef);
+        const auto beforeRename = account;
+        account.name = QStringLiteral("只改名称");
+        const int writes = store.saveCalls;
+        QVERIFY(manager.save(account, {}, &beforeRename));
+        QCOMPARE(store.saveCalls, writes);
+        QCOMPARE(store.loadCalls, 0);
+        {
+            noxshell::ServerRepository reopened(repository.databasePath(), false);
+            QVERIFY(reopened.initialize());
+            QCOMPARE(reopened.loadSavedCredentials().first().name, account.name);
+            for (const auto &saved : reopened.loadServers()) QVERIFY(saved.password.isEmpty());
+        }
+        for (const auto &saved : servers) QVERIFY(repository.deleteServer(saved.id));
+        QVERIFY(manager.remove(account));
+        QVERIFY(repository.loadSavedCredentials().isEmpty());
+        QVERIFY(store.secrets.isEmpty());
+        QCOMPARE(changed.count(), 4);
+    }
+
+    void savedCredentialSelectorsPreserveMaskedStateWithoutReadingSecrets()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("dialogs.sqlite")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore store;
+        noxshell::SavedCredentialManager manager(&repository, &store);
+        noxshell::SavedCredential account{{}, QStringLiteral("常用管理员"), QStringLiteral("admin"), {}};
+        QVERIFY(manager.save(account, QStringLiteral("synthetic-only!")));
+        noxshell::ServerProfile existing;
+        existing.id = QStringLiteral("saved-mask"); existing.name = existing.id;
+        existing.host = QStringLiteral("192.0.2.7"); existing.user = QStringLiteral("root");
+        existing.authentication = noxshell::AuthenticationMethod::Password;
+        existing.credentialRef = QStringLiteral("server/saved-mask");
+        noxshell::ui::ServerDialog edit(existing);
+        edit.setConnectionServices(&repository, &store);
+        auto *password = edit.findChild<QLineEdit *>(QStringLiteral("passwordEditor"));
+        auto *choice = edit.findChild<QComboBox *>(QStringLiteral("credentialChoice"));
+        QVERIFY(password && choice);
+        QVERIFY(password->text().isEmpty());
+        QVERIFY(password->placeholderText().contains(QStringLiteral("●●●●●●")));
+        QVERIFY(edit.findChild<QLabel *>(QStringLiteral("passwordSourceHint"))->text().contains(QStringLiteral("已保存")));
+        QCOMPARE(edit.profile().credentialRef, existing.credentialRef);
+        QCOMPARE(store.loadCalls, 0);
+        choice->setCurrentIndex(choice->findData(account.credentialRef));
+        QCOMPARE(edit.profile().user, account.user);
+        QCOMPARE(edit.profile().credentialRef, account.credentialRef);
+        QVERIFY(edit.profile().password.isEmpty());
+        QVERIFY(!password->isEnabled());
+        QCOMPARE(store.loadCalls, 0);
+        choice->setCurrentIndex(0);
+        QVERIFY(password->isEnabled());
+        password->setText(QStringLiteral("manual-only!"));
+        QCOMPARE(edit.profile().password, QStringLiteral("manual-only!"));
+
+        existing.credentialRef = account.credentialRef;
+        noxshell::ui::ServerDialog shared(existing);
+        shared.setConnectionServices(&repository, &store);
+        QCOMPARE(shared.profile().credentialRef, account.credentialRef);
+        shared.findChild<QComboBox *>(QStringLiteral("credentialChoice"))->setCurrentIndex(0);
+        QVERIFY(shared.profile().credentialRef.isEmpty()); // Manual never silently reuses shared credentials.
+        noxshell::ui::RdpDialog rdp(existing);
+        rdp.setConnectionRepository(&repository);
+        QCOMPARE(rdp.profile().credentialRef, account.credentialRef);
+        QCOMPARE(rdp.profile().user, account.user);
+        QCOMPARE(store.loadCalls, 0);
+    }
+
+    void credentialManagerPanelCreatesAndEditsWithoutRevealingPasswords()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("panel.sqlite")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore store;
+        noxshell::ui::CredentialManagerPanel panel(&repository, &store);
+        panel.resize(900, 450); panel.show();
+        bool edited = false;
+        const auto fillDialog = [&](bool adding) {
+            auto *dialog = panel.findChild<QDialog *>(QStringLiteral("savedCredentialDialog"));
+            if (!dialog) return;
+            auto *password = dialog->findChild<QLineEdit *>(QStringLiteral("savedCredentialPassword"));
+            edited = password && password->text().isEmpty() && password->echoMode() == QLineEdit::Password;
+            if (!adding) edited = edited && password->placeholderText().contains(QStringLiteral("已保存"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("savedCredentialName"))->setText(QStringLiteral("测试用账密"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("savedCredentialUser"))->setText(adding ? QStringLiteral("root") : QStringLiteral("admin"));
+            if (adding) password->setText(QStringLiteral("synthetic-panel-only!"));
+            QTest::mouseClick(dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save), Qt::LeftButton);
+        };
+        QTimer::singleShot(0, &panel, [&] { fillDialog(true); });
+        QTest::mouseClick(panel.findChild<QPushButton *>(QStringLiteral("addSavedCredential")), Qt::LeftButton);
+        QVERIFY(edited);
+        auto *list = panel.findChild<QTreeWidget *>(QStringLiteral("savedCredentialList"));
+        QCOMPARE(list->topLevelItemCount(), 1);
+        QVERIFY(list->topLevelItem(0)->text(2).contains(QStringLiteral("●●●●●●")));
+        list->setCurrentItem(list->topLevelItem(0));
+        const auto reference = repository.loadSavedCredentials().first().credentialRef;
+        edited = false;
+        QTimer::singleShot(0, &panel, [&] { fillDialog(false); });
+        QTest::mouseClick(panel.findChild<QPushButton *>(QStringLiteral("editSavedCredential")), Qt::LeftButton);
+        QVERIFY(edited);
+        QCOMPARE(repository.loadSavedCredentials().first().user, QStringLiteral("admin"));
+        QCOMPARE(repository.loadSavedCredentials().first().credentialRef, reference);
+        QCOMPARE(store.loadCalls, 0);
+    }
+
+    void managedCredentialsWorkAcrossConnectionForms_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void managedCredentialsWorkAcrossConnectionForms()
+    {
+        QFETCH(bool, dark);
+        const auto previous = noxshell::ui::storedThemeMode();
+        QSettings settings;
+        const auto previousSetting = settings.value(QStringLiteral("ui/themeMode"));
+        settings.setValue(QStringLiteral("ui/themeMode"), dark ? QStringLiteral("dark") : QStringLiteral("light"));
+        const auto restore = qScopeGuard([&] {
+            if (previousSetting.isValid()) settings.setValue(QStringLiteral("ui/themeMode"), previousSetting);
+            else settings.remove(QStringLiteral("ui/themeMode"));
+            noxshell::ui::applyApplicationTheme(previous);
+        });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("integration.sqlite")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore store;
+        noxshell::SavedCredentialManager manager(&repository, &store);
+        noxshell::SavedCredential account{{}, QStringLiteral("测试运维账号"), QStringLiteral("root"), {}};
+        QVERIFY(manager.save(account, QStringLiteral("synthetic-shared-only!")));
+        noxshell::ui::MainWindow window(repository.databasePath(), nullptr, &store);
+        window.resize(1200, 800); window.show();
+        auto *sidebar = window.findChild<noxshell::ui::HostSidebar *>();
+        auto *panel = window.findChild<noxshell::ui::CredentialManagerPanel *>();
+        auto *home = window.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
+        QVERIFY(sidebar && panel && home);
+        QCOMPARE(home->count(), 3);
+        const auto initialServers = repository.loadServers().size();
+        bool filled = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("nameEditor"))->setText(QStringLiteral("共享 SSH"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("hostEditor"))->setText(QStringLiteral("192.0.2.9"));
+            dialog->findChild<QComboBox *>(QStringLiteral("credentialChoice"))->setCurrentIndex(1);
+            filled = true;
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->addServerRequested();
+        QVERIFY(filled);
+        QCOMPARE(repository.loadServers().size(), initialServers + 1);
+        QCOMPARE(repository.loadServers().last().credentialRef, account.credentialRef);
+        QCOMPARE(store.saveCalls, 1);
+        QCOMPARE(store.loadCalls, 0);
+        filled = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::RdpDialog *>();
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("rdpNameEditor"))->setText(QStringLiteral("共享远程桌面"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("rdpHostEditor"))->setText(QStringLiteral("192.0.2.10"));
+            dialog->findChild<QComboBox *>(QStringLiteral("credentialChoice"))->setCurrentIndex(1);
+            filled = true;
+            dialog->findChild<QPushButton *>(QStringLiteral("primaryButton"))->click();
+        });
+        sidebar->addRdpServerRequested();
+        QVERIFY(filled);
+        QCOMPARE(repository.loadServers().size(), initialServers + 2);
+        QCOMPARE(store.saveCalls, 1);
+        home->setCurrentIndex(2);
+        auto *list = panel->findChild<QTreeWidget *>(QStringLiteral("savedCredentialList"));
+        QCOMPARE(list->topLevelItem(0)->text(3), QStringLiteral("2"));
+        list->setCurrentItem(list->topLevelItem(0));
+        QTimer::singleShot(0, &window, [&] {
+            auto *dialog = panel->findChild<QDialog *>(QStringLiteral("savedCredentialDialog"));
+            if (!dialog) return;
+            dialog->findChild<QLineEdit *>(QStringLiteral("savedCredentialUser"))->setText(QStringLiteral("admin"));
+            dialog->findChild<QLineEdit *>(QStringLiteral("savedCredentialPassword"))->setText(QStringLiteral("synthetic-updated-only!"));
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
+        });
+        panel->findChild<QPushButton *>(QStringLiteral("editSavedCredential"))->click();
+        const auto updated = repository.loadSavedCredentials().first();
+        QVERIFY(updated.credentialRef != account.credentialRef);
+        for (const auto &server : sidebar->servers()) {
+            if (!server.credentialRef.startsWith(QStringLiteral("managed/"))) continue;
+            QCOMPARE(server.credentialRef, updated.credentialRef);
+            QCOMPARE(server.user, QStringLiteral("admin"));
+        }
+        QCOMPARE(store.loadCalls, 0);
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_CREDENTIAL_SCREENSHOT_DIR");
+        if (!captureDir.isEmpty()) {
+            QApplication::processEvents();
+            QVERIFY(window.grab().save(QDir(captureDir).filePath(dark ? QStringLiteral("passwords-dark.png") : QStringLiteral("passwords-light.png"))));
+        }
+        // Deleting a host must not remove the credential used by another host.
+        {
+            CloseDialogResponder confirm;
+            sidebar->serverDeleteRequested(sidebar->servers().last());
+        }
+        QCOMPARE(repository.loadServers().size(), initialServers + 1);
+        QVERIFY(store.secrets.contains(updated.credentialRef));
+        QCOMPARE(repository.loadSavedCredentials().size(), 1);
+    }
+
+    void terminalFullScreenHidesHistoryPreservesResizeAndCursor()
+    {
+        noxshell::ui::VtTerminalModel model(20, 6);
+        model.feed(QStringLiteral("shell\r\n").repeated(50));
+        const auto history = model.historyLineCount();
+        QVERIFY(history > 0);
+        model.feed(QStringLiteral("\x1b[?1049h\x1b[2J\x1b[Hvi-content\x1b[2 q"));
+        QCOMPARE(model.historyLineCount(), 0);
+        QCOMPARE(model.documentLineCount(), model.rows());
+        QVERIFY(model.documentLineText(0).startsWith(QStringLiteral("vi-content")));
+        QCOMPARE(model.cursorStyle(), 2);
+        model.resize(32, 9);
+        model.feed(QStringLiteral("\x1b[?25l\x1b[?25h\x1b[?1049l"));
+        QCOMPARE(model.historyLineCount(), history);
+        QVERIFY(model.cursorVisible());
+        for (int row = 0; row < model.rows(); ++row) for (int col = 0; col < model.columns(); ++col) (void)model.cell(row, col);
+        model.feed(QStringLiteral("\x1b[?1049h"));
+        model.resize(10, 3);
+        model.feed(QStringLiteral("\x1b[?1049l"));
+        QVERIFY(model.cursorColumn() < 10 && model.cursorRow() < 3);
+    }
+
+    void terminalViInputAvoidsHistoryScanningAndCommandRecording()
+    {
+        noxshell::ui::TerminalView view;
+        auto appearance = view.appearance(); appearance.autoEnglishInput = false; view.setAppearance(appearance);
+        view.resize(800, 400); view.show(); view.setFocus();
+        view.feedText(QStringLiteral("history without prompt\r\n").repeated(1500));
+        auto *scroll = view.findChild<QScrollBar *>(QStringLiteral("terminalScrollBar"));
+        scroll->setValue(0);
+        QSignalSpy mode(&view, &noxshell::ui::TerminalView::fullScreenModeChanged);
+        QSignalSpy commands(&view, &noxshell::ui::TerminalView::commandSubmitted);
+        QSignalSpy keys(&view, &noxshell::ui::TerminalView::inputGenerated);
+        view.feedText(QStringLiteral("\x1b[?1049h\x1b[Hvi\x1b[2 q"));
+        QCOMPARE(scroll->maximum(), 0);
+        QTest::mouseMove(&view, view.contentOrigin().toPoint() + QPoint(20, 20));
+        QElapsedTimer elapsed; elapsed.start();
+        for (int index = 0; index < 500; ++index) {
+            view.feedText(QStringLiteral("\x1b[3;3Htext\x1b[3;3H"));
+            if (index % 10 == 0) QApplication::processEvents();
+        }
+        qInfo() << "500 vi updates including repaint:" << elapsed.elapsed() << "ms";
+        QVERIFY2(elapsed.elapsed() < 2000, "Small vi updates must not rescan scrollback");
+        QTest::keyClicks(&view, QStringLiteral("insert"));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QTest::keyClick(&view, Qt::Key_Escape);
+        QCOMPARE(commands.count(), 0);
+        QCOMPARE(keys.count(), 8);
+        QTest::keyClick(&view, Qt::Key_F, Qt::ControlModifier);
+        QCOMPARE(keys.last().at(0).toByteArray(), QByteArray(1, '\x06'));
+        QVERIFY(view.findChild<QFrame *>(QStringLiteral("terminalSearchBar"))->isHidden());
+        QTest::keyClick(&view, Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(keys.last().at(0).toByteArray(), QByteArray(1, '\x16'));
+        QFocusEvent focus(QEvent::FocusIn); QApplication::sendEvent(&view, &focus);
+        const auto image = view.grab().toImage();
+        QInputMethodQueryEvent query(Qt::ImCursorRectangle);
+        QApplication::sendEvent(&view, &query);
+        const auto cursor = query.value(Qt::ImCursorRectangle).toRectF();
+        QCOMPARE(image.pixelColor(QPoint(qRound(cursor.left()) + 1, qRound(cursor.top()) + 3)), QColor(QStringLiteral("#7DB1DE")));
+        view.clear(); // Clearing history while vi redraws must retain full-screen modes.
+        QCOMPARE(scroll->maximum(), 0);
+        QCOMPARE(mode.count(), 1);
+        view.feedText(QStringLiteral("\x1b[?1049l"));
+        QCOMPARE(scroll->maximum(), 0); // Explicit clear also cleared the old history.
+        QCOMPARE(mode.count(), 2);
+    }
+
+    void terminalInteractiveUseDefersMetricsUntilExitAndIdle()
+    {
+        noxshell::SshSession session;
+        noxshell::ServerProfile profile;
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        profile.name = QStringLiteral("synthetic-terminal");
+        session.connectTo(profile);
+        QTRY_VERIFY(session.isConnected());
+        QSignalSpy samples(&session, &noxshell::SshSession::metricSampleReceived);
+        session.setTerminalFullScreen(true);
+        session.requestMetrics();
+        QTest::qWait(30);
+        QCOMPARE(samples.count(), 0);
+        session.setTerminalFullScreen(false);
+        session.sendInput(QByteArray("i"));
+        session.requestMetrics();
+        QTest::qWait(30);
+        QCOMPARE(samples.count(), 0);
+        QTest::qWait(1220);
+        session.requestMetrics();
+        QTRY_COMPARE(samples.count(), 1);
     }
 
     void vtTerminalParsesAnsiCursorColorAndAlternateScreen()
@@ -2103,8 +2464,10 @@ private slots:
         const int historyBeforeAlternate = model.historyLineCount();
         model.feed(QStringLiteral("\x1b[?1049h"));
         for (int line = 0; line < 20; ++line) model.feed(QStringLiteral("alt\r\n"));
-        QCOMPARE(model.historyLineCount(), historyBeforeAlternate);
+        QCOMPARE(model.historyLineCount(), 0);
+        QCOMPARE(model.documentLineCount(), model.rows());
         model.feed(QStringLiteral("\x1b[?1049l"));
+        QCOMPARE(model.historyLineCount(), historyBeforeAlternate);
     }
 
     void terminalViewSelectsTextScrollsAndReportsMouse()
@@ -2204,14 +2567,20 @@ private slots:
         QVERIFY(history.isEmpty());
     }
 
-    void metricCardUsesThinTrackAndExpandsCpuCoresOnHover()
+    void metricCardUsesThinTrackAndShowsCpuPopoverOnHover()
     {
         noxshell::ui::MetricCard card(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
         card.resize(220, 44);
         card.setValue(QStringLiteral("36.3%"), QStringLiteral("内核态 15.8%"), 36);
         card.setCoreValues({12.0, 34.0, 56.0, 78.0});
+        // Keep the platform's real pointer away from this standalone card;
+        // synthetic Leave events must not be followed by a real Enter.
+        const auto available = card.screen()->availableGeometry();
+        card.move(QCursor::pos().x() < available.center().x()
+            ? QPoint(available.right() - 240, available.top() + 30)
+            : available.topLeft() + QPoint(20, 30));
         card.show();
-        QCoreApplication::processEvents();
+        QTest::qWait(30);
 
         auto *summaryProgress = card.findChild<QProgressBar *>(QStringLiteral("metricProgress"));
         auto *corePanel = card.findChild<QFrame *>(QStringLiteral("metricCorePanel"));
@@ -2237,12 +2606,15 @@ private slots:
         QVERIFY(summaryProgress->styleSheet().contains(QStringLiteral("border-radius:2px")));
         QEvent initialLeaveEvent(QEvent::Leave);
         QApplication::sendEvent(&card, &initialLeaveEvent);
-        QVERIFY(!corePanel->isVisible());
+        QApplication::sendEvent(corePanel, &initialLeaveEvent);
+        QTRY_VERIFY(!corePanel->isVisible());
 
         QEnterEvent enterEvent(QPointF(10, 10), QPointF(10, 10), QPointF(10, 10));
         QApplication::sendEvent(&card, &enterEvent);
         QVERIFY(corePanel->isVisible());
-        QVERIFY(card.height() > 44);
+        QCOMPARE(card.height(), 44);
+        QVERIFY(corePanel->isWindow());
+        QVERIFY(corePanel->windowFlags() & Qt::WindowDoesNotAcceptFocus);
         const auto coreProgresses = corePanel->findChildren<QProgressBar *>(QStringLiteral("metricCoreProgress"));
         QCOMPARE(coreProgresses.size(), 4);
         for (int index = 1; index < coreProgresses.size(); ++index) {
@@ -2263,7 +2635,8 @@ private slots:
 
         QEvent leaveEvent(QEvent::Leave);
         QApplication::sendEvent(&card, &leaveEvent);
-        QVERIFY(!corePanel->isVisible());
+        QApplication::sendEvent(corePanel, &leaveEvent);
+        QTRY_VERIFY(!corePanel->isVisible());
         QCOMPARE(card.height(), 44);
 
         // A changing numeric value must reallocate inline detail space even
@@ -2282,6 +2655,141 @@ private slots:
         QVERIFY(detail->width() > narrowDetailWidth);
         QVERIFY(detail->fontMetrics().horizontalAdvance(detail->text()) <= detail->width());
         QCOMPARE(value->text(), QStringLiteral("1%"));
+    }
+
+    void cpuPopoverKeepsScrollLayoutAndFocusStable_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::addColumn<bool>("overflow");
+        for (const bool dark : {false, true}) for (const bool overflow : {false, true})
+            QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(dark ? "dark" : "light")
+                .arg(overflow ? "scrolling" : "fits"))) << dark << overflow;
+    }
+
+    void cpuPopoverKeepsScrollLayoutAndFocusStable()
+    {
+        QFETCH(bool, dark);
+        QFETCH(bool, overflow);
+        const auto previous = noxshell::ui::isApplicationDarkTheme();
+        auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previous
+            ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        QWidget window;
+        auto *outerLayout = new QHBoxLayout(&window);
+        auto *scroll = new QScrollArea;
+        scroll->setFixedWidth(236);
+        scroll->setWidgetResizable(true);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        auto *content = new QWidget;
+        auto *layout = new QVBoxLayout(content);
+        auto *card = new noxshell::ui::MetricCard(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
+        card->setValue(QStringLiteral("5.8%"), QStringLiteral("内核态 2.5%"), 6);
+        card->setCoreValues({6.0, 7.0});
+        layout->addWidget(card);
+        auto *below = new QLabel(QStringLiteral("内存 / 网络 / 进程"));
+        below->setFixedHeight(overflow ? 470 : 240);
+        layout->addWidget(below);
+        layout->addStretch();
+        scroll->setWidget(content);
+        outerLayout->addWidget(scroll);
+        auto *input = new QLineEdit;
+        outerLayout->addWidget(input);
+        window.resize(620, 360);
+        window.show();
+        window.activateWindow();
+        QApplication::setActiveWindow(&window);
+        input->setFocus();
+        QTRY_VERIFY(input->hasFocus());
+        QTest::qWait(30);
+        auto *bar = scroll->verticalScrollBar();
+        QCOMPARE(bar->maximum() > 0, overflow);
+        bar->setValue(overflow ? 8 : 0);
+        QCoreApplication::processEvents();
+        const int scrollMaximum = bar->maximum();
+        const int scrollValue = bar->value();
+        const auto contentSize = content->size();
+        const auto belowGeometry = below->geometry();
+        const auto cardGeometry = card->geometry();
+        auto *popup = card->findChild<QFrame *>(QStringLiteral("metricCorePanel"));
+        QVERIFY(popup);
+        const auto enter = [&] {
+            QEnterEvent event(QPointF(10, 10), QPointF(10, 10), card->mapToGlobal(QPoint(10, 10)));
+            QApplication::sendEvent(card, &event);
+        };
+        const auto stableLayout = [&] {
+            QCOMPARE(card->geometry(), cardGeometry);
+            QCOMPARE(below->geometry(), belowGeometry);
+            QCOMPARE(content->size(), contentSize);
+            QCOMPARE(bar->maximum(), scrollMaximum);
+            QCOMPARE(bar->value(), scrollValue);
+            QCOMPARE(QApplication::focusWidget(), input);
+        };
+        enter();
+        QTRY_VERIFY(popup->isVisible());
+        stableLayout();
+        QVERIFY(popup->screen()->availableGeometry().contains(popup->geometry()));
+        QCOMPARE(popup->width(), card->width());
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_MONITOR_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) QVERIFY(popup->grab().save(QDir(screenshots).filePath(
+            QStringLiteral("cpu-popover-%1-%2.png").arg(dark ? "dark" : "light").arg(overflow ? "scrolling" : "fits"))));
+        const int smallHeight = popup->height();
+        // Updating samples or rebuilding for a different core count must not
+        // resize the monitor content or disturb the terminal's input focus.
+        card->setCoreValues(QVector<double>(16, 12.0));
+        QCoreApplication::processEvents();
+        QVERIFY(popup->isVisible());
+        QVERIFY2(popup->height() > smallHeight, qPrintable(QStringLiteral("popup heights %1 -> %2")
+            .arg(smallHeight).arg(popup->height())));
+        stableLayout();
+        card->setCoreValues({5.0, 8.0});
+        QCoreApplication::processEvents();
+        QCOMPARE(popup->height(), smallHeight);
+        stableLayout();
+        QEvent leave(QEvent::Leave);
+        QApplication::sendEvent(card, &leave);
+        QEnterEvent popupEnter(QPointF(10, 10), QPointF(10, 10), popup->mapToGlobal(QPoint(10, 10)));
+        QApplication::sendEvent(popup, &popupEnter);
+        QTest::qWait(160);
+        QVERIFY(popup->isVisible()); // The pointer can cross the small gap.
+        QApplication::sendEvent(popup, &leave);
+        QTRY_VERIFY(!popup->isVisible());
+        stableLayout();
+        enter();
+        QTRY_VERIFY(popup->isVisible());
+        QWheelEvent wheel(QPointF(4, 4), scroll->viewport()->mapToGlobal(QPoint(4, 4)),
+            QPoint(), QPoint(0, 120), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        // Send the event to a non-scrolling widget so only the dismissal, not
+        // normal wheel scrolling, is measured by the stable-layout assertion.
+        QApplication::sendEvent(input, &wheel);
+        QVERIFY(!popup->isVisible());
+        stableLayout();
+        if (overflow) {
+            enter();
+            QTRY_VERIFY(popup->isVisible());
+            bar->setValue(scrollValue + 1);
+            QTRY_VERIFY(!popup->isVisible());
+            bar->setValue(scrollValue);
+            stableLayout();
+        }
+        enter();
+        QTRY_VERIFY(popup->isVisible());
+        window.move(window.pos() + QPoint(5, 5));
+        QTRY_VERIFY(!popup->isVisible());
+        enter();
+        QTRY_VERIFY(popup->isVisible());
+        card->setCoreValues({});
+        QVERIFY(!popup->isVisible());
+        stableLayout();
+        card->setCoreValues({6.0, 7.0});
+        enter();
+        QTRY_VERIFY(popup->isVisible());
+        QEvent deactivate(QEvent::WindowDeactivate);
+        QApplication::sendEvent(&window, &deactivate);
+        QVERIFY(!popup->isVisible());
+        enter();
+        QTRY_VERIFY(popup->isVisible());
+        window.hide();
+        QVERIFY(!popup->isVisible());
     }
 
     void parsesLinuxMetricsAndCalculatesCpuDelta()
@@ -2793,6 +3301,109 @@ private slots:
         QCOMPARE(repository.loadCommandHistory().size(), 1);
         QVERIFY(repository.clearCommandHistory());
         QVERIFY(repository.loadCommandHistory().isEmpty());
+    }
+
+    void commandHistorySearchFindsOlderRowsAndTreatsKeywordsLiterally()
+    {
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("command-search.sqlite")), false);
+        QVERIFY(repository.initialize());
+        noxshell::ServerProfile server;
+        server.name = QStringLiteral("search-fixture"); server.host = QStringLiteral("192.0.2.11");
+        server.user = QStringLiteral("root");
+        QVERIFY(repository.saveServer(server));
+        const auto now = QDateTime::currentDateTime();
+        QVERIFY(repository.recordCommand(server.id, QStringLiteral("netstat -nt"), now.addSecs(-1000)));
+        const auto oldId = repository.loadCommandHistory().first().id;
+        QVERIFY(repository.setCommandNote(oldId, QStringLiteral("获取连接数 100%_done")));
+        for (int index = 0; index < 305; ++index)
+            QVERIFY(repository.recordCommand(server.id, QStringLiteral("echo fixture-%1").arg(index), now.addSecs(index)));
+        const auto recent = repository.loadCommandHistory(false, 300);
+        QCOMPARE(recent.size(), 300);
+        QVERIFY(std::none_of(recent.cbegin(), recent.cend(), [oldId](const auto &entry) { return entry.id == oldId; }));
+        const auto older = repository.loadCommandHistory(false, 300, QStringLiteral(" NETSTAT "));
+        QCOMPARE(older.size(), 1);
+        QCOMPARE(older.first().id, oldId);
+        QCOMPARE(repository.loadCommandHistory(false, 300, QStringLiteral("获取连接数")).size(), 1);
+        QCOMPARE(repository.loadCommandHistory(false, 300, QStringLiteral("100%_done")).size(), 1);
+        QVERIFY(repository.loadCommandHistory(false, 300, QStringLiteral("not_a_%_match")).isEmpty());
+        QVERIFY(repository.loadCommandHistory(false, 300, QStringLiteral("' OR 1=1 --")).isEmpty());
+        QVERIFY(repository.loadCommandHistory(true, 300, QStringLiteral("netstat")).isEmpty());
+        QVERIFY(repository.setCommandFavorite(oldId, true));
+        QCOMPARE(repository.loadCommandHistory(true, 300, QStringLiteral("netstat")).size(), 1);
+        QCOMPARE(repository.loadCommandHistory(false, 500, QStringLiteral("  ")).size(), 306);
+    }
+
+    void commandHistorySearchAndClearWorkAcrossTabs_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void commandHistorySearchAndClearWorkAcrossTabs()
+    {
+        QFETCH(bool, dark);
+        const auto previousTheme = noxshell::ui::storedThemeMode();
+        const auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previousTheme); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("search-panel.sqlite")), false);
+        QVERIFY(repository.initialize());
+        noxshell::ServerProfile server;
+        server.name = QStringLiteral("test-host"); server.host = QStringLiteral("192.0.2.11");
+        server.user = QStringLiteral("root");
+        QVERIFY(repository.saveServer(server));
+        QVERIFY(repository.recordCommand(server.id, QStringLiteral("netstat -nt")));
+        const auto favoriteId = repository.loadCommandHistory().first().id;
+        QVERIFY(repository.setCommandFavorite(favoriteId, true));
+        QVERIFY(repository.setCommandNote(favoriteId, QStringLiteral("获取连接数")));
+        QVERIFY(repository.recordCommand(server.id, QStringLiteral("ps -fx")));
+        QVERIFY(repository.recordCommand(server.id, QStringLiteral("ip addr")));
+        noxshell::ui::CommandHistoryPanel panel(&repository);
+        panel.setServerId(server.id);
+        panel.resize(1000, 240); panel.show();
+        auto *search = panel.findChild<QLineEdit *>(QStringLiteral("commandHistorySearch"));
+        auto *clear = panel.findChild<QToolButton *>(QStringLiteral("commandHistoryClearSearchButton"));
+        auto *tabs = panel.findChild<QTabBar *>(QStringLiteral("commandHistoryTabs"));
+        auto *tree = panel.findChild<QTreeWidget *>(QStringLiteral("commandHistoryList"));
+        QVERIFY(search && clear && tabs && tree);
+        QSignalSpy selected(&panel, &noxshell::ui::CommandHistoryPanel::commandSelected);
+        QSignalSpy executed(&panel, &noxshell::ui::CommandHistoryPanel::commandExecutionRequested);
+        QCOMPARE(tree->topLevelItemCount(), 3);
+        QVERIFY(!clear->isEnabled());
+        search->setText(QStringLiteral("PS"));
+        QTest::keyClick(search, Qt::Key_Return);
+        QCOMPARE(tree->topLevelItemCount(), 1);
+        QCOMPARE(tree->topLevelItem(0)->text(1), QStringLiteral("ps -fx"));
+        QCOMPARE(executed.count(), 0);
+        QCOMPARE(selected.count(), 0);
+        tabs->setCurrentIndex(1);
+        QCOMPARE(search->text(), QStringLiteral("PS"));
+        QCOMPARE(tree->topLevelItemCount(), 0);
+        search->setText(QStringLiteral("连接"));
+        QTRY_COMPARE_WITH_TIMEOUT(tree->topLevelItemCount(), 1, 1000);
+        QCOMPARE(tree->topLevelItem(0)->text(1), QStringLiteral("netstat -nt"));
+        panel.refresh();
+        QCOMPARE(search->text(), QStringLiteral("连接"));
+        QCOMPARE(tree->topLevelItemCount(), 1);
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_COMMAND_SEARCH_SCREENSHOT_DIR");
+        if (!captureDir.isEmpty()) {
+            QApplication::processEvents();
+            QVERIFY(panel.grab().save(QDir(captureDir).filePath(dark ? QStringLiteral("search-dark.png") : QStringLiteral("search-light.png"))));
+        }
+        QTest::mouseClick(clear, Qt::LeftButton);
+        QVERIFY(search->text().isEmpty());
+        QVERIFY(!clear->isEnabled());
+        QCOMPARE(tree->topLevelItemCount(), 1); // Still on favorites.
+        tabs->setCurrentIndex(0);
+        QCOMPARE(tree->topLevelItemCount(), 3);
+        search->setText(QStringLiteral("no-such-command"));
+        QTRY_COMPARE_WITH_TIMEOUT(tree->topLevelItemCount(), 0, 1000);
+        QTest::mouseClick(clear, Qt::LeftButton);
+        QCOMPARE(tree->topLevelItemCount(), 3);
+        QCOMPARE(repository.loadCommandHistory().size(), 3);
+        QCOMPARE(repository.loadCommandHistory(true).size(), 1);
     }
 
     void commandHistoryMigratesExistingPerServerDataWithoutLoss()
@@ -4567,9 +5178,10 @@ private slots:
         QVERIFY(!monitorToggle->icon().isNull());
         auto *homeTabs = window.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
         QVERIFY(homeTabs);
-        QCOMPARE(homeTabs->count(), 2);
+        QCOMPARE(homeTabs->count(), 3);
         QCOMPARE(homeTabs->tabText(0), QStringLiteral("访问历史"));
         QCOMPARE(homeTabs->tabText(1), QStringLiteral("服务器管理"));
+        QCOMPARE(homeTabs->tabText(2), QStringLiteral("密码管理"));
         homeTabs->setCurrentIndex(1);
         QVERIFY(sidebar->isVisible());
 
@@ -4653,15 +5265,28 @@ private slots:
             QVERIFY(!progress->isTextVisible());
         }
         metricRows.at(0)->setCoreValues({12.0, 34.0, 56.0, 78.0});
+        auto *monitorScroll = window.findChild<QScrollArea *>(QStringLiteral("monitorScrollArea"));
+        QVERIFY(monitorScroll);
+        const int monitorHeight = monitorScroll->widget()->height();
+        const int monitorScrollMaximum = monitorScroll->verticalScrollBar()->maximum();
+        const int monitorScrollValue = monitorScroll->verticalScrollBar()->value();
+        const auto memoryGeometry = metricRows.at(1)->geometry();
         QEnterEvent metricEnterEvent(QPointF(10, 10), QPointF(10, 10), QPointF(10, 10));
         QApplication::sendEvent(metricRows.at(0), &metricEnterEvent);
         QCoreApplication::processEvents();
-        QVERIFY(metricRows.at(0)->height() > 44);
+        QCOMPARE(metricRows.at(0)->height(), 44);
+        auto *corePopover = metricRows.at(0)->findChild<QFrame *>(QStringLiteral("metricCorePanel"));
+        QVERIFY(corePopover && corePopover->isVisible() && corePopover->isWindow());
+        QCOMPARE(metricRows.at(1)->geometry(), memoryGeometry);
+        QCOMPARE(monitorScroll->widget()->height(), monitorHeight);
+        QCOMPARE(monitorScroll->verticalScrollBar()->maximum(), monitorScrollMaximum);
+        QCOMPARE(monitorScroll->verticalScrollBar()->value(), monitorScrollValue);
         QVERIFY(metricRows.at(0)->geometry().bottom() < metricRows.at(1)->geometry().top());
         QVERIFY(metricRows.at(1)->geometry().bottom() < metricRows.at(2)->geometry().top());
         QEvent metricLeaveEvent(QEvent::Leave);
         QApplication::sendEvent(metricRows.at(0), &metricLeaveEvent);
-        QCoreApplication::processEvents();
+        QApplication::sendEvent(corePopover, &metricLeaveEvent);
+        QTRY_VERIFY(!corePopover->isVisible());
         QCOMPARE(metricRows.at(0)->height(), 44);
         QVERIFY(monitorDetails->isVisible());
         QCOMPARE(window.findChildren<noxshell::ui::TransferQueuePanel *>().size(), 0);
@@ -6002,7 +6627,7 @@ private slots:
         QVERIFY(fingerprintEditor->text().isEmpty());
         QVERIFY(editDialog.profile().expectedFingerprint.isEmpty());
         QVERIFY(fingerprintEditor->placeholderText().contains(QStringLiteral("重新确认")));
-        QVERIFY(editDialog.findChild<QLabel *>(QStringLiteral("passwordSourceHint"))->text().contains(QStringLiteral("凭据库")));
+        QVERIFY(editDialog.findChild<QLabel *>(QStringLiteral("passwordSourceHint"))->text().contains(QStringLiteral("已保存")));
         QCOMPARE(editDialog.findChild<QPushButton *>(QStringLiteral("primaryButton"))->text(), QStringLiteral("保存修改"));
     }
 };

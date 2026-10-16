@@ -194,6 +194,7 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
     });
     connect(m_session, &SshSession::rawOutputReceived, m_output, &TerminalView::feedData);
     connect(m_output, &TerminalView::inputGenerated, m_session, &SshSession::sendInput);
+    connect(m_output, &TerminalView::fullScreenModeChanged, m_session, &SshSession::setTerminalFullScreen);
     connect(m_output, &TerminalView::commandSubmitted, this, [this](const QString &command) {
         rememberCommand(command);
         emit commandSubmitted(command);
@@ -257,7 +258,7 @@ void TerminalPanel::setServer(const ServerProfile &profile)
     m_connectionPassword->clear();
     m_profile = profile;
     m_commandHistory->setServerId(profile.id);
-    m_output->clear();
+    m_output->clear(true);
     m_prompt.clear();
     m_input->clear();
     m_input->setEnabled(false);

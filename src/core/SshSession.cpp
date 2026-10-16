@@ -211,6 +211,8 @@ void SshSession::connectToImpl(const ServerProfile &profile, bool suppliedSecret
     m_profile.password.clear();
     m_profile.keyPassphrase.clear();
     m_demo = profile.connectionMode == ConnectionMode::Demo;
+    m_terminalFullScreen = false;
+    m_lastTerminalInput.invalidate();
     m_connected = false;
     m_connecting = true;
     m_metricsInFlight = false;
@@ -360,6 +362,7 @@ void SshSession::disconnectFromHost()
 
 void SshSession::execute(const QString &command)
 {
+    if (!command.isEmpty()) m_lastTerminalInput.start();
     if (m_demo) {
         executeDemo(command);
         return;
@@ -369,6 +372,7 @@ void SshSession::execute(const QString &command)
 
 void SshSession::sendInput(const QByteArray &data)
 {
+    if (!data.isEmpty()) m_lastTerminalInput.start();
     if (m_demo) {
         for (char byte : data) {
             if (byte == '\r' || byte == '\n') {
@@ -405,6 +409,9 @@ void SshSession::resizeTerminal(int columns, int rows, int pixelWidth, int pixel
 
 void SshSession::requestMetrics()
 {
+    // Background exec uses the interactive worker: never enqueue blocking
+    // samples while vi/top is active, or while the user is typing.
+    if (m_terminalFullScreen || (m_lastTerminalInput.isValid() && m_lastTerminalInput.elapsed() < 1200)) return;
     if (m_metricsInFlight) return;
     if (m_metricsCooldown.isValid() && m_metricsCooldown.elapsed() < m_metricsRetryMs) return;
     if (!m_connected) {

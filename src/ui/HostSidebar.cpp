@@ -317,6 +317,17 @@ bool HostSidebar::updateServer(const ServerProfile &profile)
     return false;
 }
 
+void HostSidebar::refreshServers(const QVector<ServerProfile> &profiles)
+{
+    const auto selected = profileForItem(m_list->currentItem()).id;
+    const QSignalBlocker blocker(m_list);
+    m_servers = profiles;
+    for (const auto &profile : profiles)
+        if (!profile.group.isEmpty() && !m_groups.contains(profile.group)) m_groups.append(profile.group);
+    populate();
+    if (!selected.isEmpty()) selectServerById(selected);
+}
+
 bool HostSidebar::setServerState(const QString &serverId, ServerState state)
 {
     for (auto &server : m_servers) {

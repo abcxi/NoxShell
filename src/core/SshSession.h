@@ -33,6 +33,8 @@ public:
     void sendInput(const QByteArray &data);
     void resizeTerminal(int columns, int rows, int pixelWidth, int pixelHeight);
     void requestMetrics();
+    void setTerminalFullScreen(bool enabled) { m_terminalFullScreen = enabled; }
+    [[nodiscard]] bool terminalFullScreen() const { return m_terminalFullScreen; }
     void requestHomeDirectory();
     void listDirectory(const QString &path);
     quint64 calculateDirectorySize(const QString &path);
@@ -128,6 +130,8 @@ private:
 
     ServerProfile m_profile;
     bool m_connected{false};
+    bool m_terminalFullScreen{false};
+    QElapsedTimer m_lastTerminalInput;
     bool m_connecting{false};
     bool m_loadingCredentials{false};
     quint64 m_connectionAttempt{};

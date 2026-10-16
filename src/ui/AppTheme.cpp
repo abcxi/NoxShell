@@ -240,7 +240,7 @@ QString applicationStyleSheet(bool dark)
         QLabel#metricTitle { color: #5F6F82; font-size: 12px; }
         QLabel#metricValue { color:#243B53; font-size:15px; font-weight:600; }
         QLabel#metricDetail { color:#78899B; font-size:11px; }
-        QFrame#metricCorePanel { background:#F8FAFC; border:0; border-top:1px solid #EEF2F6; }
+        QFrame#metricCorePanel { background:#F8FAFC; border:1px solid #D9E4EF; border-radius:5px; }
         QLabel#metricCoreName, QLabel#metricCoreValue, QLabel#metricCoreMore { color:#708297; font-size:10px; }
         QLabel#hostItemName { color:#20344B; font-weight:650; }
         QLabel#hostItemAddress { color:#60748A; font-size:12px; }
@@ -340,14 +340,23 @@ QString applicationStyleSheet(bool dark)
         QWidget#terminalRecentPage { background: #0C1825; }
         QLabel#recentLoginTitle { color: #F2F6FA; font-size: 18px; font-weight: 650; }
         QLabel#recentLoginHint, QLabel#recentLoginEmpty { color: #7F95AA; }
+        QLabel#credentialManagerStatus { color: #8EA3B7; }
+        QPushButton#addSavedCredential {
+            color: #E5F3FF; background: #0C5577; border: 1px solid #1A718B;
+        }
+        QPushButton#editSavedCredential, QPushButton#deleteSavedCredential {
+            color: #D0DBE5; background: #152B3B; border: 1px solid #2A4558;
+        }
+        QPushButton#addSavedCredential:hover, QPushButton#editSavedCredential:hover,
+        QPushButton#deleteSavedCredential:hover { background: #1C4560; }
         QLabel#recentLoginEmpty { font-size: 14px; }
-        QTreeWidget#recentLoginList {
+        QTreeWidget#recentLoginList, QTreeWidget#savedCredentialList {
             color: #D8E4EF; background: #101E2D; alternate-background-color: #132235;
             border: 1px solid #22364C; border-radius: 5px; padding: 0;
         }
-        QTreeWidget#recentLoginList::item { min-height: 34px; padding: 0 8px; border-radius: 0; }
-        QTreeWidget#recentLoginList::item:selected { color: white; background: #17466F; border: 0; }
-        QTreeWidget#recentLoginList QHeaderView::section {
+        QTreeWidget#recentLoginList::item, QTreeWidget#savedCredentialList::item { min-height: 34px; padding: 0 8px; border-radius: 0; }
+        QTreeWidget#recentLoginList::item:selected, QTreeWidget#savedCredentialList::item:selected { color: white; background: #17466F; border: 0; }
+        QTreeWidget#recentLoginList QHeaderView::section, QTreeWidget#savedCredentialList QHeaderView::section {
             color: #8EA3B7; background: #132235; border: 0; border-bottom: 1px solid #22364C;
             min-height: 30px; padding: 0 8px;
         }
@@ -413,12 +422,23 @@ QString applicationStyleSheet(bool dark)
             background: transparent; border: 0; border-bottom: 2px solid transparent;
         }
         QTabBar#commandHistoryTabs::tab:selected { color: #FFFFFF; border-bottom-color: #1684FF; }
-        QToolButton#commandHistoryClearButton, QToolButton#commandHistoryCloseButton {
+        QLineEdit#commandHistorySearch {
+            color: #D8E4EF; background: #0C1825; border: 1px solid #31506B;
+            border-radius: 4px; min-height: 25px; padding: 0 7px;
+            selection-color: #FFFFFF; selection-background-color: #17466F;
+        }
+        QLineEdit#commandHistorySearch:focus { border-color: #1684FF; }
+        QToolButton#commandHistoryClearButton, QToolButton#commandHistoryCloseButton,
+        QToolButton#commandHistoryClearSearchButton {
             color: #9FB1C2; background: transparent; border: 1px solid #31506B;
             border-radius: 4px; min-height: 25px; padding: 0 7px;
         }
-        QToolButton#commandHistoryCloseButton { min-width: 25px; max-width: 25px; padding: 0; font-size: 16px; }
-        QToolButton#commandHistoryClearButton:hover, QToolButton#commandHistoryCloseButton:hover {
+        QToolButton#commandHistoryCloseButton, QToolButton#commandHistoryClearSearchButton {
+            min-width: 25px; max-width: 25px; padding: 0; font-size: 16px;
+        }
+        QToolButton#commandHistoryClearSearchButton:disabled { color: #536B80; border-color: #22364C; }
+        QToolButton#commandHistoryClearButton:hover, QToolButton#commandHistoryCloseButton:hover,
+        QToolButton#commandHistoryClearSearchButton:hover {
             color: #FFFFFF; background: #1C344A;
         }
         QTreeWidget#commandHistoryList {
@@ -668,7 +688,7 @@ QString applicationStyleSheet(bool dark)
         }
         QToolButton#transferQueueButton[active="true"] { background:#173D5D; border-color:#3F83B8; }
         QFrame#monitorSystemSummary, QFrame#metricRow { border-bottom-color:#2A3542; }
-        QFrame#metricCorePanel { background:#1A232D; border-top-color:#2A3542; }
+        QFrame#metricCorePanel { background:#1A232D; border-color:#35485B; }
         QLabel#metricCoreName, QLabel#metricCoreValue, QLabel#metricCoreMore { color:#91A3B6; }
         QTreeWidget#hostList { background:#171F28; }
         QTreeWidget#hostList::item:selected { color:#FFFFFF; background:#174E78; }

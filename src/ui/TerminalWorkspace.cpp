@@ -4,6 +4,7 @@
 #include "../core/ServerRepository.h"
 #include "../core/SshSession.h"
 #include "TerminalPanel.h"
+#include "CredentialManagerPanel.h"
 
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -206,9 +207,13 @@ TerminalWorkspace::TerminalWorkspace(ServerRepository *repository, CredentialSto
     managerLayout->setContentsMargins(0, 16, 0, 0);
     m_homeTabs->addTab(historyPage, QStringLiteral("访问历史"));
     m_homeTabs->addTab(m_serverManagerPage, QStringLiteral("服务器管理"));
+    auto *credentialsPage = new CredentialManagerPanel(repository, credentialStore, m_homeTabs);
+    m_homeTabs->addTab(credentialsPage, QStringLiteral("密码管理"));
+    connect(credentialsPage, &CredentialManagerPanel::credentialsChanged, this, &TerminalWorkspace::savedCredentialsChanged);
     emptyLayout->addWidget(m_homeTabs);
-    connect(m_homeTabs, &QTabWidget::currentChanged, this, [this](int index) {
+    connect(m_homeTabs, &QTabWidget::currentChanged, this, [this, credentialsPage](int index) {
         if (index == 0) refreshRecentLogins();
+        if (index == 2) credentialsPage->refresh();
     });
 
     m_sessionsPage = new QWidget;

@@ -1,5 +1,6 @@
 #include "RdpDialog.h"
 #include "CredentialInput.h"
+#include "CredentialChoice.h"
 
 #include <QComboBox>
 #include <QAction>
@@ -73,6 +74,8 @@ RdpDialog::RdpDialog(QWidget *parent)
     m_user->setObjectName(QStringLiteral("rdpUserEditor"));
     m_user->setPlaceholderText(QStringLiteral("可选；例如 Administrator 或 DOMAIN\\user"));
     m_password = new QLineEdit;
+    m_credentialChoice = new CredentialChoice;
+    form->addRow(QStringLiteral("账密来源"), m_credentialChoice);
     m_password->setObjectName(QStringLiteral("rdpPasswordEditor"));
     m_password->setEchoMode(QLineEdit::Password);
     m_password->setPlaceholderText(QStringLiteral("Windows 登录密码（可选）"));
@@ -133,6 +136,7 @@ RdpDialog::RdpDialog(QWidget *parent)
             ? QStringLiteral(":/assets/eye-off.svg") : QStringLiteral(":/assets/eye.svg")));
         m_passwordReveal->setToolTip(visible ? QStringLiteral("隐藏密码") : QStringLiteral("显示密码"));
     });
+    connect(m_credentialChoice, &QComboBox::currentIndexChanged, this, &RdpDialog::updateCredentialChoice);
 }
 
 RdpDialog::RdpDialog(const ServerProfile &profile, QWidget *parent)
@@ -143,7 +147,8 @@ RdpDialog::RdpDialog(const ServerProfile &profile, QWidget *parent)
     if (!group.isEmpty() && m_group->findData(group) < 0) m_group->addItem(group, group);
     setWindowTitle(QStringLiteral("编辑 Windows 远程桌面"));
     populate(profile);
-    m_password->setPlaceholderText(QStringLiteral("留空则沿用已保存密码"));
+    m_password->setPlaceholderText(profile.credentialRef.isEmpty() ? QStringLiteral("Windows 密码")
+        : QStringLiteral("●●●●●● 已保存 · 输入可替换"));
     if (auto *buttons = findChild<QDialogButtonBox *>()) {
         buttons->button(QDialogButtonBox::Save)->setText(QStringLiteral("保存修改"));
     }
@@ -162,6 +167,11 @@ ServerProfile RdpDialog::profile() const
     result.connectionMode = ConnectionMode::Rdp;
     result.authentication = AuthenticationMethod::Password;
     result.password = m_password->text();
+    if (const auto chosen = m_credentialChoice->selection()) {
+        result.user = chosen->user;
+        result.password.clear();
+        result.credentialRef = chosen->credentialRef;
+    } else if (m_original.credentialRef.startsWith(QLatin1String("managed/"))) result.credentialRef.clear();
     result.privateKeyPath.clear();
     result.publicKeyPath.clear();
     result.keyPassphrase.clear();
@@ -184,6 +194,28 @@ void RdpDialog::setAvailableGroups(const QStringList &groups)
 void RdpDialog::setInitialGroup(const QString &group)
 {
     selectGroup(m_group, group);
+}
+
+void RdpDialog::setConnectionRepository(ServerRepository *repository)
+{
+    m_credentialChoice->setRepository(repository, m_original.credentialRef);
+    updateCredentialChoice();
+}
+
+void RdpDialog::updateCredentialChoice()
+{
+    const auto chosen = m_credentialChoice->selection();
+    m_user->setEnabled(!chosen);
+    m_password->setEnabled(!chosen);
+    m_passwordReveal->setEnabled(!chosen);
+    if (chosen) {
+        m_user->setText(chosen->user);
+        m_password->clear();
+        m_passwordReveal->setChecked(false);
+    }
+    const bool saved = chosen || (!m_original.credentialRef.isEmpty()
+        && !m_original.credentialRef.startsWith(QLatin1String("managed/")));
+    m_password->setPlaceholderText(saved ? QStringLiteral("●●●●●● 已保存 · 输入可替换") : QStringLiteral("Windows 密码，可选"));
 }
 
 void RdpDialog::populate(const ServerProfile &profile)

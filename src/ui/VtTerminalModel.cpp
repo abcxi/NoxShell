@@ -40,6 +40,9 @@ void VtTerminalModel::reset()
     m_scrollBottom = m_rows - 1;
     m_wrapPending = false;
     m_cursorVisible = true;
+    m_cursorStyle = 6;
+    m_alternateScreen = false;
+    m_primaryCells.clear();
     m_reverseVideo = false;
     m_applicationCursorKeys = false;
     m_bracketedPaste = false;
@@ -73,6 +76,15 @@ void VtTerminalModel::resize(int columns, int rows)
             resized[row * columns + column] = m_cells.value(index(row, column));
         }
     }
+    if (m_alternateScreen && !m_primaryCells.isEmpty()) {
+        QVector<TerminalCell> primary(columns * rows, blankCell());
+        for (int row = 0; row < copiedRows; ++row)
+            for (int column = 0; column < copiedColumns; ++column)
+                primary[row * columns + column] = m_primaryCells.at(index(row, column));
+        m_primaryCells = std::move(primary);
+        m_primaryCursorColumn = qBound(0, m_primaryCursorColumn, columns - 1);
+        m_primaryCursorRow = qBound(0, m_primaryCursorRow, rows - 1);
+    }
     m_columns = columns;
     m_rows = rows;
     m_cells = std::move(resized);
@@ -90,11 +102,11 @@ const TerminalCell &VtTerminalModel::cell(int row, int column) const
 const TerminalCell &VtTerminalModel::documentCell(int line, int column) const
 {
     if (column < 0 || column >= m_columns || line < 0 || line >= documentLineCount()) return kFallbackCell;
-    if (line < m_scrollback.size()) {
+    if (line < historyLineCount()) {
         const auto &historyLine = m_scrollback.at(line);
         return column < historyLine.size() ? historyLine.at(column) : kFallbackCell;
     }
-    return cell(line - m_scrollback.size(), column);
+    return cell(line - historyLineCount(), column);
 }
 
 QString VtTerminalModel::documentLineText(int line, bool trimRight) const
@@ -230,6 +242,10 @@ void VtTerminalModel::processCsi(char32_t finalCharacter)
         break;
     case 's': m_savedColumn = m_cursorColumn; m_savedRow = m_cursorRow; break;
     case 'u': m_cursorColumn = m_savedColumn; m_cursorRow = m_savedRow; clampCursor(); break;
+    case 'q':
+        if (m_csiBuffer.endsWith(QLatin1Char(' ')) && first >= 0 && first <= 6)
+            m_cursorStyle = first == 0 ? 2 : first;
+        break;
     case 'S': scrollUp(qMax(1, first)); break;
     case 'T': scrollDown(qMax(1, first)); break;
     case 'X': eraseCells(m_cursorRow, m_cursorColumn, qMin(m_columns - 1, m_cursorColumn + qMax(1, first) - 1)); break;
@@ -266,7 +282,7 @@ void VtTerminalModel::processCsi(char32_t finalCharacter)
                 if (parameter == 1) m_applicationCursorKeys = enabled;
                 else if (parameter == 5) m_reverseVideo = enabled;
                 else if (parameter == 25) m_cursorVisible = enabled;
-                else if (parameter == 1049 || parameter == 47) setAlternateScreen(enabled, parameter == 1049);
+                else if (parameter == 1049 || parameter == 1047 || parameter == 47) setAlternateScreen(enabled, parameter == 1049);
                 else if (parameter == 2004) m_bracketedPaste = enabled;
                 else if (parameter == 1000) m_mouseTracking = enabled ? MouseTracking::Press : MouseTracking::None;
                 else if (parameter == 1002) m_mouseTracking = enabled ? MouseTracking::ButtonMotion : MouseTracking::None;
