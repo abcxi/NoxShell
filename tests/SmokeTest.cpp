@@ -27,7 +27,23 @@
 #include "../src/ui/SearchMarkerScrollBar.h"
 #include "../src/ui/ServerDialog.h"
 #include "../src/ui/SystemDetailPanel.h"
+#include "../src/ui/TerminalPanel.h"
+#include "../src/ui/ServerToolsDialog.h"
+#include "../src/ui/SoftwareInstallDialog.h"
+#include "../src/core/ServerTools.h"
 #include "../src/ui/TerminalSettingsDialog.h"
+#include "../src/ui/SettingsPage.h"
+#include "../src/ui/AgentPanel.h"
+#include "../src/core/AppSettings.h"
+#include "../src/core/ProxyTunnel.h"
+#include "../src/core/LocalAgentProcess.h"
+#include "../src/core/TcpLatencyProbe.h"
+#include "../src/core/AgentMcpStdio.h"
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QTextBrowser>
+#include <future>
+#include <thread>
 #include "../src/ui/TerminalWorkspace.h"
 #include "../src/ui/TransferQueuePanel.h"
 #include "../src/ui/TerminalView.h"
@@ -40,6 +56,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QContextMenuEvent>
+#include <QCryptographicHash>
 #include <QCursor>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -51,6 +68,8 @@
 #include <QFontComboBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QHelpEvent>
+#include <QToolTip>
 #include <QTabWidget>
 #include <QIcon>
 #include <QImage>
@@ -60,7 +79,10 @@
 #include <QJsonObject>
 #include <QLayout>
 #include <QLineEdit>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QListWidget>
+#include <QListView>
 #include <QMimeData>
 #include <QMenu>
 #include <QMessageBox>
@@ -80,6 +102,7 @@
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QStyleOptionComboBox>
 #include <QPushButton>
 #include <QTabBar>
 #include <QTemporaryDir>
@@ -101,6 +124,14 @@
 bool nativeProbeTerminalMarkText(QWidget *terminal, const QString &text);
 bool nativeProbeTerminalCommitText(QWidget *terminal, const QString &text);
 bool nativeProbeTerminalEscape(QWidget *terminal);
+bool nativeProbeTerminalOptionArrow(QWidget *terminal, bool left);
+bool nativeProbeTitlebarClick(QWidget *window, const QString &identifier);
+bool nativeProbeTitlebarSelect(QWidget *window, int index, int mode);
+bool nativeProbeTitlebarTabMenu(QWidget *window, int index, const QString &actionName);
+bool nativeProbeTitlebarHover(QWidget *window);
+bool nativeProbeTitlebarMenuVisible(QWidget *window);
+bool nativeProbeSelectTheme(QWidget *window, int mode);
+bool nativeProbeCaptureWindow(QWidget *window, const QString &path);
 #endif
 #include <functional>
 #include <utility>
@@ -110,6 +141,14 @@ bool nativeProbeTerminalEscape(QWidget *terminal);
 #include <QJsonDocument>
 #include <QJsonObject>
 #endif
+
+static noxshell::ui::FilePanel *activeFilePanel(QWidget *window)
+{
+    auto *stack = window->findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+    auto *group = stack ? stack->currentWidget() : nullptr;
+    auto *pane = group ? group->property("activeTerminalPane").value<QWidget *>() : nullptr;
+    return pane ? pane->findChild<noxshell::ui::FilePanel *>() : nullptr;
+}
 
 class MemoryCredentialStore final : public noxshell::CredentialStore {
 public:
@@ -148,6 +187,15 @@ public:
     std::function<void()> onLoad;
     QString error;
 };
+
+class SettingsGuard {
+public:
+    SettingsGuard(){QSettings s;for(const auto &k:s.allKeys())saved.insert(k,s.value(k));appearance=noxshell::ui::TerminalView::defaultAppearance();}
+    ~SettingsGuard(){QSettings s;s.clear();for(auto it=saved.begin();it!=saved.end();++it)s.setValue(it.key(),it.value());s.sync();emit noxshell::AppSettings::instance()->changed({});noxshell::ui::TerminalView::setDefaultAppearance(appearance);noxshell::ui::applyApplicationTheme(noxshell::ui::ThemeMode::Light);}
+private:QVariantMap saved;decltype(noxshell::ui::TerminalView::defaultAppearance()) appearance;
+};
+
+static bool writeTextFile(const QString &path,const QString &text);
 
 class LocalDirectoryUrlCapture final : public QObject {
     Q_OBJECT
@@ -324,6 +372,11 @@ static int runWindowLifecycleProbe(noxshell::ui::Application &app)
         || !sessionClosed.isEmpty() || canceledTransfer || !completedTransfer) return 21;
     qInfo("NOXSHELL_WINDOW_LIFECYCLE_OK");
     return 0;
+}
+
+static bool writeTextFile(const QString &path,const QString &text)
+{
+    QFile file(path);return file.open(QIODevice::WriteOnly)&&file.write(text.toUtf8())==text.toUtf8().size();
 }
 
 class SmokeTest final : public QObject {
@@ -734,6 +787,112 @@ private slots:
         QCOMPARE(pixmap.size(), QSize(128, 128));
     }
 
+    void workspaceSurfacesConnectWithoutHeavyBorders_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void workspaceSurfacesConnectWithoutHeavyBorders()
+    {
+        QFETCH(bool, dark);
+        using namespace noxshell;
+        using namespace noxshell::ui;
+        SettingsGuard guard;
+        AppSettings::instance()->setValue("general/openTerminal", false);
+        AppSettings::instance()->setValue("files/autoSave", false);
+        QTemporaryDir directory;
+        MemoryCredentialStore credentials;
+        MainWindow window(directory.filePath("workspace-surfaces.sqlite"), nullptr, &credentials);
+        window.resize(1500, 960); window.show();
+        const auto mode=dark ? ThemeMode::Dark : ThemeMode::Light;
+#ifdef Q_OS_MACOS
+        if(QApplication::platformName()=="cocoa") {
+            QTRY_VERIFY_WITH_TIMEOUT(nativeProbeSelectTheme(&window,static_cast<int>(mode)),1000);
+        }
+        else
+#endif
+        {
+            auto *themeAction=window.findChild<QAction *>(dark ? "themeDarkAction" : "themeLightAction");
+            QVERIFY(themeAction);themeAction->trigger();
+        }
+        auto *workspace = window.findChild<TerminalWorkspace *>();
+        ServerProfile profile;
+        profile.id="surfaces-demo"; profile.name=QStringLiteral("演示工作区");
+        profile.host="192.0.2.10"; profile.user="root"; profile.connectionMode=ConnectionMode::Demo;
+        workspace->openOrActivate(profile, true);
+        auto *stack = workspace->findChild<QStackedWidget *>("terminalSessionStack");
+        auto *pane = stack->currentWidget()->property("activeTerminalPane").value<QWidget *>();
+        auto *session = pane->findChild<SshSession *>();
+        QTRY_VERIFY(session->isConnected());
+        auto *rail = window.findChild<QWidget *>("monitorRail");
+        rail->show();
+        workspace->setFileWorkspaceVisible(true);
+        auto *files = pane->findChild<FilePanel *>();
+        auto *tree = files->findChild<QTreeWidget *>("remoteFileTree");
+        QTRY_COMPARE(tree->topLevelItemCount(), 8);
+        QTreeWidgetItem *readme = nullptr;
+        for (int i=0;i<tree->topLevelItemCount();++i)
+            if(tree->topLevelItem(i)->text(0)=="README.md")readme=tree->topLevelItem(i);
+        QVERIFY(readme); tree->itemDoubleClicked(readme,0);
+        auto *editor = pane->findChild<RemoteFileEditor *>();
+        QVERIFY(editor);
+        auto *text = editor->findChild<QPlainTextEdit *>("remoteFileEditorText");
+        QTRY_VERIFY(text->isEnabled());
+        const auto theme=workspaceColors(dark);
+        const auto originalBuffer=pane->findChild<TerminalView *>()->plainText();
+        QSignalSpy connections(session,&SshSession::connectionChanged);
+        QSignalSpy writes(session,&SshSession::writeFileRequested);
+        text->selectAll();
+        text->insertPlainText(QStringLiteral("# 演示工作区\n\n终端与文件编辑分别保留自己的上下文。\n\n- 拖拽中间分隔条调整宽度\n- Cmd/Ctrl+S 保存\n- 每个分屏独立保留草稿\n"));
+        const auto draft=text->toPlainText();
+        QCoreApplication::processEvents();
+        auto *header=pane->findChild<QFrame *>("terminalPaneHeader");
+        auto *input=pane->findChild<QLineEdit *>("terminalInput");
+        auto *toolbar=files->findChild<QWidget *>("fileToolbar");
+        QCOMPARE(header->height(),28);
+        QCOMPARE(header->palette().color(QPalette::Window),theme.canvas);
+        QCOMPARE(input->palette().color(QPalette::Base),theme.canvas);
+        QCOMPARE(toolbar->palette().color(QPalette::Window),theme.surface);
+        QCOMPARE(text->palette().color(QPalette::Base),theme.surface);
+        QCOMPARE(tree->palette().color(QPalette::Base),theme.surface);
+        QCOMPARE(tree->palette().color(QPalette::AlternateBase),theme.canvas);
+        QCOMPARE(tree->font().weight(),QFont::Normal);
+        QCOMPARE(text->font().weight(),QFont::Normal);
+        QVERIFY(qAbs(theme.line.lightness()-theme.surface.lightness())<40);
+        QVERIFY(qAbs(theme.text.lightness()-theme.canvas.lightness())>120);
+        auto *outer=pane->findChild<QSplitter *>("paneEditorSplitter");
+        auto *left=pane->findChild<QSplitter *>("terminalFileSplitter");
+        auto *commandColumn=pane->findChild<QWidget *>("terminalCommandColumn");
+        QVERIFY(commandColumn && commandColumn->isAncestorOf(left));
+        QCOMPARE(outer->widget(0),commandColumn); QCOMPARE(outer->widget(1),editor);
+        QCOMPARE(editor->height(),commandColumn->height());
+        QCOMPARE(editor->height(),left->height()+header->height());
+        const auto capture=[&](const QString &state){
+            const auto path=qEnvironmentVariable("NOXSHELL_WORKSPACE_STYLE_SCREENSHOT_DIR");
+            if(path.isEmpty())return true;
+            QDir().mkpath(path);QTest::qWait(120);
+            const auto file=QDir(path).filePath(QStringLiteral("workspace-%1-%2.png").arg(dark?"dark":"light",state));
+#ifdef Q_OS_MACOS
+            if(QApplication::platformName()=="cocoa")return nativeProbeCaptureWindow(&window,file);
+#endif
+            return window.grab().save(file);
+        };
+        QVERIFY(capture("single"));
+        workspace->splitActivePane(Qt::Horizontal);
+        auto *second=stack->currentWidget()->property("activeTerminalPane").value<QWidget *>();
+        QTRY_VERIFY(second->findChild<SshSession *>()->isConnected());
+        QCOMPARE(pane->property("activeSplitPane").toBool(),false);
+        QCOMPARE(second->property("activeSplitPane").toBool(),true);
+        QVERIFY(capture("split"));
+        QCOMPARE(text->toPlainText(),draft);
+        // The narrower split can introduce soft wraps, not change content.
+        const auto unwrapped=[](QString value){return value.remove(QRegularExpression(QStringLiteral("\\s+")));};
+        QCOMPARE(unwrapped(pane->findChild<TerminalView *>()->plainText()),unwrapped(originalBuffer));
+        QCOMPARE(connections.count(),0);QCOMPARE(writes.count(),0);QCOMPARE(credentials.loadCalls,0);
+    }
+
     void applicationThemeModesResolveAndProduceDistinctPalettes()
     {
         using noxshell::ui::ThemeMode;
@@ -744,13 +903,202 @@ private slots:
         QCOMPARE(noxshell::ui::themeModeSettingValue(ThemeMode::System), QStringLiteral("system"));
         QCOMPARE(noxshell::ui::themeModeSettingValue(ThemeMode::Light), QStringLiteral("light"));
         QCOMPARE(noxshell::ui::themeModeSettingValue(ThemeMode::Dark), QStringLiteral("dark"));
-        QVERIFY(noxshell::ui::applicationStyleSheet(false).contains(QStringLiteral("#F3F6FA")));
-        const auto darkStyle = noxshell::ui::applicationStyleSheet(true);
-        QVERIFY(darkStyle.contains(QStringLiteral("#111820")));
-        QVERIFY(darkStyle.contains(QStringLiteral(
-            "QTreeWidget#remoteDirectoryTree {\n            color:#D5E0EB; background:#151D25;")));
-        QVERIFY(darkStyle.contains(QStringLiteral(
-            "QTreeWidget#remoteDirectoryTree::item:selected {\n            color:#FFFFFF; background:#174E78;")));
+        for(bool dark : {false,true}) {
+            const auto style=noxshell::ui::applicationStyleSheet(dark);
+            const auto colors=noxshell::ui::workspaceColors(dark);
+            for(const auto color : {colors.canvas,colors.surface,colors.line,colors.text})
+                QVERIFY(style.contains(color.name()));
+            QVERIFY(!style.contains(QLatin1Char('@')));
+            QVERIFY(style.contains(QStringLiteral("QFrame#terminalSplitPane[activeSplitPane=\"true\"]")));
+        }
+    }
+
+    void terminalThemeChangesPreserveAnsiAndExistingOutput()
+    {
+        using namespace noxshell::ui;
+        const auto previous = isApplicationDarkTheme() ? ThemeMode::Dark : ThemeMode::Light;
+        const auto restore = qScopeGuard([previous] { applyApplicationTheme(previous); });
+        applyApplicationTheme(ThemeMode::Dark);
+        TerminalView view;
+        view.resize(800, 300);
+        view.show();
+        QCoreApplication::processEvents();
+        view.feedText(QStringLiteral("\x1b[?25lDEFAULT\r\n"
+            "\x1b[48;2;12;24;37m   \x1b[49m   \r\n"
+            "\x1b[38;2;208;219;229m████\x1b[39m████\r\n"
+            "\x1b[7m   \x1b[27m\r\n"
+            "\x1b[42m   \x1b[0m\r\n"
+            "\x1b[48;5;196m   \x1b[49m\r\n"));
+        const auto originalText = view.plainText();
+        const auto originalGrid = QSize(view.columns(), view.rows());
+        QSignalSpy resizeSpy(&view, &TerminalView::terminalSizeChanged);
+        const auto cell = view.cellSize();
+        const auto origin = view.contentOrigin();
+        const auto pixel = [&](const QImage &image, qreal column, qreal row) {
+            const qreal ratio = image.devicePixelRatio();
+            return image.pixelColor(qRound((origin.x() + column * cell.width()) * ratio),
+                qRound((origin.y() + row * cell.height()) * ratio));
+        };
+        const auto hasColor = [&](const QImage &image, int fromColumn, int toColumn,
+                                  int row, const QColor &color) {
+            const qreal ratio = image.devicePixelRatio();
+            const QRect area(qRound((origin.x() + fromColumn * cell.width()) * ratio),
+                qRound((origin.y() + row * cell.height()) * ratio),
+                qRound((toColumn - fromColumn) * cell.width() * ratio), qRound(cell.height() * ratio));
+            for (int y = area.top(); y <= area.bottom(); ++y)
+                for (int x = area.left(); x <= area.right(); ++x)
+                    if (image.pixelColor(x, y) == color) return true;
+            return false;
+        };
+        for (const auto mode : {ThemeMode::Light, ThemeMode::Dark, ThemeMode::Light, ThemeMode::System}) {
+            applyApplicationTheme(mode);
+            QCoreApplication::processEvents();
+            const auto colors = terminalColors(isApplicationDarkTheme());
+            const auto image = view.grab().toImage();
+            QCOMPARE(image.pixelColor(2, 2), colors.background);
+            QCOMPARE(pixel(image, 0.5, 1.5), QColor("#0C1825")); // Explicit RGB matching the old default.
+            QCOMPARE(pixel(image, 4.5, 1.5), colors.background); // SGR 49 follows theme again.
+            QVERIFY(hasColor(image, 0, 4, 2, QColor("#D0DBE5")));
+            QVERIFY(hasColor(image, 4, 8, 2, colors.foreground)); // SGR 39 follows theme again.
+            QVERIFY(hasColor(image, 0, 7, 0, colors.foreground));
+            QCOMPARE(pixel(image, 0.5, 3.5), colors.foreground); // Inverse default colors.
+            QCOMPARE(pixel(image, 0.5, 4.5), QColor("#53C99C")); // ANSI 16-color background.
+            QCOMPARE(pixel(image, 0.5, 5.5), QColor("#FF0000")); // ANSI 256-color background.
+            QCOMPARE(view.plainText(), originalText);
+            QCOMPARE(QSize(view.columns(), view.rows()), originalGrid);
+            view.feedText(QStringLiteral("\x1b[?5h"));
+            const auto reversed = view.grab().toImage();
+            QCOMPARE(reversed.pixelColor(2, 2), colors.foreground);
+            QCOMPARE(pixel(reversed, 0.5, 3.5), colors.background);
+            view.feedText(QStringLiteral("\x1b[?5l"));
+        }
+        QCOMPARE(resizeSpy.count(), 0);
+
+        view.feedText(QStringLiteral("\x1b[?1049h\x1b[?25lALTERNATE"));
+        for (const auto mode : {ThemeMode::Dark, ThemeMode::Light}) {
+            applyApplicationTheme(mode);
+            QCoreApplication::processEvents();
+            const auto colors = terminalColors(isApplicationDarkTheme());
+            const auto image = view.grab().toImage();
+            QCOMPARE(image.pixelColor(2, 2), colors.background);
+            QVERIFY(hasColor(image, 0, 9, 0, colors.foreground));
+            QCOMPARE(view.plainText().trimmed(), QStringLiteral("ALTERNATE"));
+        }
+        view.feedText(QStringLiteral("\x1b[?1049l"));
+        QCOMPARE(view.plainText(), originalText);
+
+        // Scrollback and wrapped lines retain the semantic default/explicit distinction.
+        VtTerminalModel model(12, 2);
+        model.feed(QStringLiteral("\x1b[48;2;12;24;37m  \x1b[49m \r\nsecond\r\nthird"));
+        QVERIFY(model.historyLineCount() > 0);
+        QVERIFY(!model.documentCell(0, 0).defaultBackground);
+        QVERIFY(model.documentCell(0, 2).defaultBackground);
+        model.resize(6, 2);
+        model.resize(12, 2);
+        QVERIFY(!model.documentCell(0, 0).defaultBackground);
+        QVERIFY(model.documentCell(0, 2).defaultBackground);
+        model.feed(QStringLiteral("\x1b[31;44mX\x1b[0mY"));
+        QVERIFY(!model.cell(model.cursorRow(), model.cursorColumn() - 2).defaultForeground);
+        QVERIFY(!model.cell(model.cursorRow(), model.cursorColumn() - 2).defaultBackground);
+        QVERIFY(model.cell(model.cursorRow(), model.cursorColumn() - 1).defaultForeground);
+        QVERIFY(model.cell(model.cursorRow(), model.cursorColumn() - 1).defaultBackground);
+    }
+
+    void splitTerminalsAndControlsFollowApplicationTheme()
+    {
+        using namespace noxshell::ui;
+        QSettings settings;
+        const auto previousSetting = settings.value(QStringLiteral("ui/themeMode"));
+        const auto previous = storedThemeMode();
+        const auto restore = qScopeGuard([&] {
+            if (previousSetting.isValid()) settings.setValue(QStringLiteral("ui/themeMode"), previousSetting);
+            else settings.remove(QStringLiteral("ui/themeMode"));
+            applyApplicationTheme(previous);
+        });
+        QTemporaryDir directory;
+        MemoryCredentialStore credentials;
+        MainWindow window(directory.filePath(QStringLiteral("theme.sqlite")), nullptr, &credentials);
+        window.resize(1400, 900);
+        window.show();
+        const auto selectTheme = [&](ThemeMode mode) {
+#ifdef Q_OS_MACOS
+            if (QApplication::platformName() == QStringLiteral("cocoa"))
+                return nativeProbeSelectTheme(&window, static_cast<int>(mode));
+#endif
+            const auto name = mode == ThemeMode::Light ? QStringLiteral("themeLightAction")
+                : mode == ThemeMode::Dark ? QStringLiteral("themeDarkAction") : QStringLiteral("themeSystemAction");
+            auto *action = window.findChild<QAction *>(name);
+            if (!action) return false;
+            action->trigger();
+            return true;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(selectTheme(ThemeMode::Light), 1000);
+        auto *workspace = window.findChild<TerminalWorkspace *>();
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("theme-demo");
+        profile.name = QStringLiteral("主题测试");
+        profile.host = QStringLiteral("demo.example");
+        profile.user = QStringLiteral("root");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        workspace->openOrActivate(profile, true);
+        auto *stack = window.findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+        auto *group = stack->currentWidget();
+        auto *first = group->property("activeTerminalPane").value<QWidget *>();
+        auto *firstSession = first->findChild<noxshell::SshSession *>();
+        QTRY_VERIFY(firstSession->isConnected());
+        QVERIFY(selectTheme(ThemeMode::Dark));
+        first->findChild<QAction *>(QStringLiteral("terminalSplitVerticalAction"))->trigger();
+        QCOMPARE(workspace->activePaneCount(), 2);
+        auto *second = group->property("activeTerminalPane").value<QWidget *>();
+        auto *secondSession = second->findChild<noxshell::SshSession *>();
+        QTRY_VERIFY(secondSession->isConnected());
+        auto *firstView = first->findChild<TerminalView *>();
+        auto *secondView = second->findChild<TerminalView *>();
+        QTRY_VERIFY(firstView->isVisible() && secondView->isVisible());
+        QTest::qWait(80);
+        QCOMPARE(secondView->grab().toImage().pixelColor(2, 2), terminalColors(true).background);
+        firstView->feedText(QStringLiteral("\r\n[root@demo ~]# echo light\r\nSSH follows the application theme\r\n"));
+        secondView->feedText(QStringLiteral("\r\n[root@demo ~]# echo colors\r\n\x1b[32mANSI colors are preserved\x1b[0m\r\n"));
+        const auto firstText = firstView->plainText();
+        const auto secondText = secondView->plainText();
+        QSignalSpy firstConnection(firstSession, &noxshell::SshSession::connectionChanged);
+        QSignalSpy secondConnection(secondSession, &noxshell::SshSession::connectionChanged);
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_TERMINAL_THEME_SCREENSHOT_DIR");
+        for (const auto mode : {ThemeMode::Light, ThemeMode::Dark, ThemeMode::System, ThemeMode::Light}) {
+            QVERIFY(selectTheme(mode));
+            QCoreApplication::processEvents();
+            const bool dark = isApplicationDarkTheme();
+            const auto colors = terminalColors(dark);
+            QVERIFY(!applicationStyleSheet(dark).contains(QLatin1Char('@')));
+            for (auto *pane : {first, second}) {
+                auto *view = pane->findChild<TerminalView *>();
+                QCOMPARE(view->grab().toImage().pixelColor(2, 2), colors.background);
+                const auto *input = pane->findChild<QLineEdit *>(QStringLiteral("terminalInput"));
+                QCOMPARE(input->palette().color(QPalette::Text), colors.foreground);
+                QCOMPARE(input->palette().color(QPalette::Base), workspaceColors(dark).canvas);
+                const auto *label = pane->findChild<QLabel *>(QStringLiteral("terminalPaneIdentity"));
+                QCOMPARE(label->palette().color(QPalette::WindowText), workspaceColors(dark).muted);
+                const auto *title = pane->findChild<QLabel *>(QStringLiteral("terminalLoadingTitle"));
+                QCOMPARE(title->palette().color(QPalette::WindowText), colors.foreground);
+            }
+            QCOMPARE(firstView->plainText(), firstText);
+            QCOMPARE(secondView->plainText(), secondText);
+            QVERIFY(firstSession->isConnected() && secondSession->isConnected());
+            if (!captureDir.isEmpty()) {
+                QDir().mkpath(captureDir);
+                QTest::qWait(120);
+                const auto path = QDir(captureDir).filePath(QStringLiteral("terminal-%1.png").arg(themeModeSettingValue(mode)));
+#ifdef Q_OS_MACOS
+                if (QApplication::platformName() == QStringLiteral("cocoa"))
+                    QVERIFY(nativeProbeCaptureWindow(&window, path));
+                else
+#endif
+                    QVERIFY(window.grab().save(path));
+            }
+        }
+        QCOMPARE(firstConnection.count(), 0);
+        QCOMPARE(secondConnection.count(), 0);
+        QCOMPARE(workspace->activePaneCount(), 2);
     }
 
     void numericEditorsRenderAcrossThemeChanges()
@@ -1154,6 +1502,493 @@ private slots:
         QCOMPARE(repository.loadSavedCredentials().size(), 1);
     }
 
+    void workspaceHeadersDoNotRepeatServerNames_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void workspaceHeadersDoNotRepeatServerNames()
+    {
+        QFETCH(bool, dark);
+        const auto previous = noxshell::ui::isApplicationDarkTheme();
+        auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previous
+            ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        QTemporaryDir directory;
+        noxshell::ServerRepository repository(directory.filePath(QStringLiteral("headers.sqlite")), false);
+        QVERIFY(repository.initialize());
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        QSignalSpy connections(&session, &noxshell::SshSession::connectRequested);
+        noxshell::ui::TerminalPanel terminal(&session, &repository);
+        noxshell::ui::FilePanel files(&session);
+        auto *input = terminal.findChild<QLineEdit *>(QStringLiteral("terminalInput"));
+        QVERIFY(input);
+        QVERIFY(!files.findChild<QLabel *>(QStringLiteral("fileServerLabel")));
+        QVERIFY(!files.findChild<QLabel *>(QStringLiteral("filePanelTitle")));
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("header-fixture");
+        profile.name = QStringLiteral("网宿·住宅");
+        profile.host = QStringLiteral("192.0.2.10");
+        profile.user = QStringLiteral("root");
+        profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        for (const auto &name : {QStringLiteral("网宿·住宅"), QStringLiteral("renamed-host")}) {
+            profile.name = name;
+            terminal.setServer(profile);
+            files.updateServer(profile);
+            session.promptChanged(QStringLiteral("root@%1:~$ ").arg(name));
+            QVERIFY(input->placeholderText().isEmpty());
+        }
+        // Remote output is untouched: only the client's duplicate labels go.
+        const QString remotePrompt = QStringLiteral("root@remote-linux:~# ");
+        session.rawOutputReceived(remotePrompt.toUtf8());
+        QVERIFY(terminal.findChild<noxshell::ui::TerminalView *>()->plainText().contains(remotePrompt.trimmed()));
+        QCOMPARE(connections.count(), 0);
+    }
+
+    void serverToolsAreBoundedCancelableAndNeverUseTerminal_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void serverToolsAreBoundedCancelableAndNeverUseTerminal()
+    {
+        QFETCH(bool, dark);
+        const auto previous = noxshell::ui::isApplicationDarkTheme();
+        auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previous
+            ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        QObject::disconnect(&session, &noxshell::SshSession::connectRequested, nullptr, nullptr);
+        QObject::disconnect(&session, &noxshell::SshSession::serverToolRequested, nullptr, nullptr);
+        QSignalSpy connections(&session, &noxshell::SshSession::connectRequested);
+        QSignalSpy tools(&session, &noxshell::SshSession::serverToolRequested);
+        QSignalSpy metrics(&session, &noxshell::SshSession::collectMetricsRequested);
+        QSignalSpy terminalWrites(&session, &noxshell::SshSession::executeRequested);
+        noxshell::ui::TerminalPanel panel(&session, nullptr);
+        auto *canvas = panel.findChild<noxshell::ui::TerminalView *>();
+        auto appearance = canvas->appearance(); appearance.autoEnglishInput = false; canvas->setAppearance(appearance);
+        noxshell::ServerProfile profile;
+        profile.id = profile.name = QStringLiteral("tool-fixture"); profile.host = "192.0.2.10";
+        profile.user = "fixture"; profile.password = "synthetic-only"; profile.connectionMode = noxshell::ConnectionMode::Ssh;
+        session.connectTo(profile);
+        QCOMPARE(connections.size(), 1);
+        QVERIFY(QMetaObject::invokeMethod(&session, "handleConnectionChanged", Qt::DirectConnection,
+            Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("fixture connected")), Q_ARG(quint64, connections.first().at(1).toULongLong())));
+        panel.resize(980, 560); panel.show();
+        QCoreApplication::processEvents();
+        QVERIFY(panel.window()->testAttribute(Qt::WA_AlwaysShowToolTips));
+        auto *historyButton = panel.findChild<QToolButton *>(QStringLiteral("commandHistoryButton"));
+        const QStringList toolNames{QStringLiteral("进程管理"), QStringLiteral("网速测试"), QStringLiteral("流量观测")};
+        for (int i = 0; i < toolNames.size(); ++i) {
+            auto *button = panel.findChild<QToolButton *>(QStringLiteral("serverToolButton%1").arg(i));
+            QVERIFY(button);
+            QCOMPARE(button->size(), historyButton->size());
+            QCOMPARE(button->iconSize(), historyButton->iconSize());
+            QCOMPARE(button->autoRaise(), historyButton->autoRaise());
+            QVERIFY(button->property("terminalFooterButton").toBool());
+            QCOMPARE(button->toolTip(), toolNames[i]);
+            // The old buttons had opaque native white squares in light mode.
+            QCOMPARE(button->grab().toImage().pixelColor(1, 1), historyButton->grab().toImage().pixelColor(1, 1));
+            QHelpEvent help(QEvent::ToolTip, button->rect().center(), button->mapToGlobal(button->rect().center()));
+            QApplication::sendEvent(button, &help);
+            QTRY_VERIFY(QToolTip::isVisible());
+            QCOMPARE(QToolTip::text(), toolNames[i]);
+            QToolTip::hideText();
+        }
+        panel.findChild<QToolButton *>(QStringLiteral("serverToolButton0"))->click();
+        auto *dialog = panel.findChild<noxshell::ui::ServerToolsDialog *>();
+        QVERIFY(dialog && dialog->isVisible());
+        QCOMPARE(tools.size(), 1);
+        QVERIFY(session.serverToolBusy());
+        QCOMPARE(session.runServerTool({{"operation", "traffic"}}), quint64(0));
+        session.requestMetrics(); QCOMPARE(metrics.size(), 0);
+        const auto reply = [&](quint64 request, const QJsonObject &result, const QString &error = QString()) {
+            QVERIFY(QMetaObject::invokeMethod(&session, "handleServerToolFinished", Qt::DirectConnection,
+                Q_ARG(quint64, request), Q_ARG(QByteArray, QJsonDocument(result).toJson(QJsonDocument::Compact)), Q_ARG(QString, error)));
+        };
+        const auto first = tools.last().at(0).toULongLong();
+        reply(first - 1, {{"rows", QJsonArray{}}}); QVERIFY(session.serverToolBusy());
+        QJsonArray rows;
+        for (int i = 0; i < 1000; ++i) rows.append(QJsonObject{{"pid", i + 100}, {"name", QStringLiteral("worker-%1").arg(i)}, {"start", "42"}, {"cpu", 1}, {"rss", 1024}});
+        reply(first, {{"rows", rows}, {"safeSignals", true}});
+        auto *processes = dialog->findChild<QTreeWidget *>(QStringLiteral("managedProcessList"));
+        QCOMPARE(processes->topLevelItemCount(), 100);
+        processes->setCurrentItem(processes->topLevelItem(0));
+        auto *terminate = dialog->findChild<QPushButton *>(QStringLiteral("processActionTERM")); QVERIFY(terminate->isEnabled());
+        const auto cancelConfirmation = [](QPushButton *button) {
+            QVERIFY(button->isEnabled());
+            bool handled = false;
+            QTimer timer; timer.setInterval(10);
+            QObject::connect(&timer, &QTimer::timeout, &timer, [&] {
+                auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                if (!box) for (auto *widget : QApplication::topLevelWidgets()) {
+                    auto *candidate = qobject_cast<QMessageBox *>(widget);
+                    if (candidate && candidate->isVisible()) { box = candidate; break; }
+                }
+                if (!box) return;
+                handled = true;
+                QCOMPARE(box->defaultButton(), box->button(QMessageBox::Cancel));
+                box->reject(); timer.stop();
+            });
+            timer.start(); button->click(); timer.stop();
+            QVERIFY(handled);
+        };
+        cancelConfirmation(terminate); QCOMPARE(tools.size(), 1);
+        auto *tabs = dialog->findChild<QTabWidget *>(); tabs->setCurrentIndex(2);
+        QCOMPARE(tools.size(), 2);
+        rows = {};
+        for (int i = 0; i < 2000; ++i) rows.append(QJsonObject{{"ip", QStringLiteral("198.51.100.%1").arg(i % 250 + 1)},
+            {"connections", 200 - i % 10}, {"tx", 2048}, {"rx", i ? QJsonValue(4096) : QJsonValue()}, {"complete", i != 0}});
+        reply(tools.last().at(0).toULongLong(), {{"rows", rows}, {"partial", true}});
+        auto *clients = dialog->findChild<QTreeWidget *>(QStringLiteral("trafficClientList"));
+        QCOMPARE(clients->topLevelItemCount(), 10);
+        QVERIFY(clients->topLevelItem(0)->text(3).contains(QStringLiteral("不可用")));
+        auto *limit = dialog->findChild<QSpinBox *>(QStringLiteral("trafficClientLimit")); QCOMPARE(limit->maximum(), 100);
+        QVERIFY(!dialog->findChild<QCheckBox *>(QStringLiteral("serverToolsAutoRefresh"))->isChecked());
+        tabs->setCurrentIndex(1); QCOMPARE(tools.size(), 3);
+        reply(tools.last().at(0).toULongLong(), {{"rows", QJsonArray{QJsonObject{{"name", "eth0"}, {"ip", "10.0.0.2"}, {"private", true}}}}});
+        QCOMPARE(dialog->findChild<QComboBox *>(QStringLiteral("speedSourceAddress"))->count(), 2);
+        QCOMPARE(dialog->findChild<QSpinBox *>(QStringLiteral("speedTestMbps"))->value(), 10);
+        dialog->findChild<QLineEdit *>(QStringLiteral("speedTestTarget"))->setText("192.0.2.1");
+        cancelConfirmation(dialog->findChild<QPushButton *>(QStringLiteral("startSpeedTest"))); QCOMPARE(tools.size(), 3);
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_SERVER_TOOLS_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) {
+            QVERIFY(panel.findChild<QWidget *>(QStringLiteral("terminalInputRow"))->grab().save(
+                QDir(screenshots).filePath(QStringLiteral("footer-%1.png").arg(dark ? "dark" : "light"))));
+            for (int page = 0; page < 3; ++page) {
+                tabs->blockSignals(true); tabs->setCurrentIndex(page); tabs->blockSignals(false);
+                QVERIFY(dialog->grab().save(QDir(screenshots).filePath(QStringLiteral("tools-%1-%2.png").arg(dark ? "dark" : "light").arg(page))));
+            }
+        }
+        auto *cancel = dialog->findChild<QPushButton *>(QStringLiteral("cancelServerTools"));
+        auto *automatic = dialog->findChild<QCheckBox *>(QStringLiteral("serverToolsAutoRefresh"));
+        auto *status = dialog->findChild<QLabel *>(QStringLiteral("serverToolsStatus"));
+        QVERIFY(cancel && automatic && status);
+        QVERIFY(!cancel->isEnabled()); QCOMPARE(cancel->text(), QStringLiteral("无运行任务"));
+        automatic->setChecked(true);
+        QVERIFY(cancel->isEnabled()); QCOMPARE(cancel->text(), QStringLiteral("停止自动刷新"));
+        cancel->click(); QVERIFY(!automatic->isChecked());
+        QVERIFY(status->text().contains(QStringLiteral("自动刷新已停止")));
+        dialog->findChild<QPushButton *>(QStringLiteral("refreshServerTools"))->click();
+        QVERIFY(session.serverToolBusy());
+        automatic->setChecked(true);
+        tabs->setCurrentIndex(tabs->currentIndex() == 0 ? 1 : 0); // queues a page query after cancel
+        const auto requestsBeforeCancel = tools.size();
+        cancel->click();
+        QCOMPARE(cancel->text(), QStringLiteral("正在取消…")); QVERIFY(!cancel->isEnabled());
+        QVERIFY(status->text().contains(QStringLiteral("正在取消")));
+        QVERIFY(!automatic->isChecked()); QVERIFY(!automatic->isEnabled());
+        tabs->setCurrentIndex(2); // manual cancel must also suppress later page changes
+        QCOMPARE(session.runServerTool({{"operation", "traffic"}}), quint64(0));
+        // A successful result racing with the click must not overwrite the old list.
+        reply(tools.last().at(0).toULongLong(), {{"rows", QJsonArray{QJsonObject{{"ip", "203.0.113.1"}}}}});
+        QVERIFY(!session.serverToolBusy());
+        QCOMPARE(tools.size(), requestsBeforeCancel);
+        QCOMPARE(clients->topLevelItemCount(), 10);
+        QVERIFY(status->text().contains(QStringLiteral("任务已取消")));
+        QVERIFY(!cancel->isEnabled()); QCOMPARE(cancel->text(), QStringLiteral("无运行任务"));
+        QVERIFY(automatic->isEnabled());
+        QVERIFY(!dialog->findChild<QTimer *>(QStringLiteral("serverToolsRefreshTimer"))->isActive());
+        // A new explicit refresh works normally after the channel is released.
+        dialog->findChild<QPushButton *>(QStringLiteral("refreshServerTools"))->click();
+        QCOMPARE(tools.size(), requestsBeforeCancel + 1);
+        reply(tools.last().at(0).toULongLong(), {{"rows", QJsonArray{}}});
+        QVERIFY(status->text().contains(QStringLiteral("查询已完成")));
+        dialog->findChild<QPushButton *>(QStringLiteral("refreshServerTools"))->click();
+        cancel->click();
+        reply(tools.last().at(0).toULongLong(), {}, QStringLiteral("已取消"));
+        QVERIFY(!session.serverToolBusy());
+        QVERIFY(status->text().contains(QStringLiteral("任务已取消")));
+        dialog->close(); QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCOMPARE(terminalWrites.count(), 0); QCOMPARE(connections.count(), 1);
+        const auto unsafe = noxshell::detail::serverToolCommand({{"operation", "speed"}, {"target", "x';$(touch BAD)"}});
+        QVERIFY(!unsafe.isEmpty()); QVERIFY(!unsafe.contains("$(touch BAD)"));
+        QVERIFY(noxshell::detail::serverToolCommand({{"operation", "arbitrary-command"}}).isEmpty());
+    }
+
+    void softwareInstallerRequiresConfirmationAndKeepsBackgroundJob_data()
+    {
+        QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("dark")<<true;
+    }
+
+    void softwareInstallerRequiresConfirmationAndKeepsBackgroundJob()
+    {
+        using namespace noxshell;using namespace noxshell::ui;
+        QFETCH(bool,dark);SettingsGuard settings;
+        const auto previous=isApplicationDarkTheme()?ThemeMode::Dark:ThemeMode::Light;
+        const auto restore=qScopeGuard([&]{applyApplicationTheme(previous);});applyApplicationTheme(dark?ThemeMode::Dark:ThemeMode::Light);
+        MemoryCredentialStore credentials;SshSession session(nullptr,&credentials);
+        QObject::disconnect(&session,&SshSession::connectRequested,nullptr,nullptr);
+        QObject::disconnect(&session,&SshSession::serverToolRequested,nullptr,nullptr);
+        QSignalSpy connections(&session,&SshSession::connectRequested),requests(&session,&SshSession::serverToolRequested),rawInput(&session,&SshSession::inputRequested);
+        ServerProfile profile;profile.id=QUuid::createUuid().toString();profile.name="software-fixture";profile.host="192.0.2.71";profile.user="root";profile.password="synthetic-only";profile.connectionMode=ConnectionMode::Ssh;
+        session.connectTo(profile);QCOMPARE(connections.size(),1);
+        QVERIFY(QMetaObject::invokeMethod(&session,"handleConnectionChanged",Qt::DirectConnection,Q_ARG(bool,true),Q_ARG(QString,QString("synthetic connected")),Q_ARG(quint64,connections.last().at(1).toULongLong())));
+        TerminalPanel panel(&session,nullptr);panel.resize(1100,650);panel.show();QCoreApplication::processEvents();
+        auto *button=panel.findChild<QToolButton *>("softwareInstallButton");auto *history=panel.findChild<QToolButton *>("commandHistoryButton");
+        QVERIFY(button);QCOMPARE(button->toolTip(),QString("软件安装"));QCOMPARE(button->size(),history->size());QCOMPARE(button->iconSize(),history->iconSize());
+        QVERIFY(button->property("terminalFooterButton").toBool());button->click();
+        auto *dialog=panel.findChild<SoftwareInstallDialog *>();QVERIFY(dialog&&dialog->isVisible());QCOMPARE(requests.size(),1);
+        const auto options=[&]{
+            const auto command=requests.last().at(1).toByteArray();
+            return QJsonDocument::fromJson(QByteArray::fromBase64(command.mid(command.lastIndexOf("' '")+3).chopped(1))).object();
+        };
+        const auto reply=[&](QJsonObject result,const QString &error=QString{}){
+            QVERIFY(QMetaObject::invokeMethod(&session,"handleServerToolFinished",Qt::DirectConnection,Q_ARG(quint64,requests.last().at(0).toULongLong()),Q_ARG(QByteArray,QJsonDocument(result).toJson(QJsonDocument::Compact)),Q_ARG(QString,error)));
+        };
+        QCOMPARE(options().value("operation").toString(),QString("packages.search"));
+        QJsonArray rows;
+        rows.append(QJsonObject{{"name","nginx"},{"description","HTTP / reverse proxy server"},{"installed",false}});
+        rows.append(QJsonObject{{"name","curl"},{"description","文件传输工具"},{"installed",true}});
+        for(int i=0;i<100;++i)rows.append(QJsonObject{{"name",QString("tool%1").arg(i)},{"description","bounded fixture"},{"installed",false}});
+        reply({{"manager","apt"},{"canInstall",false},{"rows",rows},{"partial",true}});
+        auto *tree=dialog->findChild<QTreeWidget *>("availableSoftwareList");QCOMPARE(tree->topLevelItemCount(),50);
+        auto *install=dialog->findChild<QPushButton *>("installSelectedSoftware");tree->topLevelItem(0)->setCheckState(0,Qt::Checked);QVERIFY(!install->isEnabled());
+        QVERIFY(!(tree->topLevelItem(1)->flags()&Qt::ItemIsUserCheckable));
+        dialog->findChild<QLineEdit *>("softwareSearch")->setText("nginx");dialog->findChild<QPushButton *>("searchSoftware")->click();QCOMPARE(options().value("query").toString(),QString("nginx"));
+        reply({{"manager","apt"},{"canInstall",true},{"rows",rows}});
+        tree->topLevelItem(0)->setCheckState(0,Qt::Checked);QVERIFY(install->isEnabled());
+        for(int i=2;i<12;++i)tree->topLevelItem(i)->setCheckState(0,Qt::Checked);
+        QVERIFY(!install->isEnabled());for(int i=2;i<12;++i)tree->topLevelItem(i)->setCheckState(0,Qt::Unchecked);QVERIFY(install->isEnabled());
+        const QJsonObject plan{{"manager","apt"},{"packages",QJsonArray{"nginx"}},{"plan",QString(64,'a')},{"command","DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get -y --no-remove install nginx"}};
+        install->click();QCOMPARE(options().value("operation").toString(),QString("packages.plan"));
+        bool confirmed=false,sawConfirmation=false;QTimer responder;responder.setInterval(5);
+        connect(&responder,&QTimer::timeout,dialog,[&]{
+            auto *approval=qobject_cast<QDialog *>(QApplication::activeModalWidget());if(!approval||approval->objectName()!="softwareInstallConfirmation")return;
+            sawConfirmation=true;
+            QCOMPARE(approval->findChild<QPlainTextEdit *>("softwareInstallCommand")->toPlainText(),plan.value("command").toString());
+            QVERIFY(approval->findChild<QLabel *>("softwareApprovalTarget")->text().contains("root@192.0.2.71:22"));
+            if(confirmed)approval->accept();else approval->reject();
+        });
+        // A completed plan racing with hide/reopen must not reopen an old
+        // approval dialog, even if the cancellation RPC loses that race.
+        dialog->hide();dialog->showManager();responder.start();reply(plan);responder.stop();
+        QVERIFY(!sawConfirmation);QCOMPARE(requests.size(),3);QVERIFY(!session.serverToolBusy());
+        install->click();responder.start();reply(plan);responder.stop();
+        QVERIFY(sawConfirmation);QCOMPARE(requests.size(),4);QVERIFY(!session.serverToolBusy());
+        install->click();confirmed=true;responder.start();reply(plan);responder.stop();
+        QCOMPARE(options().value("operation").toString(),QString("packages.install"));
+        QCOMPARE(options().value("packages").toArray(),QJsonArray{"nginx"});const auto job=options().value("job").toString();QCOMPARE(job.size(),32);
+        const auto clearPersisted=qScopeGuard([&]{
+            const QStringList identity{profile.id,profile.host,QString::number(profile.port),profile.user};
+            QSettings().remove("packageJobs/"+QString::fromLatin1(QCryptographicHash::hash(identity.join('\n').toUtf8(),QCryptographicHash::Sha256).toHex()));
+        });
+        reply({{"job",job},{"phase","starting"},{"logPath","/tmp/noxshell-install-"+job+"/output.log"}});
+        QVERIFY(!install->isEnabled());auto *timer=dialog->findChild<QTimer *>("softwareJobPollTimer");QVERIFY(timer->isActive());
+        const auto count=requests.size();dialog->close();QVERIFY(!timer->isActive());QCOMPARE(requests.size(),count);
+        button->click();QCOMPARE(panel.findChildren<SoftwareInstallDialog *>().size(),1);QCOMPARE(options().value("operation").toString(),QString("packages.status"));QCOMPARE(options().value("job").toString(),job);
+        reply({{"job",job},{"phase","running"},{"packages",QJsonArray{"nginx"}},{"log","正在安装依赖…\n"},{"logPath","/tmp/test-output.log"}});
+        QCoreApplication::processEvents();
+        auto *status=dialog->findChild<QLabel *>("softwareInstallStatus");
+        QVERIFY(dialog->rect().contains(status->geometry()));QVERIFY(status->height()>=3*status->fontMetrics().height());
+        QVERIFY(!install->isEnabled());QVERIFY(dialog->findChild<QPlainTextEdit *>("softwareInstallLog")->toPlainText().contains("安装依赖"));
+        const auto screenshots=qEnvironmentVariable("NOXSHELL_SOFTWARE_SCREENSHOT_DIR");
+        if(!screenshots.isEmpty()){QVERIFY(QDir().mkpath(screenshots));QVERIFY(dialog->grab().save(QDir(screenshots).filePath(dark?"software-dark.png":"software-light.png")));}
+        dialog->findChild<QPushButton *>("refreshSoftwareJob")->click();reply({{"job",job},{"phase","succeeded"},{"packages",QJsonArray{"nginx"}},{"log","安装完成\n"},{"logPath","/tmp/test-output.log"}});
+        QVERIFY(!timer->isActive());QCOMPARE(tree->topLevelItem(0)->text(2),QString("已安装"));QVERIFY(!install->isEnabled());
+        dialog->findChild<QPushButton *>("clearSoftwareSearch")->click();QCOMPARE(options().value("query").toString(),QString{});reply({{"manager","apt"},{"canInstall",true},{"rows",QJsonArray{}}});
+        dialog->close();QCOMPARE(rawInput.size(),0);QCOMPARE(connections.size(),1);QCOMPARE(credentials.loadCalls,0);
+        QVERIFY(!detail::serverToolCommand({{"operation","packages.search"},{"query","x';$(touch BAD)"}}).isEmpty());
+        QVERIFY(!detail::serverToolCommand({{"operation","packages.search"},{"query","x';$(touch BAD)"}}).contains("$(touch BAD)"));
+    }
+
+    void softwareInstallerNeverInstallsInDemoOrAfterTargetChanges()
+    {
+        using namespace noxshell;using namespace noxshell::ui;SettingsGuard settings;
+        MemoryCredentialStore credentials;
+        {
+            SshSession demo(nullptr,&credentials);ServerProfile profile;profile.connectionMode=ConnectionMode::Demo;demo.connectTo(profile);
+            QSignalSpy requests(&demo,&SshSession::serverToolRequested);
+            SoftwareInstallDialog dialog(&demo);dialog.showManager();
+            QVERIFY(!dialog.findChild<QPushButton *>("installSelectedSoftware")->isEnabled());QCOMPARE(requests.size(),0);dialog.close();
+        }
+        SshSession session(nullptr,&credentials);
+        QObject::disconnect(&session,&SshSession::connectRequested,nullptr,nullptr);QObject::disconnect(&session,&SshSession::serverToolRequested,nullptr,nullptr);
+        QSignalSpy connections(&session,&SshSession::connectRequested),requests(&session,&SshSession::serverToolRequested),rawInput(&session,&SshSession::inputRequested);
+        ServerProfile profile;profile.id=QUuid::createUuid().toString();profile.name="recover-software-fixture";profile.host="192.0.2.72";profile.user="root";profile.password="synthetic-only";profile.connectionMode=ConnectionMode::Ssh;
+        session.connectTo(profile);
+        QVERIFY(QMetaObject::invokeMethod(&session,"handleConnectionChanged",Qt::DirectConnection,Q_ARG(bool,true),Q_ARG(QString,QString("synthetic connected")),Q_ARG(quint64,connections.last().at(1).toULongLong())));
+        const QStringList identity{profile.id,profile.host,QString::number(profile.port),profile.user};
+        const auto key="packageJobs/"+QString::fromLatin1(QCryptographicHash::hash(identity.join('\n').toUtf8(),QCryptographicHash::Sha256).toHex())+"/job";
+        const auto cleanup=qScopeGuard([&]{QSettings().remove(key);});QSettings().setValue(key,QString(32,'a'));
+        SoftwareInstallDialog dialog(&session);dialog.showManager();QCOMPARE(requests.size(),1);
+        const auto options=[&]{const auto command=requests.last().at(1).toByteArray();return QJsonDocument::fromJson(QByteArray::fromBase64(command.mid(command.lastIndexOf("' '")+3).chopped(1))).object();};
+        const auto reply=[&](QJsonObject result){QVERIFY(QMetaObject::invokeMethod(&session,"handleServerToolFinished",Qt::DirectConnection,Q_ARG(quint64,requests.last().at(0).toULongLong()),Q_ARG(QByteArray,QJsonDocument(result).toJson(QJsonDocument::Compact)),Q_ARG(QString,QString{})));};
+        QCOMPARE(options().value("operation").toString(),QString("packages.status"));
+        reply({{"error","任务记录不存在（模拟）"}});
+        auto *forget=dialog.findChild<QPushButton *>("forgetSoftwareJob");QVERIFY(forget->isEnabled());
+        QVERIFY(!dialog.findChild<QPushButton *>("searchSoftware")->isEnabled());
+        bool accept=false,sawWarning=false;QTimer responder;responder.setInterval(5);
+        connect(&responder,&QTimer::timeout,&dialog,[&]{
+            auto *box=qobject_cast<QMessageBox *>(QApplication::activeModalWidget());if(!box)return;sawWarning=true;
+            QCOMPARE(box->defaultButton(),box->button(QMessageBox::Cancel));box->done(accept?QMessageBox::Ok:QMessageBox::Cancel);
+        });
+        responder.start();forget->click();responder.stop();QVERIFY(sawWarning);QVERIFY(QSettings().contains(key));QCOMPARE(requests.size(),1);
+        accept=true;responder.start();forget->click();responder.stop();QVERIFY(!QSettings().contains(key));QCOMPARE(requests.size(),1);
+        dialog.findChild<QPushButton *>("searchSoftware")->click();reply({{"manager","apt"},{"canInstall",true},{"rows",QJsonArray{QJsonObject{{"name","nginx"},{"installed",false}}}}});
+        dialog.findChild<QTreeWidget *>("availableSoftwareList")->topLevelItem(0)->setCheckState(0,Qt::Checked);
+        auto *install=dialog.findChild<QPushButton *>("installSelectedSoftware");QVERIFY(install->isEnabled());install->click();QCOMPARE(requests.size(),3);
+        responder.disconnect(&dialog);bool changed=false;
+        connect(&responder,&QTimer::timeout,&dialog,[&]{
+            auto *approval=qobject_cast<QDialog *>(QApplication::activeModalWidget());if(!approval||approval->objectName()!="softwareInstallConfirmation")return;
+            changed=true;auto other=profile;other.id="another-target";other.host="192.0.2.73";session.connectTo(other);approval->accept();
+        });
+        responder.start();reply({{"manager","apt"},{"packages",QJsonArray{"nginx"}},{"plan",QString(64,'a')},{"command","apt-get install nginx"}});responder.stop();
+        QVERIFY(changed);QVERIFY(!dialog.belongsToCurrentProfile());QCOMPARE(requests.size(),3);QVERIFY(!install->isEnabled());QCOMPARE(rawInput.size(),0);dialog.close();
+    }
+
+    void terminalResizePreservesShellOutputAndWideCells()
+    {
+        noxshell::ui::VtTerminalModel model(80, 20);
+        const QString line = QStringLiteral("split-resize-buffer-中文-tail");
+        model.feed((line + QStringLiteral("\r\n")).repeated(35));
+        const auto before = QString(model.plainText()).remove(QLatin1Char('\n')).remove(QLatin1Char(' '));
+        model.resize(19, 6);
+        model.resize(53, 15);
+        model.resize(12, 4);
+        const auto after = QString(model.plainText()).remove(QLatin1Char('\n')).remove(QLatin1Char(' '));
+        QCOMPARE(after, before);
+        QVERIFY(model.cursorColumn() < model.columns());
+        QVERIFY(model.cursorRow() < model.rows());
+        for (int row = 0; row < model.rows(); ++row) {
+            QVERIFY(!model.cell(row, 0).wideContinuation);
+            for (int col = 1; col < model.columns(); ++col) {
+                if (model.cell(row, col).wideContinuation) QVERIFY(model.cell(row, col - 1).text != QStringLiteral(" "));
+            }
+        }
+        model.feed(QStringLiteral("\x1b[?1049hvi-content"));
+        model.resize(8, 3);
+        model.feed(QStringLiteral("\x1b[?1049l"));
+        const auto restored = QString(model.plainText()).remove(QLatin1Char('\n')).remove(QLatin1Char(' '));
+        QCOMPARE(restored, before);
+    }
+
+    void terminalReflowRestoresLinesAfterRepeatedResizes()
+    {
+        noxshell::ui::VtTerminalModel model(80, 12);
+        for (int line = 0; line < 24; ++line) {
+            model.feed(QStringLiteral("\x1b[32mline-%1\x1b[0m: Ubuntu 20.04 /var/www 中文 e\u0301  spaced text\r\n").arg(line));
+            if (line % 5 == 0) model.feed(QStringLiteral("\r\n"));
+        }
+        model.feed(QStringLiteral("natural-wrap:") + QStringLiteral("abcdefghij").repeated(10)
+            + QStringLiteral("\r\nroot@host:/var/www# "));
+        const auto original = model.plainText();
+        const int cursorColumn = model.cursorColumn();
+        const int cursorLine = model.historyLineCount() + model.cursorRow();
+        for (int repeat = 0; repeat < 6; ++repeat) {
+            model.resize(7, 4);
+            model.resize(2, 3);
+            model.resize(31, 7);
+            model.resize(11, 5);
+            model.resize(80, 12);
+            QCOMPARE(model.plainText(), original);
+            QCOMPARE(model.cursorColumn(), cursorColumn);
+            QCOMPARE(model.historyLineCount() + model.cursorRow(), cursorLine);
+        }
+        model.feed(QStringLiteral("echo done"));
+        QVERIFY(model.plainText().endsWith(QStringLiteral("root@host:/var/www# echo done")));
+        const auto withCommand = model.plainText();
+        model.feed(QStringLiteral("\x1b[?1049h\x1b[Hvim"));
+        model.resize(3, 3);
+        model.resize(80, 12);
+        model.feed(QStringLiteral("\x1b[?1049l"));
+        QCOMPARE(model.plainText(), withCommand);
+    }
+
+    void terminalReflowPreservesWideCellsAndPendingWrap()
+    {
+        noxshell::ui::VtTerminalModel model(8, 6);
+        model.feed(QStringLiteral("1234567中\x1b[31m文\x1b[0me\u0301 \r\n\r\n12345678"));
+        const auto original = model.plainText();
+        for (const int width : {2, 5, 3, 8}) model.resize(width, 6);
+        QCOMPARE(model.plainText(), original);
+        QCOMPARE(model.cell(1, 0).text, QStringLiteral("中"));
+        QVERIFY(model.cell(1, 1).wideContinuation);
+        QCOMPARE(model.cell(1, 2).text, QStringLiteral("文"));
+        QCOMPARE(model.cell(1, 2).foreground, QColor(QStringLiteral("#E06C75")));
+        QCOMPARE(model.cell(1, 4).text, QStringLiteral("e\u0301"));
+        model.feed(QStringLiteral("Z"));
+        QVERIFY(model.plainText().endsWith(QStringLiteral("12345678\nZ")));
+        model.resize(20, 9);
+        QVERIFY(model.plainText().endsWith(QStringLiteral("12345678Z")));
+        model.feed(QStringLiteral("\r\nhard-newline"));
+        model.resize(2, 3);
+        model.resize(20, 9);
+        QVERIFY(model.plainText().endsWith(QStringLiteral("12345678Z\nhard-newline")));
+        noxshell::ui::VtTerminalModel styledWrap(4, 4);
+        styledWrap.feed(QStringLiteral("1234\x1b[31mZ\x1b[0m"));
+        QCOMPARE(styledWrap.plainText(), QStringLiteral("1234\nZ"));
+        styledWrap.resize(10, 4);
+        QCOMPARE(styledWrap.plainText(), QStringLiteral("1234Z"));
+        QCOMPARE(styledWrap.cell(0, 4).foreground, QColor(QStringLiteral("#E06C75")));
+    }
+
+    void terminalSplitterDragRestoresBothBuffers()
+    {
+        QSplitter splitter(Qt::Horizontal);
+        auto *left = new noxshell::ui::TerminalView;
+        auto *right = new noxshell::ui::TerminalView;
+        for (auto *view : {left, right}) {
+            auto appearance = view->appearance();
+            appearance.autoEnglishInput = false;
+            view->setAppearance(appearance);
+            splitter.addWidget(view);
+        }
+        splitter.setChildrenCollapsible(false);
+        splitter.resize(1200, 540);
+        splitter.show();
+        QTest::qWait(30);
+        const auto sizes = splitter.sizes();
+        const int leftColumns = left->columns();
+        const int rightColumns = right->columns();
+        const auto output = QStringLiteral("Welcome to Ubuntu 20.04 LTS\r\n\r\n"
+            "Run 'do-release-upgrade' to upgrade to it.\r\n"
+            "Last login: Sat Oct 24 13:06:43 2026\r\n"
+            "中文目录 /var/www/app\r\n").repeated(6) + QStringLiteral("root@host:~# ");
+        left->feedText(output);
+        right->feedText(output);
+        const auto originalLeft = left->plainText();
+        const auto originalRight = right->plainText();
+        QSignalSpy leftSizes(left, &noxshell::ui::TerminalView::terminalSizeChanged);
+        QSignalSpy rightSizes(right, &noxshell::ui::TerminalView::terminalSizeChanged);
+        for (int repeat = 0; repeat < 6; ++repeat) {
+            for (const int x : {20, 1100, 260, 850}) {
+                auto *handle = splitter.handle(1);
+                const auto center = handle->rect().center();
+                QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, center);
+                const auto target = handle->mapFrom(&splitter, QPoint(x, splitter.height() / 2));
+                QMouseEvent move(QEvent::MouseMove, target, handle->mapToGlobal(target),
+                    Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+                QApplication::sendEvent(handle, &move);
+                QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, target);
+                QCoreApplication::processEvents();
+            }
+            splitter.setSizes(sizes);
+            QCoreApplication::processEvents();
+            QCOMPARE(left->columns(), leftColumns);
+            QCOMPARE(right->columns(), rightColumns);
+            QCOMPARE(left->plainText(), originalLeft);
+            QCOMPARE(right->plainText(), originalRight);
+        }
+        bool leftNarrowed = false;
+        bool rightNarrowed = false;
+        for (const auto &size : leftSizes) leftNarrowed |= size.at(0).toInt() < leftColumns;
+        for (const auto &size : rightSizes) rightNarrowed |= size.at(0).toInt() < rightColumns;
+        QVERIFY(leftNarrowed && rightNarrowed);
+        for (auto *view : {left, right}) {
+            view->feedText(QStringLiteral("echo restored\r\n"));
+            QVERIFY(view->plainText().contains(QStringLiteral("root@host:~# echo restored")));
+        }
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_SPLIT_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) QVERIFY(splitter.grab().save(QDir(screenshots).filePath(QStringLiteral("reflow-restored.png"))));
+    }
+
     void terminalFullScreenHidesHistoryPreservesResizeAndCursor()
     {
         noxshell::ui::VtTerminalModel model(20, 6);
@@ -1212,7 +2047,8 @@ private slots:
         QInputMethodQueryEvent query(Qt::ImCursorRectangle);
         QApplication::sendEvent(&view, &query);
         const auto cursor = query.value(Qt::ImCursorRectangle).toRectF();
-        QCOMPARE(image.pixelColor(QPoint(qRound(cursor.left()) + 1, qRound(cursor.top()) + 3)), QColor(QStringLiteral("#7DB1DE")));
+        QCOMPARE(image.pixelColor(QPoint(qRound(cursor.left()) + 1, qRound(cursor.top()) + 3)),
+            noxshell::ui::terminalColors(noxshell::ui::isApplicationDarkTheme()).cursor);
         view.clear(); // Clearing history while vi redraws must retain full-screen modes.
         QCOMPARE(scroll->maximum(), 0);
         QCOMPARE(mode.count(), 1);
@@ -1295,6 +2131,160 @@ private slots:
         QCOMPARE(inputSpy.at(4).at(0).toByteArray(), QByteArray("\x1b[Z"));
         QVERIFY(view.hasFocus());
         QVERIFY(!sizeSpy.isEmpty());
+    }
+
+    void terminalOptionArrowsMoveByWordAndKeepTuiModifiers()
+    {
+        using namespace noxshell::ui;
+        TerminalView view;
+        view.resize(900, 300); view.show();
+        QSignalSpy input(&view, &TerminalView::inputGenerated);
+        QSignalSpy commands(&view, &TerminalView::commandSubmitted);
+        QTest::keyClick(&view, Qt::Key_Left, Qt::AltModifier);
+        QTest::keyClick(&view, Qt::Key_Right, Qt::AltModifier);
+        QCOMPARE(input.count(), 2);
+        QCOMPARE(input.at(0).at(0).toByteArray(), QByteArray("\x1b" "b"));
+        QCOMPARE(input.at(1).at(0).toByteArray(), QByteArray("\x1b" "f"));
+        view.feedText("root@test:~# echo alpha NEW tail\x1b[23G");
+        QTest::keyClick(&view, Qt::Key_Return);
+        QCOMPARE(commands.count(), 1);
+        QCOMPARE(commands.last().at(0).toString(), QString("echo alpha NEW tail"));
+        view.feedText("\x1b[?1h");
+        QTest::keyClick(&view, Qt::Key_Left, Qt::AltModifier);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[1;3D"));
+        view.feedText("\x1b[?1049h");
+        QTest::keyClick(&view, Qt::Key_Right, Qt::AltModifier);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[1;3C"));
+        QCOMPARE(commands.count(), 1);
+        view.feedText("\x1b[?1049l\x1b[?1l");
+        QTest::keyClick(&view, Qt::Key_Left);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[D"));
+    }
+
+    void terminalOptionArrowsAcceptNativeKeypadFlag()
+    {
+        using namespace noxshell::ui;
+        TerminalView view;
+        QSignalSpy input(&view, &TerminalView::inputGenerated);
+        for (const int key : {Qt::Key_Left, Qt::Key_Right}) {
+            QKeyEvent shortcut(QEvent::ShortcutOverride, key, Qt::AltModifier | Qt::KeypadModifier);
+            shortcut.setAccepted(false);
+            QApplication::sendEvent(&view, &shortcut);
+            QVERIFY(shortcut.isAccepted());
+            QKeyEvent event(QEvent::KeyPress, key, Qt::AltModifier | Qt::KeypadModifier);
+            QApplication::sendEvent(&view, &event);
+        }
+        QCOMPARE(input.count(), 2);
+        QCOMPARE(input.at(0).at(0).toByteArray(), QByteArray("\x1b" "b"));
+        QCOMPARE(input.at(1).at(0).toByteArray(), QByteArray("\x1b" "f"));
+        for (const auto extra : {Qt::ShiftModifier, Qt::ControlModifier, Qt::MetaModifier}) {
+            QKeyEvent event(QEvent::KeyPress, Qt::Key_Left, Qt::AltModifier | Qt::KeypadModifier | extra);
+            QApplication::sendEvent(&view, &event);
+            QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[D"));
+        }
+        QSignalSpy commands(&view, &TerminalView::commandSubmitted);
+        QKeyEvent wordLeft(QEvent::KeyPress, Qt::Key_Left, Qt::AltModifier | Qt::KeypadModifier);
+        QApplication::sendEvent(&view, &wordLeft);
+        view.feedText("root@test:~# echo complete suffix\x1b[20G");
+        QTest::keyClick(&view, Qt::Key_Return);
+        QCOMPARE(commands.count(), 1);
+        QCOMPARE(commands.first().at(0).toString(), QString("echo complete suffix"));
+    }
+
+    void nativeTerminalOptionArrowsReachTheRemoteStream()
+    {
+#ifdef Q_OS_MACOS
+        if (QApplication::platformName() != "cocoa") QSKIP("Requires Cocoa");
+        using namespace noxshell::ui;
+        TerminalView view;
+        auto appearance = view.appearance(); appearance.autoEnglishInput = false; view.setAppearance(appearance);
+        view.resize(700, 300); view.show(); view.raise(); view.activateWindow(); view.setFocus();
+        QVERIFY(QTest::qWaitForWindowActive(&view));
+        QSignalSpy input(&view, &TerminalView::inputGenerated);
+        QVERIFY(nativeProbeTerminalOptionArrow(&view, true));
+        QTRY_COMPARE(input.count(), 1);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b" "b"));
+        QVERIFY(nativeProbeTerminalOptionArrow(&view, false));
+        QTRY_COMPARE(input.count(), 2);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b" "f"));
+        view.feedText("\x1b[?1049h\x1b[?1h");
+        QVERIFY(nativeProbeTerminalOptionArrow(&view, true));
+        QTRY_COMPARE(input.count(), 3);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[1;3D"));
+#else
+        QSKIP("Requires macOS");
+#endif
+    }
+
+    void terminalOptionClickNavigatesOnlyCurrentShellInput()
+    {
+        using namespace noxshell::ui;
+        TerminalView view;
+        auto appearance = view.appearance(); appearance.autoEnglishInput = false; view.setAppearance(appearance);
+        view.resize(640, 400); view.show();
+        QTest::qWait(20);
+        const QString prompt = "root@test:~# ";
+        const QString command = QStringLiteral("echo abc 中文 xyz tail");
+        view.feedText(prompt + command);
+        QSignalSpy input(&view, &TerminalView::inputGenerated);
+        const auto point = [&](int column, int row) {
+            return (view.contentOrigin() + QPointF((column + 0.25) * view.cellSize().width(),
+                (row + 0.5) * view.cellSize().height())).toPoint();
+        };
+        const int target = prompt.size() + command.indexOf("abc");
+        const int arrows = command.size() - command.indexOf("abc");
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(target, 0));
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[D").repeated(arrows));
+        // Do not send a second relative move using an unacknowledged cursor.
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(target + 1, 0));
+        QCOMPARE(input.count(), 1);
+        view.feedText(QStringLiteral("\x1b[%1G").arg(target + 1));
+        const int endColumn = prompt.size() + command.size() + 2; // Two CJK wide cells.
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(endColumn + 2, 0));
+        QCOMPARE(input.count(), 2);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[C").repeated(arrows));
+
+        view.clear(true);
+        const QString wrapped = "echo " + QString(view.columns() + 12, 'a') + " tail";
+        view.feedText(prompt + wrapped);
+        input.clear();
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(prompt.size() + 5, 0));
+        QCOMPARE(input.count(), 1);
+        QCOMPARE(input.last().at(0).toByteArray(), QByteArray("\x1b[D").repeated(wrapped.size() - 5));
+        QSignalSpy commands(&view, &TerminalView::commandSubmitted);
+        view.feedText(QStringLiteral("\x1b[1;%1H").arg(prompt.size() + 6));
+        QTest::keyClick(&view, Qt::Key_Return);
+        QCOMPARE(commands.count(), 1);
+        QCOMPARE(commands.first().at(0).toString(), wrapped);
+
+        const auto refuse = [&](const QString &screen, int row = 0) {
+            view.clear(true); view.feedText(screen); input.clear();
+            QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(18, row));
+            return input.isEmpty();
+        };
+        QVERIFY(refuse("root@test:~# echo old\r\noutput\r\nroot@test:~# echo new"));
+        QVERIFY(refuse("root@test:~# sudo true\r\nPassword: ", 1));
+        QVERIFY(refuse("\x1b[?1049hroot@test:~# echo fake"));
+        QVERIFY(refuse("\x1b[?1hroot@test:~# echo fake"));
+        QVERIFY(refuse(QStringLiteral("root@test:~# echo e\u0301 test")));
+        view.clear(true); view.feedText(prompt + QString(600, 'a')); input.clear();
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(prompt.size(), 0));
+        QVERIFY(input.isEmpty()); // Bound relative movement, even for long input.
+        view.clear(true); view.feedText(prompt + command); input.clear();
+        QInputMethodEvent preedit(QStringLiteral("拼"), {});
+        QApplication::sendEvent(&view, &preedit);
+        QTest::keyClick(&view, Qt::Key_Left, Qt::AltModifier);
+        QVERIFY(input.isEmpty());
+        QKeyEvent keypadArrow(QEvent::KeyPress, Qt::Key_Left, Qt::AltModifier | Qt::KeypadModifier);
+        QApplication::sendEvent(&view, &keypadArrow);
+        QVERIFY(input.isEmpty());
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(target, 0));
+        QVERIFY(input.isEmpty());
+        QInputMethodEvent cancel; QApplication::sendEvent(&view, &cancel);
+        view.showSearch();
+        QTest::mouseClick(&view, Qt::LeftButton, Qt::AltModifier, point(target, 0));
+        QVERIFY(input.isEmpty());
     }
 
     void terminalViewFollowsApplicationCursorModeForVi()
@@ -1410,12 +2400,19 @@ private slots:
 
     void terminalCommandBlockHoverCopiesTextAndImageWithoutRelayout()
     {
+        using namespace noxshell::ui;
+        const auto previous = isApplicationDarkTheme() ? ThemeMode::Dark : ThemeMode::Light;
+        const auto restore = qScopeGuard([previous] { applyApplicationTheme(previous); });
         noxshell::ui::TerminalView view;
         view.resize(720, 260);
         view.show();
+        view.raise();
+        view.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&view));
         QTest::qWait(20);
         view.feedText(QStringLiteral(
             "[root@test-host ~]# ls\r\none\r\ntwo\r\n[root@test-host ~]# "));
+        QTest::mouseMove(&view, QPoint(2, 2));
         QCoreApplication::processEvents();
 
         auto *tools = view.findChild<QFrame *>(QStringLiteral("terminalCommandBlockTools"));
@@ -1432,7 +2429,7 @@ private slots:
         const auto hoverPoint = view.contentOrigin().toPoint()
             + QPoint(80, qRound(view.cellSize().height() * 1.5));
         QTest::mouseMove(&view, hoverPoint);
-        QTRY_VERIFY_WITH_TIMEOUT(tools->isVisible(), 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(tools->isVisible(), 3000);
         QCOMPARE(view.size(), originalSize);
         QCOMPARE(view.rows(), originalRows);
         QCOMPARE(resizeSpy.count(), 0);
@@ -1447,8 +2444,74 @@ private slots:
         QVERIFY(copiedImage.width() > 300);
         QVERIFY(copiedImage.height() >= qCeil(view.cellSize().height() * 3));
 
+        for (const auto mode : {ThemeMode::Dark, ThemeMode::Light}) {
+            applyApplicationTheme(mode);
+            QCoreApplication::processEvents();
+            QTest::mouseMove(&view, hoverPoint);
+            QTRY_VERIFY_WITH_TIMEOUT(tools->isVisible(), 3000);
+            QTest::mouseClick(copyImage, Qt::LeftButton);
+            const auto themedImage = QApplication::clipboard()->image();
+            QCOMPARE(themedImage.pixelColor(1, 1), terminalColors(isApplicationDarkTheme()).background);
+            QCOMPARE(view.size(), originalSize);
+            QCOMPARE(view.rows(), originalRows);
+            QCOMPARE(resizeSpy.count(), 0);
+        }
+
         QTest::mouseMove(&view, QPoint(2, 2));
-        QTRY_VERIFY_WITH_TIMEOUT(!tools->isVisible(), 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!tools->isVisible(), 3000);
+    }
+
+    void terminalLongMultilineCommandKeepsCopyTools()
+    {
+        using namespace noxshell::ui;
+        SettingsGuard guard;
+        noxshell::AppSettings::instance()->setValue("terminal/scrollback", 1000);
+        TerminalView view;
+        view.resize(800, 420); view.show();
+        QString transcript = "root@test:~# echo previous\r\nprevious-output\r\n"
+            "root@test:~# for port in {10000..10599}; do\r\n> echo $port\r\n> done\r\n";
+        for (int index = 0; index < 600; ++index) transcript += QStringLiteral("client-%1\r\n").arg(index);
+        transcript += "root@test:~# ";
+        view.feedText(transcript);
+        auto *scroll = view.findChild<QScrollBar *>("terminalScrollBar");
+        auto *tools = view.findChild<QFrame *>("terminalCommandBlockTools");
+        auto *copy = tools->findChild<QToolButton *>("terminalCommandBlockCopyText");
+        scroll->setValue(0);
+        const auto point = view.contentOrigin().toPoint() + QPoint(80, qRound(view.cellSize().height() * 2.5));
+        const auto hover = [&] {
+            QMouseEvent event(QEvent::MouseMove, point, view.mapToGlobal(point), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+            QApplication::sendEvent(&view, &event);
+        };
+        hover();
+        QVERIFY(tools->isVisible());
+        QTest::mouseClick(copy, Qt::LeftButton);
+        const auto copied = QApplication::clipboard()->text();
+        QVERIFY(copied.startsWith("root@test:~# for port"));
+        QVERIFY(copied.contains("> echo $port\n> done\n"));
+        QVERIFY(copied.endsWith("client-599"));
+        QVERIFY(!copied.contains("previous-output"));
+        QElapsedTimer elapsed; elapsed.start();
+        for (int index = 0; index < 300; ++index) hover();
+        QVERIFY2(elapsed.elapsed() < 2000, "Mouse motion must reuse prompt boundaries without rescanning long output");
+        // Find the same block far beyond the old 256-line backward limit.
+        scroll->setValue(scroll->maximum() - 5);
+        hover();
+        QVERIFY(tools->isVisible());
+        QTest::mouseClick(copy, Qt::LeftButton);
+        QCOMPARE(QApplication::clipboard()->text(), copied);
+        QTest::mouseClick(tools->findChild<QToolButton *>("terminalCommandBlockCopyImage"), Qt::LeftButton);
+        const auto picture = QApplication::clipboard()->image();
+        QVERIFY(!picture.isNull());
+        QVERIFY(picture.sizeInBytes() <= 32 * 1024 * 1024);
+        QVERIFY(picture.height() <= qCeil(view.cellSize().height() * 300) + 20);
+        view.feedText(QStringLiteral("noise\r\n").repeated(1100));
+        scroll->setValue(0); hover();
+        QVERIFY(!tools->isVisible()); // Prompt indices must survive history eviction.
+        view.clear(true);
+        view.feedText("root@test:~# echo fresh\r\nfresh\r\nroot@test:~# ");
+        scroll->setValue(0); hover();
+        // A bare final prompt must not select the previous region.
+        QVERIFY(!tools->isVisible());
     }
 
     void terminalViewSendsTabOncePerPhysicalKeyPress()
@@ -1654,53 +2717,414 @@ private slots:
         QCOMPARE(view->grab().toImage(), before);
     }
 
-    void terminalInputSettingPersistsAndCancelRestores()
+    void terminalInputSettingPersistsInWorkspaceTab()
     {
-        if (QApplication::platformName() == QStringLiteral("cocoa"))
-            QSKIP("Uses the offscreen toolbar; native text input has its own probe");
-        const auto original = noxshell::ui::TerminalView::defaultAppearance();
-        QSettings settings;
-        const auto key = QStringLiteral("terminal/autoEnglishInput");
-        const auto stored = settings.value(key);
-        const auto cleanup = qScopeGuard([&] {
-            if (stored.isValid()) settings.setValue(key, stored); else settings.remove(key);
-            noxshell::ui::TerminalView::setDefaultAppearance(original);
-        });
-        settings.setValue(key, true);
-        QTemporaryDir directory;
-        QVERIFY(directory.isValid());
-        const auto database = directory.filePath(QStringLiteral("settings.sqlite"));
-        MemoryCredentialStore credentials;
+        if (QApplication::platformName() == "cocoa") QSKIP("Native settings is tested separately");
+        using namespace noxshell;using namespace noxshell::ui;
+        const auto original=TerminalView::defaultAppearance();const auto stored=QSettings().value("terminal/autoEnglishInput");
+        const auto cleanup=qScopeGuard([&]{if(stored.isValid())QSettings().setValue("terminal/autoEnglishInput",stored);else QSettings().remove("terminal/autoEnglishInput");TerminalView::setDefaultAppearance(original);});
+        AppSettings::instance()->setValue("terminal/autoEnglishInput",true);
+        QTemporaryDir directory;MemoryCredentialStore credentials;
+        const auto database=directory.filePath("settings.sqlite");
         {
-            noxshell::ui::MainWindow window(database, nullptr, &credentials);
-            auto *button = window.findChild<QToolButton *>(QStringLiteral("terminalSettingsButton"));
-            QVERIFY(button);
-            bool found = false;
-            QTimer::singleShot(0, &window, [&] {
-                auto *dialog = window.findChild<noxshell::ui::TerminalSettingsDialog *>();
-                if (!dialog) return;
-                auto *check = dialog->findChild<QCheckBox *>(QStringLiteral("terminalAutoEnglishInputCheck"));
-                found = check != nullptr;
-                if (check) check->setChecked(false);
-                dialog->accept();
-            });
-            button->click();
-            QVERIFY(found);
-            QVERIFY(!settings.value(key).toBool());
-            QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
-            QTimer::singleShot(0, &window, [&] {
-                auto *dialog = window.findChild<noxshell::ui::TerminalSettingsDialog *>();
-                if (!dialog) return;
-                dialog->findChild<QCheckBox *>(QStringLiteral("terminalAutoEnglishInputCheck"))->setChecked(true);
-                dialog->reject();
-            });
-            button->click();
-            QVERIFY(!settings.value(key).toBool());
-            QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
+            MainWindow window(database,nullptr,&credentials);
+            auto *button=window.findChild<QToolButton*>("terminalSettingsButton");QVERIFY(button);button->click();
+            auto *page=window.findChild<SettingsPage*>();QVERIFY(page);
+            auto *workspace=window.findChild<TerminalWorkspace*>();auto *tabs=workspace->sessionTabs();
+            QCOMPARE(workspace->sessionCount(),0);QCOMPARE(tabs->count(),1);
+            auto *check=page->findChild<QCheckBox*>("setting_terminal_autoEnglishInput");QVERIFY(check);check->setChecked(false);
+            QVERIFY(!AppSettings::value("terminal/autoEnglishInput").toBool());QVERIFY(!TerminalView::defaultAppearance().autoEnglishInput);
+            button->click();QCOMPARE(tabs->count(),1);QCOMPARE(window.findChildren<SettingsPage*>().size(),1);
+            QCoreApplication::sendPostedEvents(nullptr,QEvent::DeferredDelete);QCOMPARE(window.findChildren<SettingsPage*>().size(),1);
+            tabs->tabCloseRequested(0);QCoreApplication::sendPostedEvents(nullptr,QEvent::DeferredDelete);QCOMPARE(tabs->count(),0);
+            button->click();QVERIFY(!window.findChild<SettingsPage*>()->findChild<QCheckBox*>("setting_terminal_autoEnglishInput")->isChecked());
         }
-        noxshell::ui::TerminalView::setDefaultAppearance(original);
-        noxshell::ui::MainWindow reopened(database, nullptr, &credentials);
-        QVERIFY(!noxshell::ui::TerminalView::defaultAppearance().autoEnglishInput);
+        MainWindow reopened(database,nullptr,&credentials);QVERIFY(!TerminalView::defaultAppearance().autoEnglishInput);
+    }
+
+    void settingsPagesAndIndependentAgentPanes()
+    {
+        using namespace noxshell;using namespace noxshell::ui;
+        SettingsGuard guard;
+        AppSettings::instance()->setValue("general/openTerminal",false);
+        AppSettings::instance()->setValue("ui/themeMode","light");
+        QTemporaryDir dir;MemoryCredentialStore credentials;MainWindow window(dir.filePath("pages.sqlite"),nullptr,&credentials);
+        window.resize(1320,880);window.show();QTest::qWait(80);
+        auto *workspace=window.findChild<TerminalWorkspace*>();QVERIFY(workspace);
+        ServerProfile profile;profile.id="settings-demo";profile.name="Agent demo";profile.host="demo.local";profile.user="demo";profile.connectionMode=ConnectionMode::Demo;
+        workspace->openOrActivate(profile,true);QTRY_VERIFY(workspace->hasConnectedSession(profile.id));
+        workspace->splitActivePane(Qt::Horizontal);QCOMPARE(workspace->activePaneCount(),2);
+        auto modes=workspace->findChildren<QTabBar*>("terminalModeTabs");QCOMPARE(modes.size(),2);
+        auto files=workspace->findChildren<FilePanel*>();QCOMPARE(files.size(),2);QVERIFY(files[0]!=files[1]);
+        for(auto *session:workspace->findChildren<SshSession*>())if(!session->isConnected())session->connectTo(profile);
+        for(auto *session:workspace->findChildren<SshSession*>())QTRY_VERIFY(session->isConnected());
+        for(auto *mode:modes)mode->setCurrentIndex(1);
+        auto agents=workspace->findChildren<AgentPanel*>();QCOMPARE(agents.size(),2);
+        QVERIFY(agents[0]->localProcess()!=agents[1]->localProcess());
+        agents[0]->findChild<QPushButton*>("agentStart")->click();
+        QVERIFY(agents[0]->findChild<QLabel*>("agentStatus")->text().contains("真实 SSH"));QVERIFY(!agents[0]->localProcess()->isRunning());
+        for(auto *mode:modes)mode->setCurrentIndex(0);QVERIFY(workspace->hasConnectedSession(profile.id));
+#ifdef Q_OS_MACOS
+        if(QApplication::platformName()=="cocoa")QVERIFY(nativeProbeTitlebarClick(&window,"settingsButton"));else
+#endif
+        window.findChild<QToolButton*>("terminalSettingsButton")->click();
+        auto *page=window.findChild<SettingsPage*>();QVERIFY(page);QCOMPARE(workspace->sessionCount(),1);
+        auto *nav=page->findChild<QListWidget*>("settingsNavigation");auto *pages=page->findChild<QStackedWidget*>("settingsPages");
+        QCOMPARE(nav->count(),9);QCOMPARE(pages->count(),9);
+        const auto capture=qEnvironmentVariable("NOXSHELL_SETTINGS_SCREENSHOT_DIR");if(!capture.isEmpty())QVERIFY(QDir().mkpath(capture));
+        for(int theme=0;theme<2;++theme){
+            auto *combo=page->findChild<QComboBox*>("setting_ui_themeMode");combo->setCurrentIndex(combo->findData(theme?"dark":"light"));
+            for(int i=0;i<nav->count();++i){nav->setCurrentRow(i);QTest::qWait(15);QCOMPARE(pages->currentIndex(),i);
+                QVERIFY(pages->currentWidget()->isVisible());
+                if(!capture.isEmpty()){
+                    const auto path=QDir(capture).filePath(QString("settings-%1-%2.png").arg(theme?"dark":"light").arg(i));
+#ifdef Q_OS_MACOS
+                    if(QApplication::platformName()=="cocoa")QVERIFY(nativeProbeCaptureWindow(&window,path));else
+#endif
+                    QVERIFY(window.grab().save(path));
+                }
+            }
+        }
+        page->findChild<QSpinBox*>("setting_terminal_scrollback")->setValue(37);
+        QCOMPARE(AppSettings::value("terminal/scrollback").toInt(),37);
+        auto *api=page->findChild<QLineEdit*>("aiApiKey");api->setText("synthetic-api-key");
+        page->findChild<QLineEdit*>("aiEndpoint")->setText("https://service.example/v1");page->findChild<QLineEdit*>("aiModel")->setText("test-model");
+        page->findChild<QPushButton*>("saveAiSettings")->click();QCOMPARE(credentials.secrets.value("noxshell.ai.api").password,QString("synthetic-api-key"));QVERIFY(api->text().isEmpty());
+        QVERIFY(!QSettings().allKeys().contains("ai/apiKey"));
+        page->findChild<QLineEdit*>("aiEndpoint")->setText("https://user:secret@service.example/v1");page->findChild<QPushButton*>("saveAiSettings")->click();
+        QCOMPARE(AppSettings::value("ai/baseUrl").toString(),QString("https://service.example/v1"));
+        auto *proxy=page->findChild<QComboBox*>("proxyMode");proxy->setCurrentIndex(proxy->findData("manual"));
+        page->findChild<QLineEdit*>("proxyPassword")->setText("synthetic-proxy-key");page->findChild<QPushButton*>("saveProxySettings")->click();
+        QCOMPARE(credentials.secrets.value("noxshell.proxy").password,QString("synthetic-proxy-key"));
+        page->findChild<QPushButton*>("deleteProxyPassword")->click();QVERIFY(!credentials.secrets.contains("noxshell.proxy"));QVERIFY(AppSettings::value("proxy/credentialRef").toString().isEmpty());
+        workspace->sessionTabs()->setCurrentIndex(0);QCOMPARE(workspace->activePaneCount(),2);QVERIFY(workspace->hasConnectedSession(profile.id));
+        QCOMPARE(workspace->findChildren<FilePanel*>(),files);
+    }
+
+    void settingsValidationAndStartupRestore()
+    {
+        using namespace noxshell;using namespace noxshell::ui;SettingsGuard guard;
+        AppSettings::instance()->setValue("terminal/scrollback",91);AppSettings::instance()->setValue("terminal/scrollback",-1);QCOMPARE(AppSettings::value("terminal/scrollback").toInt(),91);
+        AppSettings::instance()->setValue("terminal/shell","bash; unwanted");QCOMPARE(AppSettings::value("terminal/shell").toString(),QString("default"));
+        auto rules=AppSettings::highlightRules();rules.append({"custom-test","Test","\\bHELLO\\b",QColor("#123456"),true,true});AppSettings::saveHighlightRules(rules);
+        QCOMPARE(AppSettings::highlightRules().last().pattern,QString("\\bHELLO\\b"));
+        rules.last().pattern="[";AppSettings::saveHighlightRules(rules);QCOMPARE(AppSettings::highlightRules().last().pattern,QString("\\bHELLO\\b"));
+        QTemporaryDir dir;ServerRepository repo(dir.filePath("restore.sqlite"),true);QVERIFY(repo.initialize());auto servers=repo.loadServers();QVERIFY(servers.size()>2);
+        QVERIFY(repo.saveTerminalState({servers[0].id,servers[2].id},1));MemoryCredentialStore credentials;
+        AppSettings::instance()->setValue("general/openTerminal",true);
+        {TerminalWorkspace workspace(&repo,&credentials);QCOMPARE(workspace.sessionCount(),2);QCOMPARE(workspace.sessionTabs()->currentIndex(),1);QCOMPARE(credentials.loadCalls,0);
+            for(auto *session:workspace.findChildren<SshSession*>()){QVERIFY(!session->isConnected());QVERIFY(!session->isConnecting());}
+            workspace.showSettings(new SettingsPage(&credentials));QCOMPARE(workspace.sessionCount(),2);QCOMPARE(repo.loadTerminalState().serverIds.size(),2);
+        }
+        AppSettings::instance()->setValue("general/openTerminal",false);TerminalWorkspace empty(&repo,&credentials);QCOMPARE(empty.sessionCount(),0);
+    }
+
+    void agentAiRequestsAreExplicitAndPaneScoped()
+    {
+        using namespace noxshell;using namespace noxshell::ui;SettingsGuard guard;
+        QTcpServer server;QVERIFY(server.listen(QHostAddress::LocalHost));
+        AppSettings::instance()->setValue("ai/enabled",true);AppSettings::instance()->setValue("ai/model","fixture-model");
+        AppSettings::instance()->setValue("ai/baseUrl",QString("http://127.0.0.1:%1/v1").arg(server.serverPort()));AppSettings::instance()->setValue("ai/credentialRef","test-ai");
+        AppSettings::instance()->setValue("proxy/mode","direct");MemoryCredentialStore credentials;credentials.secrets.insert("test-ai",{"synthetic-token",{}});
+        SshSession shell(nullptr,&credentials);AgentPanel first(&shell,nullptr,&credentials),second(&shell,nullptr,&credentials);
+        auto *select=first.findChild<QComboBox*>("agentSelector");select->setCurrentIndex(select->findData("ai"));
+        QTest::qWait(20);QVERIFY(!server.hasPendingConnections());
+        auto *input=first.findChild<QLineEdit*>("agentAiQuestion");auto *send=first.findChild<QPushButton*>("agentAiSend");
+        input->setText("manual question");send->click();QTRY_VERIFY_WITH_TIMEOUT(server.hasPendingConnections(),2000);
+        auto *socket=server.nextPendingConnection();QByteArray request;
+        QTRY_VERIFY_WITH_TIMEOUT((request+=socket->readAll()).contains("manual question"),2000);
+        QVERIFY(request.startsWith("POST /v1/chat/completions HTTP/1.1"));QVERIFY(request.contains("Authorization: Bearer synthetic-token"));QVERIFY(request.contains("fixture-model"));
+        const auto json=QByteArrayLiteral("{\"choices\":[{\"message\":{\"content\":\"fixture answer\"}}]}");
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+QByteArray::number(json.size())+"\r\nConnection: close\r\n\r\n"+json);socket->disconnectFromHost();
+        auto *chat=first.findChild<QTextBrowser*>("agentAiConversation");QTRY_VERIFY(chat->toPlainText().contains("fixture answer"));
+        QVERIFY(second.findChild<QTextBrowser*>("agentAiConversation")->toPlainText().isEmpty());QVERIFY(send->isEnabled());
+        input->setText("cancel question");send->click();QTRY_VERIFY_WITH_TIMEOUT(server.hasPendingConnections(),2000);auto *pending=server.nextPendingConnection();
+        first.findChild<QPushButton*>("agentStop")->click();QTRY_VERIFY(send->isEnabled());QVERIFY(first.findChild<QLabel*>("agentStatus")->text().contains("停止"));pending->close();
+    }
+
+    void localAgentDiscoveryFindsBundledCodexWithoutShellPath_data()
+    {
+        QTest::addColumn<QString>("application");
+        QTest::addColumn<QString>("entry");
+        for (const auto &application : {QString("ChatGPT.app"), QString("Codex.app")}) {
+            QTest::newRow(qPrintable(application+"-binary")) << application
+                << QString("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+            QTest::newRow(qPrintable(application+"-launcher")) << application
+                << QString("Contents/Resources/codex-cli/bin/codex");
+        }
+    }
+
+    void localAgentDiscoveryFindsBundledCodexWithoutShellPath()
+    {
+#ifndef Q_OS_MACOS
+        QSKIP("Desktop bundle fallback is macOS-only");
+#else
+        using namespace noxshell;
+        QFETCH(QString, application); QFETCH(QString, entry);
+        QTemporaryDir directory; QVERIFY(directory.isValid());
+        const auto root = directory.filePath("Applications with spaces");
+        const auto executable = QDir(root).filePath(application+"/"+entry);
+        QVERIFY(QDir().mkpath(QFileInfo(executable).absolutePath()));
+        // Discovery must not execute even a version/login check. Only the
+        // explicit start below may create this synthetic marker.
+        QVERIFY(writeTextFile(executable, "#!/bin/sh\nprintf 'bundled-fixture:%s\\n' \"$1\"\n: > started\n"));
+        const QStringList paths{directory.filePath("empty-bin")};
+        const QStringList roots{directory.filePath("missing-apps"), root};
+        QVERIFY(LocalAgentProcess::findCli("codex", paths, roots).isEmpty());
+        QVERIFY(QFile::setPermissions(executable, QFile::ReadOwner|QFile::WriteOwner|QFile::ExeOwner));
+        QCOMPARE(LocalAgentProcess::findCli("codex", paths, roots), executable);
+        QVERIFY(LocalAgentProcess::findCli("claude", paths, roots).isEmpty());
+        QVERIFY(LocalAgentProcess::findCli("../codex", paths, roots).isEmpty());
+        QVERIFY(LocalAgentProcess::findCli("arbitrary-tool", paths, roots).isEmpty());
+        QVERIFY(LocalAgentProcess::findCli("codex", paths, {"relative-root"}).isEmpty());
+        QVERIFY(!QFileInfo::exists(directory.filePath("started")));
+
+        // A separately installed CLI retains priority over app fallbacks.
+        QVERIFY(QDir().mkpath(paths.first()));
+        const auto installed = QDir(paths.first()).filePath("codex");
+        QVERIFY(writeTextFile(installed, "#!/bin/sh\nexit 0\n"));
+        QVERIFY(QFile::setPermissions(installed, QFile::ReadOwner|QFile::WriteOwner|QFile::ExeOwner));
+        QCOMPARE(LocalAgentProcess::findCli("codex", paths, roots), installed);
+
+        LocalAgentProcess process;
+        QSignalSpy output(&process, &LocalAgentProcess::outputReceived), finished(&process, &LocalAgentProcess::finished);
+        QVERIFY(process.start(executable, {"one argument with spaces"}, directory.path()));
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 2000);
+        QCOMPARE(finished.first().first().toInt(), 0);
+        QByteArray captured;
+        for (const auto &row : output) captured += row.first().toByteArray();
+        QVERIFY(captured.contains("bundled-fixture:one argument with spaces"));
+        QVERIFY(QFileInfo::exists(directory.filePath("started")));
+
+        QVERIFY(QFile::remove(executable));
+        QVERIFY(QDir().mkpath(executable));
+        QVERIFY(LocalAgentProcess::findCli("codex", {directory.filePath("absent-bin")}, roots).isEmpty());
+#endif
+    }
+
+    void localAgentDiscoveryWorksWithFinderPathWithoutStartingTheAgent()
+    {
+#ifndef Q_OS_MACOS
+        QSKIP("Finder discovery is macOS-only");
+#else
+        using namespace noxshell; using namespace noxshell::ui;
+        bool hasBundle = false;
+        for (const auto &root : {QDir::homePath()+"/Applications", QString("/Applications")})
+            for (const auto &app : {QString("ChatGPT.app"), QString("Codex.app")})
+                for (const auto &entry : {QString("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+                                         QString("Contents/Resources/codex-cli/bin/codex")}) {
+                    const QFileInfo file(QDir(root).filePath(app+"/"+entry));
+                    hasBundle |= file.isFile() && file.isExecutable();
+                }
+        if (!hasBundle) QSKIP("No installed desktop bundle; synthetic bundle coverage is independent");
+        const auto previousPath = qgetenv("PATH");
+        const auto restore = qScopeGuard([&] { qputenv("PATH", previousPath); });
+        qputenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        const auto executable = LocalAgentProcess::findCli("codex");
+        QVERIFY(!executable.isEmpty());
+        QVERIFY(QFileInfo(executable).isFile()); QVERIFY(QFileInfo(executable).isExecutable());
+        SettingsGuard settings; MemoryCredentialStore credentials; SshSession shell(nullptr, &credentials);
+        AgentPanel panel(&shell, nullptr, &credentials);
+        auto *selector = panel.findChild<QComboBox *>("agentSelector");
+        selector->setCurrentIndex(selector->findData("codex"));
+        panel.findChild<QPushButton *>("agentDetect")->click();
+        QVERIFY(panel.findChild<QLabel *>("agentStatus")->text().contains(executable));
+        QVERIFY(!panel.localProcess()->isRunning()); QVERIFY(!panel.taskRunning());
+        QVERIFY(panel.workspaceDirectory().isEmpty()); QCOMPARE(credentials.loadCalls, 0);
+#endif
+    }
+
+    void agentChineseGuideIsCompactAndNeverApprovesTools_data()
+    {
+        QTest::addColumn<bool>("dark"); QTest::addColumn<int>("width");
+        for (const auto dark : {false, true})
+            for (const int width : {1440, 680, 440})
+                QTest::newRow(qPrintable(QString("%1-%2").arg(dark?"dark":"light").arg(width))) << dark << width;
+    }
+
+    void agentChineseGuideIsCompactAndNeverApprovesTools()
+    {
+        using namespace noxshell; using namespace noxshell::ui;
+        QFETCH(bool, dark); QFETCH(int, width); SettingsGuard settings;
+        const auto previous = isApplicationDarkTheme()?ThemeMode::Dark:ThemeMode::Light;
+        const auto restore = qScopeGuard([&] { applyApplicationTheme(previous); });
+        applyApplicationTheme(dark?ThemeMode::Dark:ThemeMode::Light);
+        MemoryCredentialStore credentials; SshSession shell(nullptr, &credentials);
+        AgentPanel panel(&shell, nullptr, &credentials);
+        auto *selector = panel.findChild<QComboBox *>("agentSelector");
+        selector->setCurrentIndex(selector->findData("codex"));
+        auto *terminal = panel.findChild<TerminalView *>("agentTerminal");
+        auto *toolbar = panel.findChild<QWidget *>("agentToolbar");
+        auto *help = panel.findChild<QPushButton *>("agentChineseHelp");
+        auto *guide = panel.findChild<QTextBrowser *>("agentChineseGuide");
+        auto *hint = panel.findChild<QLabel *>("agentLanguageHint");
+        QVERIFY(terminal && toolbar && help && guide && hint);
+        QSignalSpy input(terminal, &TerminalView::inputGenerated), commands(&shell, &SshSession::serverToolRequested);
+        panel.resize(width, 720); panel.show(); QCoreApplication::processEvents();
+        QCOMPARE(panel.width(), width);
+        QVERIFY(guide->isHidden()); QVERIFY(help->isVisible()); QVERIFY(hint->isVisible());
+        QVERIFY(selector->width() <= 144); QVERIFY(toolbar->height() <= (width>=600?32:60));
+        QVERIFY(!terminal->customHighlightsEnabled());
+        TerminalView ordinaryShell; QVERIFY(ordinaryShell.customHighlightsEnabled());
+        AppSettings::instance()->setValue("terminal/copyOnSelect", !AppSettings::value("terminal/copyOnSelect").toBool());
+        QVERIFY(!terminal->customHighlightsEnabled()); QVERIFY(ordinaryShell.customHighlightsEnabled());
+        for (const auto name : {"agentStart", "agentResume", "agentStop", "agentDetect", "agentChineseHelp"}) {
+            const auto *button = panel.findChild<QPushButton *>(name);
+            QVERIFY(button->isVisible()); QVERIFY(panel.rect().contains(QRect(button->mapTo(&panel, QPoint{}), button->size())));
+        }
+        // Render synthetic CLI text verbatim: the guide must never replace
+        // strings inside commands, logs or permission prompts.
+        const auto transcript = QString::fromUtf8(
+            ">_ OpenAI Codex\r\n\r\n"
+            "› 检查服务器更新，需要修改前先告诉我风险\r\n\r\n"
+            "• 我会先检查系统类型和包管理器，再说明建议步骤。\r\n\r\n"
+            "Allow the noxshell MCP server to run tool \"ssh_execute\"?\r\n\r\n"
+            "1. Allow\r\n2. Allow for this session\r\n3. Always allow\r\n4. Cancel\r\n"
+            "\r\ncommand: printf '%s' 'Always allow'\r\n");
+        terminal->feedText(transcript); const auto unchanged = terminal->plainText();
+        QVERIFY(unchanged.contains("printf '%s' 'Always allow'"));
+        help->click(); QCoreApplication::processEvents();
+        QVERIFY(guide->isVisible()); QVERIFY(guide->height() <= 186);
+        QVERIFY(guide->toPlainText().contains("仅允许本次"));
+        QVERIFY(guide->toPlainText().contains("后续可能不再询问"));
+        QVERIFY(guide->toPlainText().contains("中文确认"));
+        QCOMPARE(terminal->plainText(), unchanged); QCOMPARE(input.count(), 0); QCOMPARE(commands.count(), 0);
+        const auto captures = qEnvironmentVariable("NOXSHELL_AGENT_CHINESE_SCREENSHOT_DIR");
+        if (!captures.isEmpty() && width == 1440) {
+            QVERIFY(QDir().mkpath(captures));
+            QVERIFY(panel.grab().save(QDir(captures).filePath(dark?"agent-chinese-dark.png":"agent-chinese-light.png")));
+        }
+        help->click(); QVERIFY(guide->isHidden());
+        selector->setCurrentIndex(selector->findData("ai"));
+        QVERIFY(help->isHidden()); QVERIFY(hint->isHidden()); QVERIFY(guide->isHidden());
+        QVERIFY(panel.findChild<QPushButton *>("agentDetect")->isHidden());
+        QVERIFY(!panel.localProcess()->isRunning()); QVERIFY(panel.workspaceDirectory().isEmpty());
+        QCOMPARE(input.count(), 0); QCOMPARE(commands.count(), 0); QCOMPARE(credentials.loadCalls, 0);
+    }
+
+    void localAgentPtyAndMcpBridgeStayInTheCurrentPane()
+    {
+        using namespace noxshell;
+        QTemporaryDir directory;QVERIFY(directory.isValid());
+        LocalAgentProcess process;QSignalSpy output(&process,&LocalAgentProcess::outputReceived);QSignalSpy finished(&process,&LocalAgentProcess::finished);
+#ifndef Q_OS_WIN
+        QVERIFY(process.start("/bin/sh",{"-c","printf 'local-agent-ready\\n'; IFS= read -r value; printf 'received:%s\\n' \"$value\"; exit 7"},directory.path()));
+        process.resize(91,31);QTRY_VERIFY_WITH_TIMEOUT([&]{for(const auto &row:output)if(row.first().toByteArray().contains("local-agent-ready"))return true;return false;}(),1500);
+        process.write("pane-input\n");QTRY_COMPARE_WITH_TIMEOUT(finished.size(),1,2000);QCOMPARE(finished.first().first().toInt(),7);
+        QByteArray captured;for(const auto &row:output)captured+=row.first().toByteArray();QVERIFY(captured.contains("received:pane-input"));
+#else
+        QSKIP("PTY bridge test currently uses the POSIX test fixture");
+#endif
+        const auto socketPath=directory.filePath("bridge.sock"),configPath=directory.filePath("bridge.json");
+        QLocalServer server;server.setSocketOptions(QLocalServer::UserAccessOption);QVERIFY(server.listen(socketPath));
+        const QByteArray token=QByteArray(64,'a');QVERIFY(writeTextFile(configPath,QString::fromUtf8(QJsonDocument(QJsonObject{{"socket",socketPath},{"token",QString::fromLatin1(token)}}).toJson())));
+        QProcess helper;helper.start(QCoreApplication::applicationFilePath(),{"--agent-mcp",configPath});QVERIFY(helper.waitForStarted(2000));
+        helper.write("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}\n");
+        helper.write("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n");
+        helper.write("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ssh_execute\",\"arguments\":{\"command\":\"uname -a\"}}}\n");
+        QTRY_VERIFY_WITH_TIMEOUT(server.hasPendingConnections(),2000);auto *client=server.nextPendingConnection();QVERIFY(client);
+        QTRY_VERIFY_WITH_TIMEOUT(client->canReadLine(),2000);const auto bridgeRequest=QJsonDocument::fromJson(client->readLine()).object();
+        QCOMPARE(bridgeRequest.value("token").toString(),QString::fromLatin1(token));QCOMPARE(bridgeRequest.value("command").toString(),QString("uname -a"));
+        client->write(QJsonDocument(QJsonObject{{"text","exitCode: 0\\nLinux fixture"}}).toJson(QJsonDocument::Compact)+"\n");client->flush();
+        QTRY_VERIFY_WITH_TIMEOUT(helper.canReadLine(),2000);
+        auto initialize=QJsonDocument::fromJson(helper.readLine()).object();QCOMPARE(initialize.value("result").toObject().value("serverInfo").toObject().value("name").toString(),QString("noxshell-agent"));
+        QTRY_VERIFY_WITH_TIMEOUT(helper.canReadLine(),2000);const auto listed=QJsonDocument::fromJson(helper.readLine()).object();QCOMPARE(listed.value("result").toObject().value("tools").toArray().first().toObject().value("name").toString(),QString("ssh_execute"));
+        QTRY_VERIFY_WITH_TIMEOUT(helper.canReadLine(),2000);const auto called=QJsonDocument::fromJson(helper.readLine()).object();QCOMPARE(called.value("result").toObject().value("isError").toBool(),false);QVERIFY(called.value("result").toObject().value("content").toArray().first().toObject().value("text").toString().contains("Linux fixture"));
+        helper.closeWriteChannel();QTRY_COMPARE_WITH_TIMEOUT(helper.state(),QProcess::NotRunning,2500);QCOMPARE(helper.exitCode(),0);
+    }
+
+    void localAgentLaunchUsesLocalCliAndConfirmsRemoteCommands()
+    {
+#ifdef Q_OS_WIN
+        QSKIP("Uses a synthetic POSIX CLI, never a real coding agent");
+#else
+        using namespace noxshell;using namespace noxshell::ui;SettingsGuard guard;
+        QTemporaryDir directory;QVERIFY(directory.isValid());
+        const auto cli=directory.filePath("codex");QVERIFY(writeTextFile(cli,"#!/bin/sh\nprintf 'LOCAL_FIXTURE:%s\\n' \"$PWD\"\nprintf 'ARG:%s\\n' \"$@\"\nwhile IFS= read -r line; do printf 'INPUT:%s\\n' \"$line\"; done\n"));
+        QVERIFY(QFile::setPermissions(cli,QFile::ReadOwner|QFile::WriteOwner|QFile::ExeOwner));
+        const auto previousPath=qgetenv("PATH");qputenv("PATH",directory.path().toUtf8()+":"+previousPath);
+        const auto restoreEnv=qScopeGuard([&]{qputenv("PATH",previousPath);});
+        const bool wasTest=QStandardPaths::isTestModeEnabled();QStandardPaths::setTestModeEnabled(true);
+        const auto restorePaths=qScopeGuard([&]{QStandardPaths::setTestModeEnabled(wasTest);});
+        MemoryCredentialStore credentials;SshSession shell(nullptr,&credentials);
+        QObject::disconnect(&shell,&SshSession::connectRequested,nullptr,nullptr);
+        QObject::disconnect(&shell,&SshSession::serverToolRequested,nullptr,nullptr);
+        QSignalSpy connects(&shell,&SshSession::connectRequested),commands(&shell,&SshSession::serverToolRequested),rawInput(&shell,&SshSession::inputRequested);
+        ServerProfile profile;profile.id="local-agent-synthetic-test";profile.name="Test";profile.user="fixture";profile.host="192.0.2.19";profile.password="synthetic-ssh-secret";profile.connectionMode=ConnectionMode::Ssh;
+        shell.connectTo(profile);QCOMPARE(connects.size(),1);
+        QVERIFY(QMetaObject::invokeMethod(&shell,"handleConnectionChanged",Qt::DirectConnection,Q_ARG(bool,true),Q_ARG(QString,QString("synthetic connected")),Q_ARG(quint64,connects.first().at(1).toULongLong())));
+        AgentPanel panel(&shell,nullptr,&credentials);auto *selector=panel.findChild<QComboBox*>("agentSelector");selector->setCurrentIndex(selector->findData("codex"));panel.resize(1000,500);panel.show();
+        panel.findChild<QPushButton*>("agentStart")->click();QVERIFY(panel.localProcess()->isRunning());QVERIFY(panel.taskRunning());
+        const auto workspace=panel.workspaceDirectory();const auto cleanup=qScopeGuard([&]{panel.findChild<QPushButton*>("agentStop")->click();QDir(workspace).removeRecursively();});
+        QFile instructions(workspace+"/AGENTS.md");QVERIFY(instructions.open(QIODevice::ReadOnly));
+        const auto guidance=QString::fromUtf8(instructions.readAll());instructions.close();
+        QVERIFY(guidance.contains("默认使用简体中文"));QVERIFY(guidance.contains("不要重复大段工具输出"));
+        QVERIFY(guidance.contains("原始报错保留原文"));QVERIFY(guidance.contains("`ssh_execute`"));
+        QVERIFY(guidance.contains("逐条确认"));QVERIFY(guidance.contains("不得代替用户授权"));
+        QVERIFY(!guidance.contains("synthetic-ssh-secret"));
+        auto *terminal=panel.findChild<TerminalView*>("agentTerminal");QTRY_VERIFY_WITH_TIMEOUT(terminal->plainText().contains("--agent-mcp"),2000);
+        QVERIFY(!terminal->plainText().contains("synthetic-ssh-secret"));QCOMPARE(rawInput.size(),0);QCOMPARE(connects.size(),1);QCOMPARE(credentials.loadCalls,0);
+        QFile bridgeFile(workspace+"/.noxshell-bridge.json");QVERIFY(bridgeFile.open(QIODevice::ReadOnly));const auto bytes=bridgeFile.readAll();bridgeFile.close();QVERIFY(!bytes.contains("synthetic-ssh-secret"));
+        const auto bridge=QJsonDocument::fromJson(bytes).object();const auto socketPath=bridge.value("socket").toString();
+        QLocalSocket rejected;rejected.connectToServer(socketPath);QVERIFY(rejected.waitForConnected(1000));
+        rejected.write("{\"token\":\"wrong\",\"command\":\"echo forbidden\"}\n");rejected.flush();QTRY_VERIFY_WITH_TIMEOUT(rejected.canReadLine(),1000);QVERIFY(rejected.readLine().contains("error"));QCOMPARE(commands.size(),0);
+        QTimer responder;bool sawComplete=false;const auto longCommand=QString("printf '%1'\n").arg(QString(5000,'x'));
+        connect(&responder,&QTimer::timeout,&panel,[&]{auto *dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget());if(!dialog)return;if(auto *preview=dialog->findChild<QPlainTextEdit*>("agentCommandPreview")){sawComplete=preview->toPlainText()==longCommand;dialog->reject();}});responder.start(5);
+        QLocalSocket canceled;canceled.connectToServer(socketPath);QVERIFY(canceled.waitForConnected(1000));
+        canceled.write(QJsonDocument(QJsonObject{{"token",bridge.value("token")},{"command",longCommand}}).toJson(QJsonDocument::Compact)+"\n");canceled.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(canceled.canReadLine(),1500);QVERIFY(sawComplete);QVERIFY(canceled.readLine().contains("error"));QCOMPARE(commands.size(),0);responder.stop();
+        responder.disconnect(&panel);connect(&responder,&QTimer::timeout,&panel,[&]{if(auto *dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget()))if(dialog->findChild<QPlainTextEdit*>("agentCommandPreview"))dialog->accept();});responder.start(5);
+        bool wrapperWorked=false;
+        const auto commandHandler=connect(&shell,&SshSession::serverToolRequested,&panel,[&](quint64 request,const QByteArray &wire){
+            QProcess helper;helper.start("/bin/sh",{"-c",QString::fromUtf8(wire)});if(!helper.waitForStarted(1000))return;
+            helper.waitForFinished(3000);const auto output=helper.readAllStandardOutput();const auto parsed=QJsonDocument::fromJson(output).object();
+            wrapperWorked=QByteArray::fromBase64(parsed.value("stdout").toString().toLatin1())=="approved-local-fixture";
+            QTimer::singleShot(10,&shell,[&,request,output]{QVERIFY(QMetaObject::invokeMethod(&shell,"handleServerToolFinished",Qt::DirectConnection,Q_ARG(quint64,request),Q_ARG(QByteArray,output),Q_ARG(QString,QString{})));});
+        });
+        QLocalSocket approved;approved.connectToServer(socketPath);QVERIFY(approved.waitForConnected(1000));approved.write(QJsonDocument(QJsonObject{{"token",bridge.value("token")},{"command","printf approved-local-fixture"}}).toJson(QJsonDocument::Compact)+"\n");approved.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(approved.canReadLine(),5000);QVERIFY(wrapperWorked);QVERIFY(approved.readLine().contains("approved-local-fixture"));QCOMPARE(commands.size(),1);
+        QObject::disconnect(commandHandler);
+        connect(&shell,&SshSession::serverToolRequested,&panel,[&](quint64 request,const QByteArray &){
+            QTimer::singleShot(10,&shell,[&,request]{QVERIFY(QMetaObject::invokeMethod(&shell,"handleServerToolFinished",Qt::DirectConnection,Q_ARG(quint64,request),Q_ARG(QByteArray,QByteArray("python3: command not found")),Q_ARG(QString,QString{})));});
+        });
+        QLocalSocket malformed;malformed.connectToServer(socketPath);QVERIFY(malformed.waitForConnected(1000));malformed.write(QJsonDocument(QJsonObject{{"token",bridge.value("token")},{"command","printf invalid-response-fixture"}}).toJson(QJsonDocument::Compact)+"\n");malformed.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(malformed.canReadLine(),2000);QVERIFY(QJsonDocument::fromJson(malformed.readLine()).object().contains("error"));QCOMPARE(commands.size(),2);responder.stop();
+        responder.disconnect(&panel);connect(&responder,&QTimer::timeout,&panel,[&]{if(auto *dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget()))if(dialog->findChild<QPlainTextEdit*>("agentCommandPreview")){panel.findChild<QPushButton*>("agentStop")->click();dialog->accept();}});responder.start(5);
+        QLocalSocket stopped;stopped.connectToServer(socketPath);QVERIFY(stopped.waitForConnected(1000));stopped.write(QJsonDocument(QJsonObject{{"token",bridge.value("token")},{"command","printf must-not-run-after-stop"}}).toJson(QJsonDocument::Compact)+"\n");stopped.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.localProcess()->isRunning(),2000);responder.stop();QCOMPARE(commands.size(),2);
+        QVERIFY(!QFile::exists(workspace+"/.noxshell-bridge.json"));QVERIFY(shell.isConnected());QCOMPARE(connects.size(),1);QCOMPARE(rawInput.size(),0);
+#endif
+    }
+
+    void sshProxyTunnelHandshakes()
+    {
+        using namespace noxshell;
+        for(int kind=0;kind<5;++kind){
+            std::promise<quint16> portPromise;auto future=portPromise.get_future();
+            auto server=std::async(std::launch::async,[&portPromise,kind]{
+                QTcpServer listener;if(!listener.listen(QHostAddress::LocalHost)){portPromise.set_value(0);return false;}portPromise.set_value(listener.serverPort());
+                if(!listener.waitForNewConnection(3000))return false;std::unique_ptr<QTcpSocket> socket(listener.nextPendingConnection());
+                auto read=[&](int length){QByteArray b;while(b.size()<length){if(!socket->bytesAvailable()&&!socket->waitForReadyRead(2000))break;b+=socket->read(length-b.size());}return b;};
+                auto send=[&](const QByteArray &b){socket->write(b);return socket->waitForBytesWritten(1000);};
+                if(kind<2){QByteArray b;while(!b.endsWith("\r\n\r\n")&&b.size()<16384){auto next=read(1);if(next.isEmpty())return false;b+=next;}
+                    if(!b.startsWith("CONNECT target.example:22 HTTP/1.1")||!b.contains("Proxy-Authorization: Basic dXNlcjpwYXNz"))return false;
+                    send(kind==0?"HTTP/1.1 200 Connection established\r\n\r\nSSH-2.0-fixture\r\n":"HTTP/1.1 407 Denied\r\n\r\n");
+                }else{
+                    if(read(4)!=QByteArray::fromHex("05020002"))return false;if(!send(QByteArray::fromHex("0502")))return false;
+                    if(read(11)!=QByteArray::fromHex("0104757365720470617373"))return false;if(!send(QByteArray::fromHex("0100")))return false;
+                    const auto prefix=read(4);if(prefix.size()!=4)return false;
+                    if(kind==4){if(prefix!=QByteArray::fromHex("05010004")||read(18)!=QByteArray::fromHex("000000000000000000000000000000010016"))return false;}
+                    else{if(prefix!=QByteArray::fromHex("05010003"))return false;const auto n=read(1);if(n.isEmpty()||read(quint8(n[0])+2)!=QByteArray("target.example\0\x16",16))return false;}
+                    send(kind==3?QByteArray::fromHex("05050001000000000000"):QByteArray::fromHex("05000001000000000000")+"SSH-2.0-fixture\r\n");
+                }
+                socket->disconnectFromHost();return true;
+            });
+            const auto port=future.get();QVERIFY(port);QTcpSocket client;client.setProxy(QNetworkProxy::NoProxy);client.connectToHost(QHostAddress::LocalHost,port);QVERIFY(client.waitForConnected(2000));
+            QString error;QNetworkProxy proxy(kind<2?QNetworkProxy::HttpProxy:QNetworkProxy::Socks5Proxy,"127.0.0.1",port,"user","pass");
+            const bool ok=negotiateProxyTunnel(client.socketDescriptor(),proxy,kind==4?"::1":"target.example",22,3000,[]{return false;},error);
+            QCOMPARE(ok,kind!=1&&kind!=3);QVERIFY(server.get());
+            if(ok){if(!client.bytesAvailable())client.waitForReadyRead(1000);QVERIFY(client.readAll().startsWith("SSH-2.0-fixture"));QVERIFY(error.isEmpty());}else QVERIFY(!error.isEmpty());
+        }
     }
 
     void terminalInputSourcePolicyRespectsManualChoiceAndFailures()
@@ -2196,6 +3620,10 @@ private slots:
 
     void terminalTabContextMenuDuplicatesAndClosesSessions()
     {
+        SettingsGuard settingsGuard;
+        noxshell::AppSettings::instance()->setValue("tabs/showUser", false);
+        noxshell::AppSettings::instance()->setValue("tabs/showHost", false);
+        noxshell::AppSettings::instance()->setValue("tabs/maxTitleLength", 10);
         noxshell::ui::TerminalWorkspace workspace(nullptr, nullptr);
         workspace.resize(900, 500);
 
@@ -2567,7 +3995,7 @@ private slots:
         QVERIFY(history.isEmpty());
     }
 
-    void metricCardUsesThinTrackAndShowsCpuPopoverOnHover()
+    void metricCardEmbedsReadingsAndShowsCpuPopoverOnHover()
     {
         noxshell::ui::MetricCard card(QStringLiteral("CPU"), QColor(QStringLiteral("#006EFF")));
         card.resize(220, 44);
@@ -2586,7 +4014,7 @@ private slots:
         auto *corePanel = card.findChild<QFrame *>(QStringLiteral("metricCorePanel"));
         QVERIFY(summaryProgress);
         QVERIFY(corePanel);
-        QCOMPARE(summaryProgress->height(), 4);
+        QCOMPARE(summaryProgress->height(), 24);
         QVERIFY(!summaryProgress->isTextVisible());
         auto *value = card.findChild<QLabel *>(QStringLiteral("metricValue"));
         auto *detail = card.findChild<QLabel *>(QStringLiteral("metricDetail"));
@@ -2596,14 +4024,17 @@ private slots:
         QVERIFY(title);
         QCOMPARE(value->text(), QStringLiteral("36.3%"));
         QCOMPARE(detail->text(), QStringLiteral("内核态 15.8%"));
-        QCOMPARE(title->geometry().center().y(), detail->geometry().center().y());
+        QCOMPARE(title->mapTo(&card, title->rect().center()).y(), detail->mapTo(&card, detail->rect().center()).y());
         QCOMPARE(value->geometry().center().y(), detail->geometry().center().y());
-        QVERIFY(title->geometry().right() < detail->geometry().left());
+        QVERIFY(title->geometry().right() < summaryProgress->geometry().left());
         QVERIFY(detail->geometry().right() < value->geometry().left());
         QVERIFY(detail->alignment() & Qt::AlignLeft);
-        QVERIFY(detail->geometry().bottom() < summaryProgress->geometry().top());
+        QCOMPARE(value->parentWidget(), summaryProgress);
+        QCOMPARE(detail->parentWidget(), summaryProgress);
+        QVERIFY(summaryProgress->rect().contains(value->geometry()));
+        QVERIFY(summaryProgress->rect().contains(detail->geometry()));
         QVERIFY(summaryProgress->format().contains(QStringLiteral("36.3%")));
-        QVERIFY(summaryProgress->styleSheet().contains(QStringLiteral("border-radius:2px")));
+        QVERIFY(summaryProgress->styleSheet().contains(QStringLiteral("border-radius:4px")));
         QEvent initialLeaveEvent(QEvent::Leave);
         QApplication::sendEvent(&card, &initialLeaveEvent);
         QApplication::sendEvent(corePanel, &initialLeaveEvent);
@@ -2940,6 +4371,47 @@ private slots:
         QVERIFY(fileSystems->height() >= 24 + fileSystems->topLevelItemCount() * 21);
     }
 
+    void networkRatesShareTheTimeAxis_data()
+    {
+        QTest::addColumn<bool>("dark");QTest::addColumn<int>("width");
+        for(bool dark:{false,true})for(int width:{220,252,300})
+            QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(dark?"dark":"light").arg(width)))<<dark<<width;
+    }
+
+    void networkRatesShareTheTimeAxis()
+    {
+        QFETCH(bool,dark);QFETCH(int,width);
+        using namespace noxshell;using namespace noxshell::ui;
+        SettingsGuard guard;applyApplicationTheme(dark?ThemeMode::Dark:ThemeMode::Light);
+        SystemDetailPanel panel;panel.resize(width,650);panel.show();
+        MetricSample sample;sample.capturedAt=QDateTime::fromMSecsSinceEpoch(160000);
+        sample.networkRates={{"eth0",5500,5200}};panel.setSample(sample);
+        QCoreApplication::processEvents();
+        auto *chart=static_cast<NetworkRateChart *>(panel.findChild<QWidget *>("networkRateChart"));
+        auto *row=panel.findChild<QWidget *>("networkRateRow");
+        auto *up=panel.findChild<QLabel *>("networkUploadRate");
+        auto *down=panel.findChild<QLabel *>("networkDownloadRate");
+        QCOMPARE(row->parentWidget(),chart);
+        QVERIFY(row->y()>=chart->height()-18);QVERIFY(row->height()<=15);
+        QVERIFY(row->geometry().left()>=40);QVERIFY(row->geometry().right()<=chart->width()-34);
+        QVERIFY(up->font().pixelSize()<=10);QVERIFY(down->font().pixelSize()<=10);
+        QVERIFY(up->fontMetrics().horizontalAdvance(up->text())<=up->width());
+        QVERIFY(down->fontMetrics().horizontalAdvance(down->text())<=down->width());
+        QVERIFY(panel.findChild<QFrame *>("networkSectionCard")->height()<=160);
+        // A flat blue line crosses the scale label's rectangle. The old
+        // opaque badge erased it; transparent text leaves it visible.
+        NetworkRateChart flat;flat.resize(200,92);
+        flat.setRates({{100000,500,100},{160000,500,100}},160000);
+        auto rendered=flat.grab().toImage().scaled(flat.size());
+        const QColor blue(dark?"#7BAAFF":"#2F6FD6");int visible=0;
+        for(int y=12;y<=17;++y)for(int x=8;x<48;++x){const auto c=rendered.pixelColor(x,y);
+            if(qAbs(c.red()-blue.red())+qAbs(c.green()-blue.green())+qAbs(c.blue()-blue.blue())<70)++visible;}
+        QVERIFY2(visible>12,"Scale labels must not paint a badge over the curve.");
+        const auto dir=qEnvironmentVariable("NOXSHELL_NETWORK_SCREENSHOT_DIR");
+        if(!dir.isEmpty()){QDir().mkpath(dir);QVERIFY(panel.findChild<QFrame *>("networkSectionCard")->grab()
+            .save(QDir(dir).filePath(QStringLiteral("network-footer-%1-%2.png").arg(dark?"dark":"light").arg(width))));}
+    }
+
     void networkChartUsesTimeWindowAndKeepsSamplesUnchanged()
     {
         noxshell::ui::SystemDetailPanel panel;
@@ -2976,11 +4448,157 @@ private slots:
         QVERIFY(coloredPixels > 200); // A connected curve, not just one end marker.
     }
 
+    void networkInterfacePopupStaysReadableAndStable_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void networkInterfacePopupStaysReadableAndStable()
+    {
+        QFETCH(bool, dark);
+        const auto previous = noxshell::ui::isApplicationDarkTheme();
+        auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previous
+            ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        noxshell::ui::SystemDetailPanel panel;
+        panel.resize(220, 600);
+        noxshell::MetricSample sample;
+        sample.capturedAt = QDateTime::fromMSecsSinceEpoch(100000);
+        sample.networkRates = {{"eth0", 100, 200}, {"lo", 0, 0}};
+        panel.setSample(sample);
+        panel.show();
+        QTest::qWait(30);
+        auto *combo = panel.findChild<QComboBox *>(QStringLiteral("networkInterfaceCombo"));
+        QVERIFY(combo);
+        QStyleOptionComboBox option;
+        option.initFrom(combo);
+        option.currentText = combo->currentText();
+        const auto labelArea = combo->style()->subControlRect(QStyle::CC_ComboBox, &option,
+            QStyle::SC_ComboBoxEditField, combo);
+        QVERIFY(labelArea.width() >= combo->fontMetrics().horizontalAdvance(combo->currentText()));
+        combo->showPopup();
+        QTest::qWait(30);
+        auto closePopup = qScopeGuard([&] { combo->hidePopup(); });
+        auto *view = combo->view();
+        QVERIFY(view->isVisible());
+        QCOMPARE(combo->itemText(0), QStringLiteral("全部网卡"));
+        const auto first = combo->model()->index(0, combo->modelColumn());
+        QVERIFY(view->visualRect(first).height() >= 24);
+        QVERIFY(view->visualRect(first).width() >= view->fontMetrics().horizontalAdvance(combo->itemText(0)) + 40);
+        const auto popupImage = view->viewport()->grab().toImage().scaled(view->viewport()->size(),
+            Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        const auto textRegion = view->visualRect(first).adjusted(3, 3, -3, -3).intersected(popupImage.rect());
+        const QColor selectedText(dark ? "#E3EFFF" : "#1E5BAA");
+        int readablePixels = 0;
+        for (int y = textRegion.top(); y <= textRegion.bottom(); ++y)
+            for (int x = textRegion.left(); x <= textRegion.right(); ++x) {
+                const auto color = popupImage.pixelColor(x, y);
+                if (qAbs(color.red() - selectedText.red()) + qAbs(color.green() - selectedText.green())
+                    + qAbs(color.blue() - selectedText.blue()) < 100) ++readablePixels;
+            }
+        QVERIFY2(readablePixels > 20, "The selected 'all interfaces' label must have visible high-contrast text.");
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_NETWORK_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) QVERIFY(view->viewport()->grab().save(QDir(screenshots).filePath(
+            QStringLiteral("network-popup-%1.png").arg(dark ? "dark" : "light"))));
+        // Sample refreshes must not reset an open popup, its selected row or
+        // the model while the set/order of available interfaces is unchanged.
+        QSignalSpy removed(combo->model(), &QAbstractItemModel::rowsRemoved);
+        QSignalSpy inserted(combo->model(), &QAbstractItemModel::rowsInserted);
+        const auto popupRow = combo->model()->index(2, combo->modelColumn());
+        view->setCurrentIndex(popupRow);
+        for (int i = 1; i <= 4; ++i) {
+            sample.capturedAt = sample.capturedAt.addSecs(1);
+            sample.networkRates[0].receivedBytesPerSecond += 1;
+            panel.setSample(sample);
+        }
+        QCOMPARE(removed.count(), 0);
+        QCOMPARE(inserted.count(), 0);
+        QCOMPARE(view->currentIndex(), popupRow);
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("__all__"));
+        QVERIFY(view->isVisible());
+        combo->hidePopup();
+        combo->setCurrentIndex(combo->findData(QStringLiteral("eth0")));
+        panel.setSample(sample);
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("eth0"));
+        sample.networkRates.removeFirst();
+        panel.setSample(sample);
+        QCOMPARE(combo->currentText(), QStringLiteral("全部网卡"));
+        QCOMPARE(combo->count(), 2);
+        panel.reset(QStringLiteral("未连接"));
+        QCOMPARE(combo->currentText(), QStringLiteral("全部网卡"));
+    }
+
+    void networkChartFillsWidthAndDistinguishesDirections_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::addColumn<int>("width");
+        for (const bool dark : {false, true}) for (const int width : {188, 214, 300})
+            QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(dark ? "dark" : "light").arg(width))) << dark << width;
+    }
+
+    void networkChartFillsWidthAndDistinguishesDirections()
+    {
+        QFETCH(bool, dark);
+        QFETCH(int, width);
+        const auto previous = noxshell::ui::isApplicationDarkTheme();
+        auto restore = qScopeGuard([&] { noxshell::ui::applyApplicationTheme(previous
+            ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light); });
+        noxshell::ui::applyApplicationTheme(dark ? noxshell::ui::ThemeMode::Dark : noxshell::ui::ThemeMode::Light);
+        noxshell::ui::NetworkRateChart chart;
+        chart.resize(width, 92);
+        const QColor up(dark ? "#7BAAFF" : "#2F6FD6");
+        const QColor down(dark ? "#FFB15C" : "#B8600B");
+        const auto near = [](const QColor &left, const QColor &right) {
+            return qAbs(left.red() - right.red()) + qAbs(left.green() - right.green())
+                + qAbs(left.blue() - right.blue()) < 80;
+        };
+        const QVector<noxshell::ui::NetworkRatePoint> samples = {
+            {100000, 400, 100}, {112000, 900, 450}, {124000, 200, 100},
+            {136000, 800, 600}, {148000, 200, 900}, {160000, 1200, 300}};
+        chart.setRates(samples, 160000);
+        auto rendered = chart.grab().toImage().scaled(chart.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        int upPixels = 0, downPixels = 0, leftPixels = 0;
+        for (int y = 7; y < 73; ++y) for (int x = 5; x < width - 5; ++x) {
+            const auto color = rendered.pixelColor(x, y);
+            if (near(color, up)) ++upPixels;
+            if (near(color, down)) ++downPixels;
+            if (x < 36 && (near(color, up) || near(color, down))) ++leftPixels;
+        }
+        QVERIFY(upPixels > 80);
+        QVERIFY(downPixels > 30);
+        QVERIFY2(leftPixels > 10, "The former 49px gutter must now be available to the curves.");
+        QCOMPARE(chart.rates().size(), samples.size());
+        QCOMPARE(chart.rates().last().upload, 1200.0);
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_NETWORK_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) QVERIFY(chart.grab().save(QDir(screenshots).filePath(
+            QStringLiteral("network-chart-%1-%2.png").arg(dark ? "dark" : "light").arg(width))));
+        // On identical paths, gaps in the orange dash still reveal the blue
+        // line underneath: direction must not depend on color alone.
+        chart.setRates({{100000, 500, 500}, {160000, 500, 500}}, 160000);
+        rendered = chart.grab().toImage().scaled(chart.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        upPixels = downPixels = 0;
+        for (int y = 7; y < 73; ++y) for (int x = 60; x < width - 12; ++x) {
+            if (near(rendered.pixelColor(x, y), up)) ++upPixels;
+            if (near(rendered.pixelColor(x, y), down)) ++downPixels;
+        }
+        QVERIFY(upPixels > 10);
+        QVERIFY(downPixels > 10);
+        if (!screenshots.isEmpty()) QVERIFY(chart.grab().save(QDir(screenshots).filePath(
+            QStringLiteral("network-chart-overlap-%1-%2.png").arg(dark ? "dark" : "light").arg(width))));
+        // Very large scales and empty charts remain paintable in a narrow rail.
+        chart.setRates({{100000, 12e9, 1e9}, {160000, 12e9, 1e9}}, 160000);
+        QVERIFY(!chart.grab().isNull());
+        chart.setRates({}, 160000);
+        QVERIFY(!chart.grab().isNull());
+    }
+
     void monitorRailVisualLayout_data()
     {
         QTest::addColumn<bool>("dark");
         QTest::addColumn<int>("railWidth");
-        for (const bool dark : {false, true}) for (const int width : {236, 252, 360})
+        for (const bool dark : {false, true}) for (const int width : {220, 236, 252, 360})
             QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(dark ? "dark" : "light").arg(width))) << dark << width;
     }
 
@@ -3000,6 +4618,7 @@ private slots:
         auto *rail = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
         QVERIFY(rail);
         rail->setFixedWidth(railWidth);
+        rail->show();
         window.findChild<QLabel *>(QStringLiteral("serverAddress"))->setText(QStringLiteral("203.0.113.8"));
         window.findChild<QLabel *>(QStringLiteral("monitorUptimeValue"))->setText(QStringLiteral("704 天 23 小时"));
         auto *summary = window.findChild<QFrame *>(QStringLiteral("monitorMetricSummary"));
@@ -3030,15 +4649,27 @@ private slots:
             auto *value = row->findChild<QLabel *>(QStringLiteral("metricValue"));
             auto *progress = row->findChild<QProgressBar *>(QStringLiteral("metricProgress"));
             QCOMPARE(row->height(), 44);
-            QCOMPARE(title->geometry().center().y(), detail->geometry().center().y());
+            QCOMPARE(title->mapTo(row, title->rect().center()).y(), detail->mapTo(row, detail->rect().center()).y());
             QCOMPARE(value->geometry().center().y(), detail->geometry().center().y());
-            QVERIFY(title->geometry().right() < detail->geometry().left());
+            QVERIFY(title->geometry().right() < progress->geometry().left());
             QVERIFY(detail->geometry().right() < value->geometry().left());
+            QCOMPARE(value->parentWidget(), progress);
+            QCOMPARE(detail->parentWidget(), progress);
+            QVERIFY(progress->rect().contains(value->geometry()));
+            QVERIFY(progress->rect().contains(detail->geometry()));
             QVERIFY(value->width() >= value->sizeHint().width());
             QVERIFY(detail->fontMetrics().horizontalAdvance(detail->text()) <= detail->width());
-            QVERIFY(detail->geometry().bottom() < progress->geometry().top());
+            QVERIFY(qAbs(progress->rect().center().y() - value->geometry().center().y()) <= 1);
             QVERIFY(progress->width() > 120);
+            QCOMPARE(progress->height(), 24);
+            QVERIFY(!progress->isTextVisible());
+            QVERIFY(progress->geometry().left() < row->width() / 2);
+            QVERIFY(progress->accessibleDescription().contains(value->text()));
         }
+        QCOMPARE(rows[0]->findChild<QProgressBar *>(QStringLiteral("metricProgress"))->x(),
+            rows[1]->findChild<QProgressBar *>(QStringLiteral("metricProgress"))->x());
+        QCOMPARE(rows[1]->findChild<QProgressBar *>(QStringLiteral("metricProgress"))->x(),
+            rows[2]->findChild<QProgressBar *>(QStringLiteral("metricProgress"))->x());
         const auto *network = panel->findChild<QFrame *>(QStringLiteral("networkSectionCard"));
         QVERIFY(panel->findChildren<QLabel *>(QStringLiteral("networkRateCaption")).isEmpty());
         const auto *upload = panel->findChild<QLabel *>(QStringLiteral("networkUploadRate"));
@@ -3056,6 +4687,16 @@ private slots:
         const auto screenshots = qEnvironmentVariable("NOXSHELL_MONITOR_SCREENSHOT_DIR");
         if (!screenshots.isEmpty()) QVERIFY(rail->grab().save(QDir(screenshots).filePath(
             QStringLiteral("monitor-%1-%2.png").arg(dark ? "dark" : "light").arg(railWidth))));
+        const auto *cpuProgress = rows[0]->findChild<QProgressBar *>(QStringLiteral("metricProgress"));
+        const int trailingTrackX = cpuProgress->x();
+        for (const auto &reading : {QStringLiteral("100.0%"), QStringLiteral("0.0%")}) {
+            rows[0]->setValue(reading, QStringLiteral("内核态 100.0%"), reading.startsWith('1') ? 100 : 0);
+            QCoreApplication::processEvents();
+            const auto *value = rows[0]->findChild<QLabel *>(QStringLiteral("metricValue"));
+            QCOMPARE(cpuProgress->x(), trailingTrackX);
+            QVERIFY(value->width() >= value->sizeHint().width());
+            QVERIFY(cpuProgress->rect().contains(value->geometry()));
+        }
         rows[0]->setValue(QStringLiteral("--"), QStringLiteral("等待连接：这是一段用于验证窄窗口省略与提示的较长状态说明").repeated(3), 0);
         QCoreApplication::processEvents();
         auto *detail = rows[0]->findChild<QLabel *>(QStringLiteral("metricDetail"));
@@ -3903,6 +5544,21 @@ private slots:
                 QPoint(tree->header()->sectionViewportPosition(column) + tree->columnWidth(column) / 2,
                     tree->header()->height() / 2));
         };
+        const auto arrowPixels = [tree](int column) {
+            auto *header = tree->header();
+            const auto image = header->viewport()->grab().toImage().scaled(header->viewport()->size());
+            const int right = header->sectionViewportPosition(column) + header->sectionSize(column) - 1;
+            int count = 0;
+            for (int y = header->height() / 2 - 6; y <= header->height() / 2 + 6; ++y) {
+                const auto background = image.pixelColor(right - 3, y);
+                for (int x = right - 25; x < right - 5; ++x) {
+                    const auto color = image.pixelColor(x, y);
+                    if (qAbs(color.red() - background.red()) + qAbs(color.green() - background.green())
+                        + qAbs(color.blue() - background.blue()) > 70) ++count;
+                }
+            }
+            return count;
+        };
         const auto sizePoint = [tree](QTreeWidgetItem *item, bool action) {
             return QPoint(tree->header()->sectionViewportPosition(1) + (action ? 16 : tree->columnWidth(1) - 16),
                 tree->visualItemRect(item).center().y());
@@ -3911,6 +5567,8 @@ private slots:
             QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier, sizePoint(item, true));
         };
         QVERIFY(!automatic->isChecked());
+        QVERIFY(arrowPixels(0) > 8);
+        QCOMPARE(arrowPixels(1), 0);
         QCOMPARE(sizeRequests.size(), 0);
         QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("a-dir"));
         auto *a = tree->topLevelItem(0);
@@ -3932,6 +5590,8 @@ private slots:
         QCOMPARE(a->text(1), QStringLiteral("1.0 KB"));
         clickHeader(1);
         QCOMPARE(tree->header()->sortIndicatorSection(), 1);
+        QCOMPARE(arrowPixels(0), 0);
+        QVERIFY(arrowPixels(1) > 8);
         QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::AscendingOrder);
         QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("small"));
         QCOMPARE(tree->topLevelItem(1), a);
@@ -3940,8 +5600,10 @@ private slots:
         QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::DescendingOrder);
         QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("large"));
         QCOMPARE(tree->topLevelItem(3), b);
-        clickHeader(2); // Other headers do not change the selected sort.
-        QCOMPARE(tree->sortColumn(), 1);
+        clickHeader(2);
+        QCOMPARE(tree->sortColumn(), 2);
+        QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::AscendingOrder);
+        clickHeader(2);
         QCOMPARE(tree->header()->sortIndicatorOrder(), Qt::DescendingOrder);
         clickHeader(0);
         QCOMPARE(tree->sortColumn(), 0);
@@ -4254,6 +5916,305 @@ private slots:
         }
     }
 
+    void fileEditorSpansWholePane_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void fileEditorSpansWholePane()
+    {
+        QFETCH(bool, dark);
+        using namespace noxshell;
+        using namespace noxshell::ui;
+        SettingsGuard settingsGuard;
+        AppSettings::instance()->setValue("files/autoSave", false);
+        AppSettings::instance()->setValue("tabs/confirmClose", true);
+        const auto previous = isApplicationDarkTheme() ? ThemeMode::Dark : ThemeMode::Light;
+        const auto restoreTheme = qScopeGuard([previous] { applyApplicationTheme(previous); });
+        applyApplicationTheme(dark ? ThemeMode::Dark : ThemeMode::Light);
+        QTemporaryDir directory;
+        MemoryCredentialStore credentials;
+        ServerRepository repository(directory.filePath("fullheight-editor.sqlite"), false);
+        QVERIFY(repository.initialize());
+        TerminalWorkspace workspace(&repository, &credentials);
+        workspace.resize(1440, 900);
+        workspace.show();
+        ServerProfile profile;
+        profile.id = "fullheight-demo"; profile.name = QStringLiteral("演示会话");
+        profile.user = "root"; profile.host = "demo.example"; profile.connectionMode = ConnectionMode::Demo;
+        workspace.openOrActivate(profile, true);
+        auto *pane = workspace.findChild<QStackedWidget *>("terminalSessionStack")->currentWidget()
+            ->property("activeTerminalPane").value<QWidget *>();
+        auto *session = pane->findChild<SshSession *>();
+        QTRY_VERIFY(session->isConnected());
+        if (!workspace.fileWorkspaceVisible()) workspace.setFileWorkspaceVisible(true);
+        auto *files = pane->findChild<FilePanel *>();
+        auto *tree = files->findChild<QTreeWidget *>("remoteFileTree");
+        QTRY_COMPARE(tree->topLevelItemCount(), 8);
+        QTreeWidgetItem *readme = nullptr;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i)
+            if (tree->topLevelItem(i)->text(0) == "README.md") readme = tree->topLevelItem(i);
+        QVERIFY(readme);
+        QSignalSpy connections(session, &SshSession::connectionChanged);
+        tree->itemDoubleClicked(readme, 0);
+        auto *editor = pane->findChild<RemoteFileEditor *>();
+        QVERIFY(editor && !editor->isWindow());
+        auto *text = editor->findChild<QPlainTextEdit *>("remoteFileEditorText");
+        QTRY_VERIFY(text->isEnabled());
+        auto *outer = pane->findChild<QSplitter *>("paneEditorSplitter");
+        auto *left = pane->findChild<QSplitter *>("terminalFileSplitter");
+        auto *commandColumn = pane->findChild<QWidget *>("terminalCommandColumn");
+        auto *header = pane->findChild<QFrame *>("terminalPaneHeader");
+        QVERIFY(outer && left && commandColumn && header);
+        QVERIFY(commandColumn->isAncestorOf(left));
+        QCOMPARE(header->parentWidget(), commandColumn);
+        QCOMPARE(outer->widget(0), commandColumn); QCOMPARE(outer->widget(1), editor);
+        QVERIFY(!files->isAncestorOf(editor));
+        auto *modes = pane->findChild<QTabBar *>("terminalModeTabs");
+        for (int mode : {1, 0}) {
+            modes->setCurrentIndex(mode);
+            QVERIFY(editor->isVisible());
+            QCOMPARE(editor->height(), commandColumn->height());
+        }
+        for (int width : {1440, 1000}) {
+            workspace.resize(width, 900);
+            QCoreApplication::processEvents();
+            QCOMPARE(editor->y(), commandColumn->y());
+            QCOMPARE(editor->mapTo(pane, QPoint()).y(), header->mapTo(pane, QPoint()).y());
+            QCOMPARE(editor->height(), commandColumn->height());
+            QCOMPARE(editor->height(), left->height() + header->height());
+            QVERIFY(editor->height() > files->height());
+            QVERIFY(editor->x() > commandColumn->geometry().right());
+            for (const auto &name : {"terminalPaneMoreButton", "terminalPaneCloseButton"}) {
+                auto *control = header->findChild<QToolButton *>(name);
+                QVERIFY(control && control->isVisible());
+                QVERIFY(header->rect().contains(control->geometry()));
+                QVERIFY(control->mapTo(pane, control->rect().topRight()).x() < editor->mapTo(pane, QPoint()).x());
+            }
+            const auto captureDir = qEnvironmentVariable("NOXSHELL_EMBEDDED_EDITOR_SCREENSHOT_DIR");
+            if (!captureDir.isEmpty()) {
+                QDir().mkpath(captureDir);
+                const auto path = QDir(captureDir).filePath(QStringLiteral("fullheight-%1-%2.png")
+                    .arg(dark ? "dark" : "light").arg(width));
+                QTest::qWait(120);
+#ifdef Q_OS_MACOS
+                if (QApplication::platformName() == "cocoa") QVERIFY(nativeProbeCaptureWindow(&workspace, path));
+                else
+#endif
+                    QVERIFY(workspace.grab().save(path));
+            }
+        }
+        text->insertPlainText("# retained draft\n");
+        const auto draft = text->toPlainText();
+        {
+            CloseDialogResponder cancel(QMessageBox::Cancel);
+            QTest::mouseClick(header->findChild<QToolButton *>("terminalPaneCloseButton"), Qt::LeftButton);
+            QCOMPARE(cancel.count, 1);
+            QCOMPARE(cancel.names, QStringList{QStringLiteral("terminalCloseConfirmation")});
+        }
+        QCOMPARE(workspace.sessionCount(), 1);
+        QVERIFY(editor->isVisible());
+        QCOMPARE(text->toPlainText(), draft);
+        workspace.setFileWorkspaceVisible(false);
+        QVERIFY(!files->isVisible()); QVERIFY(editor->isVisible());
+        QCOMPARE(editor->height(), commandColumn->height());
+        workspace.setFileWorkspaceVisible(true);
+        QCOMPARE(text->toPlainText(), draft);
+        QCOMPARE(connections.count(), 0); QCOMPARE(credentials.loadCalls, 0);
+    }
+
+    void embeddedFileEditorsRemainIsolatedAndRestoreExpansion_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void embeddedFileEditorsRemainIsolatedAndRestoreExpansion()
+    {
+        QFETCH(bool, dark);
+        using namespace noxshell::ui;
+        const auto previousTheme = isApplicationDarkTheme() ? ThemeMode::Dark : ThemeMode::Light;
+        const auto restoreTheme = qScopeGuard([previousTheme] { applyApplicationTheme(previousTheme); });
+        QTemporaryDir directory;
+        MemoryCredentialStore credentials;
+        MainWindow window(directory.filePath(QStringLiteral("embedded-editor.sqlite")), nullptr, &credentials);
+        window.resize(1900, 1000);
+        window.show();
+        applyApplicationTheme(dark ? ThemeMode::Dark : ThemeMode::Light);
+        auto *workspace = window.findChild<TerminalWorkspace *>();
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("embedded-editor-demo");
+        profile.name = QStringLiteral("文件编辑测试");
+        profile.user = QStringLiteral("root");
+        profile.host = QStringLiteral("demo.example");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        workspace->openOrActivate(profile, true);
+        auto *stack = window.findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+        auto *group = stack->currentWidget();
+        auto *first = group->property("activeTerminalPane").value<QWidget *>();
+        QTRY_VERIFY(first->findChild<noxshell::SshSession *>()->isConnected());
+        workspace->splitActivePane(Qt::Horizontal);
+        auto *second = group->property("activeTerminalPane").value<QWidget *>();
+        auto *firstSession = first->findChild<noxshell::SshSession *>();
+        auto *secondSession = second->findChild<noxshell::SshSession *>();
+        QTRY_VERIFY(secondSession->isConnected());
+        for (auto *pane : {first, second})
+            QTest::mouseClick(pane->findChild<QToolButton *>(QStringLiteral("fileWorkspaceToggleButton")), Qt::LeftButton);
+        auto *firstFiles = first->findChild<FilePanel *>();
+        auto *secondFiles = second->findChild<FilePanel *>();
+        auto *firstTree = firstFiles->findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        auto *secondTree = secondFiles->findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        QTRY_COMPARE(firstTree->topLevelItemCount(), 8);
+        QTRY_COMPARE(secondTree->topLevelItemCount(), 8);
+        const auto fileItem = [](QTreeWidget *tree, const QString &name) -> QTreeWidgetItem * {
+            for (int index = 0; index < tree->topLevelItemCount(); ++index)
+                if (tree->topLevelItem(index)->text(0) == name) return tree->topLevelItem(index);
+            return nullptr;
+        };
+        auto *readme = fileItem(firstTree, QStringLiteral("README.md"));
+        QVERIFY(readme);
+        firstTree->scrollToItem(readme);
+        QCoreApplication::processEvents();
+        const QPoint filePoint(50, firstTree->visualItemRect(readme).center().y());
+        QTest::mouseClick(firstTree->viewport(), Qt::LeftButton, Qt::NoModifier, filePoint);
+        QTest::mouseDClick(firstTree->viewport(), Qt::LeftButton, Qt::NoModifier, filePoint);
+        QTRY_VERIFY(first->findChild<RemoteFileEditor *>());
+        QPointer<RemoteFileEditor> firstEditor = first->findChild<RemoteFileEditor *>();
+        auto *firstText = firstEditor->findChild<QPlainTextEdit *>(QStringLiteral("remoteFileEditorText"));
+        auto *firstTabs = firstEditor->findChild<QTabBar *>(QStringLiteral("remoteFileEditorTabs"));
+        QTRY_VERIFY(firstText->isEnabled());
+        QVERIFY(!firstEditor->isWindow());
+        QCOMPARE(firstEditor->window(), &window);
+        auto *editorSplit = first->findChild<QSplitter *>(QStringLiteral("paneEditorSplitter"));
+        auto *leftWorkspace = first->findChild<QWidget *>(QStringLiteral("terminalCommandColumn"));
+        QVERIFY(editorSplit && leftWorkspace);
+        QCOMPARE(editorSplit->widget(0), leftWorkspace);
+        QCOMPARE(editorSplit->widget(1), firstEditor.data());
+        QCOMPARE(editorSplit->orientation(), Qt::Horizontal);
+        QVERIFY(!firstFiles->isAncestorOf(firstEditor));
+        // The editor is the full-height sibling of BOTH terminal and browser.
+        QTRY_COMPARE(firstEditor->y(), leftWorkspace->y());
+        QTRY_COMPARE(firstEditor->height(), leftWorkspace->height());
+        QVERIFY(firstEditor->height() > firstFiles->height());
+        QVERIFY(firstEditor->x() >= leftWorkspace->geometry().right());
+        firstText->setPlainText(QStringLiteral("# unsaved first-pane draft\nvalue: 42\n"));
+        const auto draft = firstText->toPlainText();
+        auto *handle = editorSplit->handle(1);
+        const auto originalEditorSizes = editorSplit->sizes();
+        QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, handle->rect().center());
+        QTest::mouseMove(handle, handle->rect().center() - QPoint(35, 0));
+        QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, handle->rect().center());
+        QTRY_VERIFY2(editorSplit->sizes() != originalEditorSizes,
+            qPrintable(QStringLiteral("split width %1, left %2, editor %3; minimums %4 / %5")
+                .arg(editorSplit->width()).arg(originalEditorSizes.value(0)).arg(originalEditorSizes.value(1))
+                .arg(leftWorkspace->minimumSizeHint().width()).arg(firstEditor->minimumSizeHint().width())));
+        QCOMPARE(firstText->toPlainText(), draft);
+        firstTree->itemDoubleClicked(fileItem(firstTree, QStringLiteral("deploy.sh")), 0);
+        QTRY_COMPARE(firstTabs->count(), 2);
+        QCOMPARE(first->findChildren<RemoteFileEditor *>().size(), 1);
+        firstTabs->setCurrentIndex(0);
+        secondTree->itemDoubleClicked(fileItem(secondTree, QStringLiteral("README.md")), 0);
+        QTRY_VERIFY(second->findChild<RemoteFileEditor *>());
+        auto *secondEditor = second->findChild<RemoteFileEditor *>();
+        auto *secondText = secondEditor->findChild<QPlainTextEdit *>(QStringLiteral("remoteFileEditorText"));
+        QTRY_VERIFY(secondText->isEnabled());
+        QVERIFY(secondEditor != firstEditor);
+        QVERIFY(secondText->toPlainText() != draft);
+        secondText->setPlainText(QStringLiteral("# independent second-pane draft\n"));
+        auto *firstTerminal = first->findChild<TerminalView *>();
+        auto *secondTerminal = second->findChild<TerminalView *>();
+        const auto firstBuffer = firstTerminal->plainText();
+        const auto secondBuffer = secondTerminal->plainText();
+        auto *rootSplit = group->findChild<QSplitter *>(QStringLiteral("terminalPaneSplitter"));
+        auto *terminalFileSplit = first->findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
+        const auto rootSizes = rootSplit->sizes();
+        const auto fileSizes = terminalFileSplit->sizes();
+        const auto editorSizes = editorSplit->sizes();
+        QSignalSpy firstGrid(firstTerminal, &TerminalView::terminalSizeChanged);
+        QSignalSpy secondGrid(secondTerminal, &TerminalView::terminalSizeChanged);
+        QSignalSpy firstConnection(firstSession, &noxshell::SshSession::connectionChanged);
+        QSignalSpy secondConnection(secondSession, &noxshell::SshSession::connectionChanged);
+        auto *expand = firstFiles->findChild<QToolButton *>(QStringLiteral("fileWorkspaceExpandButton"));
+        auto *closeFiles = firstFiles->findChild<QToolButton *>(QStringLiteral("fileWorkspaceCloseButton"));
+        QVERIFY(expand && closeFiles);
+        QTest::mouseClick(expand, Qt::LeftButton);
+        QTRY_VERIFY(expand->isChecked());
+        QVERIFY(second->isHidden());
+        QVERIFY(first->findChild<QStackedWidget *>("terminalModeStack")->isHidden());
+        QTRY_VERIFY(editorSplit->width() > window.width() * 0.85);
+        QTRY_VERIFY(firstFiles->height() > window.height() * 0.8);
+        QCOMPARE(firstEditor->height(), leftWorkspace->height());
+        QCOMPARE(firstGrid.count(), 0);
+        QCOMPARE(secondGrid.count(), 0);
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_EMBEDDED_EDITOR_SCREENSHOT_DIR");
+        const auto capture = [&](const QString &state) {
+            if (captureDir.isEmpty()) return true;
+            QDir().mkpath(captureDir);
+            QTest::qWait(120);
+            const auto path = QDir(captureDir).filePath(QStringLiteral("editor-%1-%2.png")
+                .arg(dark ? QStringLiteral("dark") : QStringLiteral("light"), state));
+#ifdef Q_OS_MACOS
+            if (QApplication::platformName() == QStringLiteral("cocoa")) return nativeProbeCaptureWindow(&window, path);
+#endif
+            return window.grab().save(path);
+        };
+        QVERIFY(capture(QStringLiteral("expanded")));
+        QTest::mouseClick(expand, Qt::LeftButton);
+        QTRY_VERIFY(!second->isHidden());
+        QTRY_COMPARE(rootSplit->sizes(), rootSizes);
+        QTRY_COMPARE(terminalFileSplit->sizes(), fileSizes);
+        QTRY_COMPARE(editorSplit->sizes(), editorSizes);
+        QCOMPARE(firstText->toPlainText(), draft);
+        QCOMPARE(firstTerminal->plainText(), firstBuffer);
+        QCOMPARE(secondTerminal->plainText(), secondBuffer);
+        QCOMPARE(firstGrid.count(), 0);
+        QCOMPARE(secondGrid.count(), 0);
+        QVERIFY(capture(QStringLiteral("restored")));
+        QTest::mouseClick(expand, Qt::LeftButton);
+        QTest::mouseClick(closeFiles, Qt::LeftButton);
+        QTRY_VERIFY(firstFiles->isHidden() || !firstFiles->isVisible());
+        QVERIFY(!second->isHidden());
+        QVERIFY(!expand->isChecked());
+        QVERIFY(firstEditor->isVisible());
+        QCOMPARE(firstEditor->height(), leftWorkspace->height());
+        QTest::mouseClick(first->findChild<QToolButton *>(QStringLiteral("fileWorkspaceToggleButton")), Qt::LeftButton);
+        QTRY_VERIFY(firstEditor->isVisible());
+        QCOMPARE(firstText->toPlainText(), draft);
+        QCOMPARE(firstTabs->count(), 2);
+        // Cancelling a dirty tab close must keep the draft in this pane.
+        QTimer::singleShot(0, [] {
+            auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (message) message->button(QMessageBox::Cancel)->click();
+        });
+        firstTabs->tabCloseRequested(0);
+        QCOMPARE(firstTabs->count(), 2);
+        QCOMPARE(firstText->toPlainText(), draft);
+        QSignalSpy firstWrites(firstSession, &noxshell::SshSession::remoteFileWritten);
+        QSignalSpy secondWrites(secondSession, &noxshell::SshSession::remoteFileWritten);
+        QTest::keyClick(firstText, Qt::Key_S, Qt::ControlModifier);
+        QTRY_COMPARE(firstWrites.count(), 1);
+        QCOMPARE(secondWrites.count(), 0);
+        firstTabs->tabCloseRequested(0);
+        QCOMPARE(firstTabs->count(), 1);
+        firstTabs->tabCloseRequested(0);
+        QTRY_VERIFY(firstEditor.isNull());
+        QTRY_COMPARE(editorSplit->count(), 1);
+        QTRY_COMPARE(leftWorkspace->width(), editorSplit->width());
+        // Reopen restores the user's horizontal ratio, without new windows.
+        // Saving refreshes the directory asynchronously and clears its items.
+        QTRY_VERIFY(fileItem(firstTree, QStringLiteral("README.md")));
+        firstTree->itemDoubleClicked(fileItem(firstTree, QStringLiteral("README.md")), 0);
+        QTRY_VERIFY(first->findChild<RemoteFileEditor *>());
+        QTRY_COMPARE(editorSplit->sizes(), editorSizes);
+        QVERIFY(secondEditor->isVisible());
+        QCOMPARE(secondText->toPlainText(), QStringLiteral("# independent second-pane draft\n"));
+        QCOMPARE(firstConnection.count(), 0);
+        QCOMPARE(secondConnection.count(), 0);
+    }
+
     void demoSftpListsAndNavigatesDirectories()
     {
         noxshell::SshSession session(nullptr, nullptr);
@@ -4387,9 +6348,23 @@ private slots:
         QVERIFY(contextDownload->isEnabled());
         QVERIFY(newFileAction->isEnabled());
 
+        // A standalone browser emits intent; only its workspace owns editors.
+        QWidget editorHost;
+        editorHost.resize(1000, 720);
+        auto *editorLayout = new QVBoxLayout(&editorHost);
+        QPointer<noxshell::ui::RemoteFileEditor> fileEditor;
+        QObject::connect(&panel, &noxshell::ui::FilePanel::fileOpenRequested, &editorHost, [&](const QString &path) {
+            if (!fileEditor) {
+                fileEditor = new noxshell::ui::RemoteFileEditor(&session, profile.name, path, &editorHost);
+                editorLayout->addWidget(fileEditor);
+            } else fileEditor->openFile(path);
+            editorHost.show();
+        });
+        QSignalSpy openRequests(&panel, &noxshell::ui::FilePanel::fileOpenRequested);
         tree->itemDoubleClicked(firstFile, 0);
-        QTRY_VERIFY_WITH_TIMEOUT(panel.findChild<noxshell::ui::RemoteFileEditor *>() != nullptr, 1000);
-        auto *fileEditor = panel.findChild<noxshell::ui::RemoteFileEditor *>();
+        QCOMPARE(openRequests.count(), 1);
+        QVERIFY(fileEditor);
+        QVERIFY(!panel.findChild<noxshell::ui::RemoteFileEditor *>());
         auto *editorText = fileEditor->findChild<QPlainTextEdit *>(QStringLiteral("remoteFileEditorText"));
         auto *editorStatus = fileEditor->findChild<QLabel *>(QStringLiteral("remoteFileEditorStatus"));
         auto *editorTabs = fileEditor->findChild<QTabBar *>(QStringLiteral("remoteFileEditorTabs"));
@@ -4520,7 +6495,8 @@ private slots:
         QVERIFY(secondFileAfterRefresh);
         tree->itemDoubleClicked(secondFileAfterRefresh, 0);
         QTRY_COMPARE_WITH_TIMEOUT(editorTabs->count(), 2, 1000);
-        QCOMPARE(panel.findChildren<noxshell::ui::RemoteFileEditor *>().size(), 1);
+        QCOMPARE(openRequests.count(), 2);
+        QCOMPARE(editorHost.findChildren<noxshell::ui::RemoteFileEditor *>().size(), 1);
         QVERIFY(editorTabs->tabText(1).contains(QStringLiteral("demo-sftp")));
         QVERIFY(editorTabs->tabText(1).contains(secondFileName));
         QVERIFY(!editorTabs->tabButton(1, QTabBar::LeftSide));
@@ -4895,6 +6871,68 @@ private slots:
         }));
     }
 
+    void transferQueueShowsNewestFirstWithoutReorderingUpdates()
+    {
+        MemoryCredentialStore credentials;
+        noxshell::SshSession session(nullptr, &credentials);
+        noxshell::ui::TransferQueuePanel panel(&session);
+        panel.resize(520, 250);
+        panel.show();
+        auto *list = panel.findChild<QListWidget *>(QStringLiteral("transferQueueList"));
+        QVERIFY(list);
+        QSignalSpy added(&panel, &noxshell::ui::TransferQueuePanel::taskAdded);
+        // Submission order, not filename, direction or ID, determines the rows.
+        QList<noxshell::FileTransferTask> tasks;
+        for (int index = 0; index < 12; ++index) {
+            noxshell::FileTransferTask task;
+            task.id = 100 - index;
+            task.operation = index % 2 ? noxshell::RemoteFileOperation::Download
+                                       : noxshell::RemoteFileOperation::Upload;
+            task.remotePath = QStringLiteral("/remote/file-%1.txt").arg(index);
+            task.total = 1000;
+            tasks.append(task);
+            session.transferTaskChanged(task);
+            QCOMPARE(list->item(0)->data(Qt::UserRole).toULongLong(), task.id);
+        }
+        QCOMPARE(added.count(), tasks.size());
+        QCOMPARE(panel.taskCount(), tasks.size());
+        QCoreApplication::processEvents();
+        QVERIFY(list->verticalScrollBar()->maximum() > 0);
+        QCOMPARE(list->verticalScrollBar()->value(), 0);
+        list->scrollToBottom();
+        const int previousScroll = list->verticalScrollBar()->value();
+        QVERIFY(previousScroll > 0);
+        auto *oldestItem = list->item(list->count() - 1);
+        auto *oldestRow = list->itemWidget(oldestItem);
+        for (const auto state : {noxshell::TransferState::Running, noxshell::TransferState::Completed,
+                 noxshell::TransferState::Failed, noxshell::TransferState::Canceled,
+                 noxshell::TransferState::Queued}) {
+            tasks[0].state = state;
+            tasks[0].completed = 500;
+            session.transferTaskChanged(tasks[0]);
+            QCoreApplication::processEvents();
+            QCOMPARE(list->item(list->count() - 1), oldestItem);
+            QCOMPARE(list->itemWidget(oldestItem), oldestRow);
+            QCOMPARE(list->verticalScrollBar()->value(), previousScroll);
+            QCOMPARE(added.count(), tasks.size());
+        }
+        for (int row = 0; row < tasks.size(); ++row)
+            QCOMPARE(list->item(row)->data(Qt::UserRole).toULongLong(), tasks[tasks.size() - 1 - row].id);
+        auto newest = tasks.last();
+        newest.id = 200;
+        session.transferTaskChanged(newest);
+        QCoreApplication::processEvents();
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toULongLong(), newest.id);
+        QCOMPARE(list->verticalScrollBar()->value(), 0);
+        session.transferQueueReset();
+        QCOMPARE(list->count(), 0);
+        QCOMPARE(panel.taskCount(), 0);
+        session.transferTaskChanged(tasks.first());
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toULongLong(), tasks.first().id);
+        QCOMPARE(credentials.loadCalls, 0);
+    }
+
     void completedDownloadOpensOnlyItsLocalDirectory_data()
     {
         QTest::addColumn<bool>("dark");
@@ -4967,7 +7005,8 @@ private slots:
         upload.id = 82;
         upload.operation = noxshell::RemoteFileOperation::Upload;
         session.transferTaskChanged(upload);
-        auto *uploadButton = list->itemWidget(list->item(1))->findChild<QToolButton *>(QStringLiteral("transferOpenDirectory"));
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toULongLong(), upload.id);
+        auto *uploadButton = list->itemWidget(list->item(0))->findChild<QToolButton *>(QStringLiteral("transferOpenDirectory"));
         QVERIFY(uploadButton && uploadButton->isHidden() && !uploadButton->isEnabled());
         const auto updatedDestination = directory.filePath(QStringLiteral("new destination"));
         QVERIFY(QDir().mkpath(updatedDestination));
@@ -5086,8 +7125,1006 @@ private slots:
         }(), 1000);
     }
 
+    void titlebarConnectionShortcutsPreserveSessions()
+    {
+        if (QApplication::platformName() == QStringLiteral("cocoa"))
+            QSKIP("Qt titlebar fallback; Cocoa titlebar is tested separately");
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("shortcuts.sqlite")), nullptr, &credentials);
+        window.show();
+        QTest::qWait(30);
+        auto *workspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
+        auto *home = window.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
+        auto *button = window.findChild<QToolButton *>(QStringLiteral("newConnectionButton"));
+        auto *monitor = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
+        auto *monitorToggle = window.findChild<QToolButton *>(QStringLiteral("monitorToggleButton"));
+        QVERIFY(workspace && home && button && monitor && monitorToggle);
+        QVERIFY(monitor->isHidden());
+        QVERIFY(button->geometry().right() < monitorToggle->geometry().left());
+        QVERIFY(!button->icon().isNull());
+        auto *menu = button->menu();
+        QVERIFY(menu);
+        QCOMPARE(menu->actions().size(), 2);
+        QCOMPARE(menu->actions().at(0)->text(), QStringLiteral("凭据管理"));
+        QCOMPARE(menu->actions().at(1)->text(), QStringLiteral("服务器管理"));
+
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("shortcut-session");
+        profile.name = QStringLiteral("保留会话");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        workspace->openOrActivate(profile, false);
+        auto *session = workspace->findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        auto *terminal = workspace->findChild<noxshell::ui::TerminalView *>();
+        QVERIFY(terminal);
+        terminal->feedText(QStringLiteral("preserved-through-management"));
+        QSignalSpy closed(workspace, &noxshell::ui::TerminalWorkspace::sessionClosed);
+        menu->actions().at(0)->trigger();
+        QVERIFY(workspace->isHomePageVisible());
+        QCOMPARE(home->currentIndex(), 2);
+        QVERIFY(workspace->activateExisting(profile.id));
+        QVERIFY(!workspace->isHomePageVisible());
+        menu->actions().at(1)->trigger();
+        QVERIFY(workspace->isHomePageVisible());
+        QCOMPARE(home->currentIndex(), 1);
+        QCOMPARE(workspace->sessionCount(), 1);
+        QVERIFY(closed.isEmpty());
+        QCOMPARE(workspace->findChild<noxshell::SshSession *>(), session);
+        QVERIFY(terminal->plainText().contains(QStringLiteral("preserved-through-management")));
+
+        // Hovering must expose both actions without grabbing the plus button.
+        QTest::mouseMove(&window, QPoint(window.width() / 2, window.height() / 2));
+        QTest::mouseMove(button, button->rect().center());
+        QTRY_VERIFY_WITH_TIMEOUT(menu->isVisible(), 1000);
+        const auto screenshots = qEnvironmentVariable("NOXSHELL_SHORTCUT_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) {
+            QVERIFY(window.grab().save(QDir(screenshots).filePath(QStringLiteral("shortcuts.png"))));
+            QVERIFY(menu->grab().save(QDir(screenshots).filePath(QStringLiteral("shortcuts-menu.png"))));
+        }
+        bool opened = false;
+        QTimer responder;
+        connect(&responder, &QTimer::timeout, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (!dialog || !dialog->isVisible()) return;
+            opened = true;
+            dialog->reject();
+        });
+        responder.start(10);
+        QTest::mouseClick(button, Qt::LeftButton);
+        QVERIFY(opened);
+        QVERIFY(!menu->isVisible());
+        QCOMPARE(workspace->sessionCount(), 1);
+        QVERIFY(monitor->isHidden());
+        QCOMPARE(credentials.loadCalls, 0);
+        QCOMPARE(credentials.saveCalls, 0);
+    }
+
+    void nativeTitlebarConnectionShortcuts()
+    {
+#ifndef Q_OS_MACOS
+        QSKIP("Cocoa-only titlebar");
+#else
+        if (QApplication::platformName() != QStringLiteral("cocoa")) QSKIP("Requires Cocoa");
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("native-shortcuts.sqlite")), nullptr, &credentials);
+        window.show();
+        window.activateWindow();
+        QTest::qWait(100);
+        auto *workspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
+        auto *home = window.findChild<QTabWidget *>(QStringLiteral("connectionHomeTabs"));
+        auto *monitor = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
+        QVERIFY(workspace && home && monitor);
+        QVERIFY(monitor->isHidden());
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("monitorToggleButton")));
+        QVERIFY(monitor->isVisible());
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("monitorToggleButton")));
+        QVERIFY(monitor->isHidden());
+
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("native-shortcut-session");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        workspace->openOrActivate(profile, false);
+        auto *session = workspace->findChild<noxshell::SshSession *>();
+        QVERIFY(session);
+        QVERIFY(nativeProbeTitlebarHover(&window));
+        QTRY_VERIFY_WITH_TIMEOUT(nativeProbeTitlebarMenuVisible(&window), 1000);
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("credentialManagerAction")));
+        QVERIFY(workspace->isHomePageVisible());
+        QCOMPARE(home->currentIndex(), 2);
+        QVERIFY(!nativeProbeTitlebarMenuVisible(&window));
+        QVERIFY(workspace->activateExisting(profile.id));
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("serverManagerAction")));
+        QCOMPARE(home->currentIndex(), 1);
+        QVERIFY(workspace->isHomePageVisible());
+        QCOMPARE(workspace->sessionCount(), 1);
+        QCOMPARE(workspace->findChild<noxshell::SshSession *>(), session);
+
+        QVERIFY(nativeProbeTitlebarHover(&window));
+        QTRY_VERIFY_WITH_TIMEOUT(nativeProbeTitlebarMenuVisible(&window), 1000);
+        bool opened = false;
+        QTimer responder;
+        connect(&responder, &QTimer::timeout, &window, [&] {
+            auto *dialog = window.findChild<noxshell::ui::ServerDialog *>();
+            if (dialog && dialog->isVisible()) { opened = true; dialog->reject(); }
+        });
+        responder.start(10);
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("newConnectionButton")));
+        QVERIFY(opened);
+        QVERIFY(!nativeProbeTitlebarMenuVisible(&window));
+        QVERIFY(monitor->isHidden());
+        QCOMPARE(credentials.loadCalls, 0);
+        QCOMPARE(credentials.saveCalls, 0);
+#endif
+    }
+
+    void compactPaneHeadersMatchReference_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false; QTest::newRow("dark") << true;
+    }
+
+    void compactPaneHeadersMatchReference()
+    {
+        QFETCH(bool, dark);
+        using namespace noxshell; using namespace noxshell::ui;
+        SettingsGuard guard; AppSettings::instance()->setValue("general/openTerminal", false);
+        AppSettings::instance()->setValue("general/showLatency", false);
+        const auto previous = isApplicationDarkTheme() ? ThemeMode::Dark : ThemeMode::Light;
+        const auto restore = qScopeGuard([&] { applyApplicationTheme(previous); });
+        applyApplicationTheme(dark ? ThemeMode::Dark : ThemeMode::Light);
+        MemoryCredentialStore credentials;
+        TerminalWorkspace workspace(nullptr, &credentials); workspace.resize(1440, 600); workspace.show();
+        ServerProfile p; p.id = p.name = "compact-header-fixture"; p.user = "root";
+        p.host = "server-name-with-a-very-long-hostname.example.internal"; p.connectionMode = ConnectionMode::Demo;
+        workspace.openOrActivate(p, true);
+        auto *stack = workspace.findChild<QStackedWidget *>("terminalSessionStack");
+        auto *group = stack->currentWidget();
+        auto *first = group->property("activeTerminalPane").value<QWidget *>();
+        auto *shell = first->findChild<SshSession *>(); QTRY_VERIFY(shell->isConnected());
+        workspace.splitActivePane(Qt::Horizontal);
+        auto *second = group->property("activeTerminalPane").value<QWidget *>();
+        QTRY_VERIFY(second->findChild<SshSession *>()->isConnected());
+        QSignalSpy firstChanges(shell, &SshSession::connectionChanged);
+        QSignalSpy secondChanges(second->findChild<SshSession *>(), &SshSession::connectionChanged);
+        for (auto *pane : {first, second}) {
+            auto *view = pane->findChild<TerminalPanel *>()->findChild<TerminalView *>();
+            view->clear(); view->feedText("root@fixture:~# echo compact-header\r\ncompact-header\r\n");
+        }
+        for (int width : {1440, 800, 460}) {
+            workspace.resize(width, 600); QCoreApplication::processEvents();
+            for (auto *pane : {first, second}) {
+                auto *header = pane->findChild<QFrame *>("terminalPaneHeader");
+                auto *identity = pane->findChild<QLabel *>("terminalPaneIdentity");
+                auto *modes = pane->findChild<QTabBar *>("terminalModeTabs");
+                auto *more = pane->findChild<QToolButton *>("terminalPaneMoreButton");
+                auto *close = pane->findChild<QToolButton *>("terminalPaneCloseButton");
+                QCOMPARE(header->height(), 28); QCOMPARE(modes->height(), 22);
+                QVERIFY(modes->tabRect(0).height() <= 22); QVERIFY(modes->tabRect(1).height() <= 22);
+                QVERIFY(!modes->tabIcon(0).isNull() && !modes->tabIcon(1).isNull());
+                QVERIFY(identity->toolTip().contains(p.host));
+                QVERIFY(identity->width() <= 240);
+                QVERIFY(modes->x() <= identity->geometry().right() + 6);
+                QVERIFY(header->rect().contains(modes->geometry()));
+                QVERIFY(header->rect().contains(more->geometry()));
+                QVERIFY(header->rect().contains(close->geometry()));
+                QVERIFY(modes->geometry().right() < more->geometry().left());
+                QCOMPARE(more->size(), QSize(22, 22)); QCOMPARE(close->size(), QSize(22, 22));
+            }
+            const auto directory = qEnvironmentVariable("NOXSHELL_COMPACT_HEADER_SCREENSHOT_DIR");
+            if (!directory.isEmpty()) {
+                QDir().mkpath(directory);
+                QVERIFY(workspace.grab().save(QDir(directory).filePath(QStringLiteral("compact-%1-%2.png").arg(dark ? "dark" : "light").arg(width))));
+            }
+        }
+        auto *modes = first->findChild<QTabBar *>("terminalModeTabs");
+        modes->setCurrentIndex(1); auto *agent = first->findChild<AgentPanel *>();
+        QVERIFY(agent && !agent->taskRunning() && !agent->localProcess()->isRunning());
+        QCOMPARE(first->findChild<QStackedWidget *>("terminalModeStack")->currentWidget(), agent);
+        modes->setCurrentIndex(0);
+        QCOMPARE(first->findChild<AgentPanel *>(), agent);
+        QVERIFY(first->findChild<TerminalPanel *>()->findChild<TerminalView *>()->plainText().contains("compact-header"));
+        QCOMPARE(firstChanges.count(), 0); QCOMPARE(secondChanges.count(), 0);
+        QCOMPARE(credentials.loadCalls, 0);
+    }
+
+    void mergedSessionsKeepConnectionsDraftsAndRestoreTabs_data()
+    {
+        QTest::addColumn<int>("count"); QTest::addColumn<bool>("dark");
+        QTest::newRow("two-light") << 2 << false;
+        QTest::newRow("three-light") << 3 << false;
+        QTest::newRow("three-dark") << 3 << true;
+        QTest::newRow("four-dark") << 4 << true;
+    }
+
+    void mergedSessionsKeepConnectionsDraftsAndRestoreTabs()
+    {
+        QFETCH(int, count); QFETCH(bool, dark);
+        using namespace noxshell; using namespace noxshell::ui;
+        SettingsGuard settingsGuard;
+        AppSettings::instance()->setValue("general/openTerminal", false);
+        AppSettings::instance()->setValue("files/autoSave", false);
+        const auto previous = isApplicationDarkTheme() ? ThemeMode::Dark : ThemeMode::Light;
+        const auto restoreTheme = qScopeGuard([&] { applyApplicationTheme(previous); });
+        applyApplicationTheme(dark ? ThemeMode::Dark : ThemeMode::Light);
+        QTemporaryDir directory; MemoryCredentialStore credentials;
+        ServerRepository repository(directory.filePath("merge.sqlite"), false); QVERIFY(repository.initialize());
+        TerminalWorkspace workspace(&repository, &credentials);
+        workspace.resize(1440, 930); workspace.show();
+        auto *tabs = workspace.sessionTabs();
+        auto *stack = workspace.findChild<QStackedWidget *>("terminalSessionStack");
+        QList<ServerProfile> profiles; QList<QWidget *> original;
+        QList<std::shared_ptr<QSignalSpy>> connectionChanges;
+        QSignalSpy closed(&workspace, &TerminalWorkspace::sessionClosed);
+        for (int i = 0; i < count; ++i) {
+            ServerProfile p; p.id = QStringLiteral("merge-%1").arg(i); p.name = QStringLiteral("演示服务器 %1").arg(i + 1);
+            p.host = QStringLiteral("192.0.2.%1").arg(i + 10); p.user = "fixture"; p.connectionMode = ConnectionMode::Demo;
+            QVERIFY(repository.saveServer(p)); profiles.append(p); workspace.openOrActivate(p, true);
+            auto *pane = stack->currentWidget()->property("activeTerminalPane").value<QWidget *>(); original.append(pane);
+            auto *session = pane->findChild<SshSession *>(); QTRY_VERIFY(session->isConnected());
+            pane->findChild<TerminalView *>()->feedText(QStringLiteral("merge-buffer-%1\r\n").arg(i));
+            connectionChanges.append(std::make_shared<QSignalSpy>(session, &SshSession::connectionChanged));
+        }
+        auto *firstFiles = original.first()->findChild<FilePanel *>();
+        auto *tree = firstFiles->findChild<QTreeWidget *>("remoteFileTree");
+        QTRY_COMPARE(tree->topLevelItemCount(), 8);
+        QTreeWidgetItem *readme = nullptr;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i) if (tree->topLevelItem(i)->text(0) == "README.md") readme = tree->topLevelItem(i);
+        QVERIFY(readme); tree->itemDoubleClicked(readme, 0);
+        auto *editor = original.first()->findChild<RemoteFileEditor *>(); QVERIFY(editor && !editor->isWindow());
+        auto *text = editor->findChild<QPlainTextEdit *>("remoteFileEditorText"); QTRY_VERIFY(text->isEnabled());
+        text->selectAll(); text->insertPlainText("# unsaved merge draft\nkeep: true\n");
+        const auto draft = text->toPlainText();
+        auto *modes = original.first()->findChild<QTabBar *>("terminalModeTabs"); modes->setCurrentIndex(1);
+        auto *agent = original.first()->findChild<AgentPanel *>(); QVERIFY(agent); modes->setCurrentIndex(0);
+        workspace.showSettings(new QWidget); // settings must never enter the merge selection
+        workspace.selectSessionTab(0);
+        QTest::mouseClick(tabs, Qt::LeftButton, Qt::ControlModifier, tabs->tabRect(1).center());
+        QCOMPARE(tabs->property("multiSelectedTabs").toList().size(), 2);
+        if (count > 2) {
+            workspace.selectSessionTab(0);
+            QTest::mouseClick(tabs, Qt::LeftButton, Qt::ShiftModifier, tabs->tabRect(count - 1).center());
+        }
+        QCOMPARE(tabs->property("multiSelectedTabs").toList().size(), count);
+        bool prepared = false;
+        QVERIFY(QMetaObject::invokeMethod(&workspace, "prepareTabContextMenu", Qt::DirectConnection,
+            Q_RETURN_ARG(bool, prepared), Q_ARG(int, count - 1))); QVERIFY(prepared);
+        auto *merge = workspace.findChild<QAction *>("terminalMergeSelectedAction"); QVERIFY(merge->isEnabled()); merge->trigger();
+        QCOMPARE(workspace.sessionCount(), 1); QCOMPARE(tabs->count(), 2); QCOMPARE(workspace.activePaneCount(), count);
+        auto *group = stack->currentWidget();
+        QTRY_VERIFY(original.first()->isVisible()); QTest::qWait(40);
+        const auto rect = [group](QWidget *pane) { return QRect(pane->mapTo(group, QPoint{}), pane->size()); };
+        QVERIFY(rect(original[0]).right() < rect(original[1]).left());
+        QCOMPARE(rect(original[0]).top(), rect(original[1]).top());
+        if (count >= 3) {
+            QVERIFY(rect(original[2]).top() > rect(original[0]).bottom());
+            if (count == 3) QVERIFY(original[2]->width() > original[0]->width() * 1.8);
+        }
+        for (int i = 0; i < count; ++i) {
+            QCOMPARE(original[i]->property("terminalGroupPage").value<QWidget *>(), group);
+            QVERIFY(original[i]->findChild<QWidget *>("fileWorkspacePane")->isHidden());
+            QVERIFY(original[i]->findChild<SshSession *>()->isConnected());
+            const auto buffer = original[i]->findChild<TerminalPanel *>()->findChild<TerminalView *>()->plainText();
+            QVERIFY2(QString(buffer).remove('\n').contains(QStringLiteral("merge-buffer-%1").arg(i)), qPrintable(buffer));
+            QCOMPARE(connectionChanges[i]->count(), 0);
+        }
+        QCOMPARE(repository.loadTerminalState().serverIds.size(), count);
+        QCOMPARE(original.first()->findChild<AgentPanel *>(), agent);
+        QCOMPARE(text->toPlainText(), draft); QVERIFY(text->document()->isModified());
+        QCOMPARE(closed.count(), 0); QCOMPARE(credentials.loadCalls, 0);
+        QVERIFY(workspace.activateExisting(profiles.first().id));
+        workspace.openOrActivate(profiles.last(), true); QCOMPARE(workspace.sessionCount(), 1);
+        for (int mode : {1, 2, 0}) { workspace.arrangeActivePanes(mode); QCoreApplication::processEvents(); QCOMPARE(text->toPlainText(), draft); }
+        auto *root = qobject_cast<QSplitter *>(group->layout()->itemAt(0)->widget()); QVERIFY(root);
+        const auto oldSizes = root->sizes();
+        auto *handle = root->handle(1);
+        const auto move = root->orientation() == Qt::Horizontal ? QPoint(40, 0) : QPoint(0, 40);
+        QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, handle->rect().center());
+        QTest::mouseMove(handle, handle->rect().center() + move);
+        QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, handle->rect().center() + move);
+        QTRY_VERIFY(root->sizes() != oldSizes);
+        const auto capture = qEnvironmentVariable("NOXSHELL_MERGE_SCREENSHOT_DIR");
+        if (!capture.isEmpty()) {
+            QDir().mkpath(capture);
+            QVERIFY(workspace.grab().save(QDir(capture).filePath(QStringLiteral("merge-%1-%2.png").arg(count).arg(dark ? "dark" : "light"))));
+        }
+        original.first()->findChild<QToolButton *>("fileWorkspaceToggleButton")->click();
+        QVERIFY(!original.first()->findChild<QWidget *>("fileWorkspacePane")->isHidden());
+        for (auto *pane : original.mid(1)) QVERIFY(pane->findChild<QWidget *>("fileWorkspacePane")->isHidden());
+        QVERIFY(workspace.activateExisting(profiles.last().id));
+        workspace.unmergeActiveSession(); QCoreApplication::processEvents();
+        QCOMPARE(workspace.sessionCount(), count); QCOMPARE(tabs->count(), count + 1); QCOMPARE(workspace.activePaneCount(), 1);
+        QCOMPARE(stack->currentWidget()->property("activeTerminalPane").value<QWidget *>(), original.last());
+        for (int i = 0; i < count; ++i) { QVERIFY(original[i]->findChild<SshSession *>()->isConnected()); QCOMPARE(connectionChanges[i]->count(), 0); }
+        QCOMPARE(text->toPlainText(), draft); QCOMPARE(closed.count(), 0);
+        auto changed = profiles.first(); changed.host = "new.example.invalid"; workspace.updateServer(changed);
+        QVERIFY(!original.first()->property("serverConfigurationCurrent").toBool());
+        for (auto *pane : original.mid(1)) QVERIFY(pane->property("serverConfigurationCurrent").toBool());
+        const int firstIndex = stack->indexOf(original.first()->property("terminalGroupPage").value<QWidget *>());
+        const int lastIndex = stack->indexOf(original.last()->property("terminalGroupPage").value<QWidget *>());
+        workspace.selectSessionTab(firstIndex); workspace.selectSessionTab(lastIndex, 1); workspace.mergeSelectedSessions();
+        workspace.closeServer(profiles.last().id); // close only this host, never its merged sibling
+        QCOMPARE(closed.count(), 1); QVERIFY(workspace.hasConnectedSession(profiles.first().id));
+        QCOMPARE(text->toPlainText(), draft);
+    }
+
+    void mergeSelectionExcludesSettingsAndCapsPaneCount()
+    {
+        using namespace noxshell; using namespace noxshell::ui;
+        SettingsGuard guard; AppSettings::instance()->setValue("general/openTerminal", false);
+        TerminalWorkspace workspace(nullptr, nullptr);
+        for (int i = 0; i < 9; ++i) {
+            ServerProfile p; p.id = QString::number(i); p.name = p.id; p.connectionMode = ConnectionMode::Demo;
+            workspace.openOrActivate(p, false);
+        }
+        workspace.showSettings(new QWidget);
+        workspace.selectSessionTab(0); workspace.selectSessionTab(9, 2);
+        // Selecting settings clears multi-selection; range across it only includes session pages.
+        QVERIFY(workspace.sessionTabs()->property("multiSelectedTabs").toList().isEmpty());
+        workspace.selectSessionTab(0); workspace.selectSessionTab(8, 2); workspace.mergeSelectedSessions();
+        QCOMPARE(workspace.sessionCount(), 9); QCOMPARE(workspace.activePaneCount(), 1);
+        workspace.selectSessionTab(0); workspace.selectSessionTab(7, 2); workspace.mergeSelectedSessions();
+        QCOMPARE(workspace.sessionCount(), 2); QCOMPARE(workspace.activePaneCount(), 8);
+        workspace.splitActivePane(Qt::Horizontal); QCOMPARE(workspace.activePaneCount(), 8);
+    }
+
+    void tcpLatencyProbeIsSingleFlightAndCancelsSafely()
+    {
+        using noxshell::TcpLatencyProbe;
+        QTcpServer listener, stalledProxy;
+        QVERIFY(listener.listen(QHostAddress::LocalHost));
+        QVERIFY(stalledProxy.listen(QHostAddress::LocalHost));
+        TcpLatencyProbe probe;
+        QSignalSpy starts(&probe, &TcpLatencyProbe::probeStarted);
+        const QNetworkProxy direct(QNetworkProxy::NoProxy);
+        probe.setTarget("127.0.0.1", listener.serverPort(), direct);
+        probe.setActive(true);
+        QCOMPARE(starts.count(), 1);
+        for (int index = 0; index < 20; ++index) {
+            probe.setTarget("127.0.0.1", listener.serverPort(), direct);
+            probe.setActive(true);
+        }
+        QCOMPARE(starts.count(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(!probe.isRunning(), 2000);
+        QVERIFY(QRegularExpression("^\\d+ms$").match(probe.text()).hasMatch());
+        probe.setActive(false);
+        QVERIFY(!probe.isRunning());
+
+        // A local proxy that accepts TCP but never answers SOCKS negotiation.
+        const QNetworkProxy proxy(QNetworkProxy::Socks5Proxy, "127.0.0.1", stalledProxy.serverPort());
+        probe.setTarget("127.0.0.1", listener.serverPort(), proxy);
+        probe.setActive(true);
+        QTRY_VERIFY_WITH_TIMEOUT(stalledProxy.hasPendingConnections(), 2000);
+        QVERIFY(probe.isRunning());
+        probe.setActive(false);
+        QVERIFY(!probe.isRunning());
+        probe.setTarget("127.0.0.1", listener.serverPort(), direct);
+        probe.setActive(true);
+        QTRY_VERIFY_WITH_TIMEOUT(!probe.isRunning(), 2000);
+        QVERIFY(QRegularExpression("^\\d+ms$").match(probe.text()).hasMatch());
+        const auto successful = probe.text();
+        QTest::qWait(30);
+        QCOMPARE(probe.text(), successful); // Cancelled proxy errors cannot overwrite it.
+        probe.setActive(false);
+
+        probe.setTarget("127.0.0.1", listener.serverPort(), proxy);
+        probe.setActive(true);
+        QTRY_VERIFY_WITH_TIMEOUT(!probe.isRunning(), 5000);
+        QCOMPARE(probe.text(), QStringLiteral("—"));
+        QCOMPARE(starts.count(), 4);
+        probe.setActive(false);
+    }
+
+    void latencyBelongsToTopLevelTabsAndOnlyAppearsInInfo_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void latencyBelongsToTopLevelTabsAndOnlyAppearsInInfo()
+    {
+        using namespace noxshell;
+        using namespace noxshell::ui;
+        QFETCH(bool, dark);
+        const auto executable = qEnvironmentVariable("NOXSHELL_AUTH_TEST_SERVER");
+        if (executable.isEmpty()) QSKIP("Requires the loopback-only synthetic SSH fixture");
+        // The existing auth fixture accepts exactly one SSH client. Give
+        // each test session its own listener rather than changing that fixture.
+        QProcess server, siblingServer, otherServer;
+        const auto cleanup = qScopeGuard([&] {
+            for (auto *fixture : {&server, &siblingServer, &otherServer})
+                if (fixture->state() != QProcess::NotRunning) { fixture->kill(); fixture->waitForFinished(2000); }
+        });
+        const auto launch = [&](QProcess &fixture) {
+            fixture.start(executable, {});
+            if (!fixture.waitForStarted(3000)) return QJsonObject{};
+            if (!fixture.canReadLine() && !fixture.waitForReadyRead(5000)) return QJsonObject{};
+            return QJsonDocument::fromJson(fixture.readLine()).object();
+        };
+        const auto endpoint = launch(server);
+        const auto siblingEndpoint = launch(siblingServer);
+        const auto otherEndpoint = launch(otherServer);
+        QVERIFY(endpoint.value("port").toInt() > 0);
+        QVERIFY(siblingEndpoint.value("port").toInt() > 0);
+        QVERIFY(otherEndpoint.value("port").toInt() > 0);
+        SettingsGuard settings;
+        AppSettings::instance()->setValue("general/openTerminal", false);
+        AppSettings::instance()->setValue("general/serverStatus", false);
+        AppSettings::instance()->setValue("general/showLatency", true);
+        AppSettings::instance()->setValue("proxy/mode", "none");
+        AppSettings::instance()->setValue("ui/themeMode", dark ? "dark" : "light");
+        QTemporaryDir directory; MemoryCredentialStore credentials;
+        MainWindow window(directory.filePath("tab-latency.sqlite"), nullptr, &credentials);
+        window.resize(1440, 850); window.show();
+        auto *workspace = window.findChild<TerminalWorkspace *>();
+        workspace->setFileWorkspaceVisible(false);
+        auto *stack = workspace->findChild<QStackedWidget *>("terminalSessionStack");
+        auto *label = window.findChild<QLabel *>("serverLatency");
+        auto *rail = window.findChild<QWidget *>("monitorRail");
+        QVERIFY(label && rail);
+        ServerProfile profile;
+        profile.id = profile.name = "latency-a";
+        profile.host = "127.0.0.1";
+        profile.port = quint16(endpoint.value("port").toInt());
+        profile.user = "fixture-user";
+        profile.credentialRef = "latency-fixture-secret";
+        credentials.secrets.insert(profile.credentialRef, {QStringLiteral("noxshell-integration-test-only"), {}});
+        profile.expectedFingerprint = endpoint.value("fingerprint").toString();
+        profile.connectionMode = ConnectionMode::Ssh;
+        workspace->openOrActivate(profile, true);
+        auto *a = stack->currentWidget();
+        auto *first = a->property("activeTerminalPane").value<QWidget *>();
+        QTRY_VERIFY_WITH_TIMEOUT(first->findChild<SshSession *>()->isConnected(), 8000);
+        auto *probeA = a->findChild<TcpLatencyProbe *>(QString{}, Qt::FindDirectChildrenOnly);
+        QVERIFY(probeA);
+        QTRY_VERIFY_WITH_TIMEOUT(probeA->text().endsWith("ms"), 2000);
+        rail->show();
+        QVERIFY(label->isVisible());
+        QCOMPARE(label->text(), probeA->text());
+        QCOMPARE(window.findChildren<QLabel *>("serverLatency").size(), 1);
+        QSignalSpy startsA(probeA, &TcpLatencyProbe::probeStarted);
+        auto siblingProfile = profile;
+        siblingProfile.port = quint16(siblingEndpoint.value("port").toInt());
+        siblingProfile.expectedFingerprint = siblingEndpoint.value("fingerprint").toString();
+        first->setProperty("nextConnectionProfile", QVariant::fromValue(siblingProfile));
+        workspace->splitActivePane(Qt::Horizontal);
+        auto *second = a->property("activeTerminalPane").value<QWidget *>();
+        QTRY_VERIFY_WITH_TIMEOUT(second->findChild<SshSession *>()->isConnected(), 8000);
+        const int credentialReads = credentials.loadCalls;
+        for (auto *pane : {first, second, first, second}) {
+            QTest::mouseClick(pane->findChild<TerminalView *>(), Qt::LeftButton);
+            QVERIFY(!pane->findChild<QLabel *>("terminalLatency"));
+            QVERIFY(pane->findChildren<TcpLatencyProbe *>().isEmpty());
+            QVERIFY(pane->findChildren<QTcpSocket *>().isEmpty());
+        }
+        QCOMPARE(a->findChildren<TcpLatencyProbe *>().size(), 1);
+        QCOMPARE(startsA.count(), 0);
+        QCOMPARE(credentials.loadCalls, credentialReads);
+        const auto identity = label->parentWidget();
+        auto *address = window.findChild<QLabel *>("serverAddress");
+        auto *badge = window.findChild<QLabel *>("onlineBadge");
+        const auto originalAddress = address->text(), originalLatency = label->text();
+        const int originalWidth = rail->width();
+        address->setText("255.255.255.255");
+        label->setText("3999ms");
+        for (const int width : {236, 252, 360}) {
+            rail->setFixedWidth(width);
+            QCoreApplication::processEvents();
+            QCOMPARE(rail->width(), width);
+            QVERIFY(identity->rect().contains(label->geometry()));
+            QVERIFY(identity->rect().contains(badge->geometry()));
+            QVERIFY(label->geometry().right() < badge->geometry().left());
+            QVERIFY2(address->fontMetrics().horizontalAdvance(address->text()) <= address->width(),
+                qPrintable(QString("rail %1: address needs %2, has %3").arg(width)
+                    .arg(address->fontMetrics().horizontalAdvance(address->text())).arg(address->width())));
+            QVERIFY(label->fontMetrics().horizontalAdvance(label->text()) <= label->width());
+        }
+        rail->setFixedWidth(originalWidth);
+        address->setText(originalAddress); label->setText(originalLatency);
+        QCoreApplication::processEvents();
+        const auto capture = qEnvironmentVariable("NOXSHELL_LATENCY_SCREENSHOT_DIR");
+        if (!capture.isEmpty()) {
+            QDir().mkpath(capture);
+            QVERIFY(window.grab().save(QDir(capture).filePath(dark ? "latency-dark.png" : "latency-light.png")));
+        }
+        auto other = profile; other.id = other.name = "latency-b";
+        other.port = quint16(otherEndpoint.value("port").toInt());
+        other.expectedFingerprint = otherEndpoint.value("fingerprint").toString();
+        workspace->openOrActivate(other, true);
+        auto *b = stack->currentWidget();
+        QTRY_VERIFY_WITH_TIMEOUT(b->findChild<SshSession *>()->isConnected(), 8000);
+        QPointer<TcpLatencyProbe> probeB = b->findChild<TcpLatencyProbe *>(QString{}, Qt::FindDirectChildrenOnly);
+        QVERIFY(probeB);
+        QTRY_VERIFY_WITH_TIMEOUT(probeB->text().endsWith("ms"), 2000);
+        QVERIFY(!probeA->isActive());
+        QVERIFY(probeB->isActive());
+        QCOMPARE(label->text(), probeB->text());
+        workspace->selectSessionTab(0);
+        QVERIFY(probeA->isActive()); QVERIFY(!probeB->isActive());
+        QCOMPARE(startsA.count(), 1);
+        AppSettings::instance()->setValue("general/showLatency", false);
+        QVERIFY(!probeA->isActive()); QVERIFY(label->isHidden());
+        AppSettings::instance()->setValue("general/showLatency", true);
+        QVERIFY(probeA->isActive()); QCOMPARE(startsA.count(), 2);
+        workspace->showServerManager();
+        QVERIFY(!probeA->isActive()); QVERIFY(label->isHidden());
+        workspace->selectSessionTab(0);
+        QVERIFY(probeA->isActive()); QCOMPARE(startsA.count(), 3);
+        workspace->selectSessionTab(1, 1);
+        workspace->mergeSelectedSessions();
+        QCOMPARE(workspace->sessionCount(), 1);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QVERIFY(probeB.isNull());
+        QCOMPARE(workspace->findChildren<TcpLatencyProbe *>().size(), 1);
+        QPointer<TcpLatencyProbe> closing = probeA;
+        QCOMPARE(answerClose([&] { workspace->sessionTabs()->tabCloseRequested(0); }), 1);
+        QVERIFY(!closing->isActive());
+        QVERIFY(label->isHidden());
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QVERIFY(closing.isNull());
+        QVERIFY(workspace->findChildren<TcpLatencyProbe *>().isEmpty());
+    }
+
+    void monitoringBelongsToTheTopLevelTab_data()
+    {
+        QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("dark")<<true;
+    }
+
+    void monitoringBelongsToTheTopLevelTab()
+    {
+        QFETCH(bool,dark);
+        using namespace noxshell;using namespace noxshell::ui;
+        SettingsGuard guard;
+        AppSettings::instance()->setValue("general/openTerminal",false);
+        AppSettings::instance()->setValue("general/serverStatus",false); // No timer-driven samples in this fixture.
+        AppSettings::instance()->setValue("ui/themeMode",dark?"dark":"light");
+        QTemporaryDir directory;MemoryCredentialStore credentials;
+        MainWindow window(directory.filePath("tab-monitor.sqlite"),nullptr,&credentials);
+        window.resize(1500,950);window.show();applyApplicationTheme(dark?ThemeMode::Dark:ThemeMode::Light);
+        auto *workspace=window.findChild<TerminalWorkspace *>();
+        auto *stack=workspace->findChild<QStackedWidget *>("terminalSessionStack");
+        auto *detail=window.findChild<SystemDetailPanel *>();
+        auto *combo=detail->findChild<QComboBox *>("networkInterfaceCombo");
+        auto *tabs=detail->findChild<QTabBar *>("processMetricTabs");
+        auto *chart=static_cast<NetworkRateChart *>(detail->findChild<QWidget *>("networkRateChart"));
+        ServerProfile profile;profile.id="tab-monitor-a";profile.name="演示 A";profile.host="192.0.2.10";
+        profile.user="root";profile.connectionMode=ConnectionMode::Demo;
+        workspace->openOrActivate(profile,true);
+        auto *group=stack->currentWidget();auto *first=group->property("activeTerminalPane").value<QWidget *>();
+        auto *source=first->findChild<SshSession *>();QTRY_VERIFY(source->isConnected());
+        window.findChild<QWidget *>("monitorRail")->show();
+        MetricSample sample;sample.cpuReady=true;sample.cpuPercent=12.5;sample.cpuCoreCount=2;
+        sample.uptimeSeconds=12345;sample.memoryPercent=25;
+        sample.memoryUsedBytes=1ULL<<30;sample.memoryTotalBytes=4ULL<<30;
+        sample.processes={{42,"root",12.5,2.0,1024,"worker"}};
+        sample.disks={{"ext4","/",40ULL<<30,10ULL<<30,30ULL<<30,25}};
+        for(int i=0;i<=60;++i){
+            sample.capturedAt=QDateTime::fromMSecsSinceEpoch(100000+i*1000);
+            sample.networkRates={{"eth0",5500.0+(i%7)*70,5200.0+(i%5)*80},{"lo",0,0}};
+            source->metricSampleReceived(sample);
+        }
+        combo->setCurrentIndex(combo->findData("eth0"));tabs->setCurrentIndex(1);
+        QCOMPARE(chart->rates().size(),61);const auto firstStamp=chart->rates().first().timestampMs;
+        const auto lastStamp=chart->rates().last().timestampMs;
+        const auto upload=chart->rates().last().upload;
+        QSignalSpy connections(source,&SshSession::connectionChanged);
+        QSignalSpy firstRequests(source,&SshSession::collectMetricsRequested);
+        workspace->splitActivePane(Qt::Horizontal);
+        auto *second=group->property("activeTerminalPane").value<QWidget *>();
+        auto *other=second->findChild<SshSession *>();QTRY_VERIFY(other->isConnected());
+        QSignalSpy secondRequests(other,&SshSession::collectMetricsRequested);
+        for(auto *pane:{first,second,first,second}){
+            QTest::mouseClick(pane->findChild<TerminalPanel *>()->findChild<TerminalView *>(),Qt::LeftButton);
+            QCOMPARE(group->property("activeTerminalPane").value<QWidget *>(),pane);
+            QCOMPARE(group->property("monitorTerminalPane").value<QWidget *>(),first);
+            QCOMPARE(chart->rates().size(),61);QCOMPARE(chart->rates().first().timestampMs,firstStamp);
+            QCOMPARE(chart->rates().last().timestampMs,lastStamp);
+            QCOMPARE(combo->currentData().toString(),QString("eth0"));QCOMPARE(tabs->currentIndex(),1);
+        }
+        auto unrelated=sample;unrelated.networkRates={{"wrong-interface",99999,99999}};
+        other->metricSampleReceived(unrelated);
+        QCOMPARE(chart->rates().last().upload,upload);QVERIFY(combo->findData("wrong-interface")<0);
+        sample.capturedAt=sample.capturedAt.addSecs(1);source->metricSampleReceived(sample);
+        const int aCount=chart->rates().size();const auto aLast=chart->rates().last().timestampMs;
+        const auto capture=qEnvironmentVariable("NOXSHELL_TAB_MONITOR_SCREENSHOT_DIR");
+        if(!capture.isEmpty()){
+            QDir().mkpath(capture);QTest::qWait(120);
+            const auto file=QDir(capture).filePath(QStringLiteral("tab-monitor-%1.png").arg(dark?"dark":"light"));
+#ifdef Q_OS_MACOS
+            if(QApplication::platformName()=="cocoa")QVERIFY(nativeProbeCaptureWindow(&window,file));
+            else
+#endif
+                QVERIFY(window.grab().save(file));
+        }
+        auto b=profile;b.id="tab-monitor-b";b.host="192.0.2.20";b.name="演示 B";
+        workspace->openOrActivate(b,true);
+        QPointer<QWidget> bPage=stack->currentWidget();
+        auto *bPane=bPage->property("activeTerminalPane").value<QWidget *>();
+        auto *bSource=bPane->findChild<SshSession *>();
+        QTRY_VERIFY(bSource->isConnected());
+        auto bSample=sample;bSample.capturedAt=QDateTime::fromMSecsSinceEpoch(300000);
+        bSample.networkRates={{"ens3",400,800},{"lo",10,20}};bSource->metricSampleReceived(bSample);
+        combo->setCurrentIndex(combo->findData("lo"));tabs->setCurrentIndex(2);
+        workspace->selectSessionTab(0);
+        QCOMPARE(chart->rates().size(),aCount);QCOMPARE(chart->rates().last().timestampMs,aLast);
+        QCOMPARE(combo->currentData().toString(),QString("eth0"));QCOMPARE(tabs->currentIndex(),1);
+        workspace->selectSessionTab(1);
+        QCOMPARE(chart->rates().size(),1);QCOMPARE(chart->rates().last().timestampMs,qint64(300000));
+        QCOMPARE(combo->currentData().toString(),QString("lo"));QCOMPARE(tabs->currentIndex(),2);
+        workspace->selectSessionTab(0);
+        // Close the pinned pane while its sibling is focused: hand over once
+        // to the same host without throwing away the tab's chart or filters.
+        {CloseDialogResponder responder;
+            first->findChild<QToolButton *>("terminalPaneCloseButton")->click();}
+        QCOMPARE(group->property("monitorTerminalPane").value<QWidget *>(),second);
+        QCOMPARE(chart->rates().size(),aCount);QCOMPARE(chart->rates().last().timestampMs,aLast);
+        QCOMPARE(combo->currentData().toString(),QString("eth0"));
+        sample.capturedAt=sample.capturedAt.addSecs(1);other->metricSampleReceived(sample);
+        QCOMPARE(chart->rates().last().timestampMs,sample.capturedAt.toMSecsSinceEpoch());
+        // Mixed-host merge keeps the destination tab's monitor. Destroying the
+        // old source tab must release its cached view without stale callbacks.
+        workspace->selectSessionTab(0);workspace->selectSessionTab(1,1);workspace->mergeSelectedSessions();
+        QTRY_VERIFY(bPage.isNull());
+        QCOMPARE(group->property("monitorTerminalPane").value<QWidget *>(),second);
+        QTest::mouseClick(bPane->findChild<TerminalPanel *>()->findChild<TerminalView *>(),Qt::LeftButton);
+        QCOMPARE(group->property("activeTerminalPane").value<QWidget *>(),bPane);
+        QCOMPARE(group->property("monitorTerminalPane").value<QWidget *>(),second);
+        QCOMPARE(window.findChild<QLabel *>("serverAddress")->text(),profile.host);
+        QCOMPARE(chart->rates().last().timestampMs,sample.capturedAt.toMSecsSinceEpoch());
+        QCOMPARE(firstRequests.count(),0);QCOMPARE(secondRequests.count(),0);
+        QCOMPARE(credentials.loadCalls,0);
+    }
+
+    void finalSessionCloseHidesAndClearsMonitor_data()
+    {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+
+    void finalSessionCloseHidesAndClearsMonitor()
+    {
+        using namespace noxshell;
+        using namespace noxshell::ui;
+        QFETCH(bool, dark);
+        SettingsGuard guard;
+        AppSettings::instance()->setValue("general/openTerminal", false);
+        AppSettings::instance()->setValue("general/serverStatus", false);
+        AppSettings::instance()->setValue("ui/themeMode", dark ? "dark" : "light");
+        QTemporaryDir directory;
+        MemoryCredentialStore credentials;
+        MainWindow window(directory.filePath("close-monitor.sqlite"), nullptr, &credentials);
+        window.resize(1100, 800);
+        window.show();
+        auto *workspace = window.findChild<TerminalWorkspace *>();
+        auto *rail = window.findChild<QWidget *>("monitorRail");
+        auto *address = window.findChild<QLabel *>("serverAddress");
+        auto *panel = window.findChild<SystemDetailPanel *>();
+        auto *chart = static_cast<NetworkRateChart *>(panel->findChild<QWidget *>("networkRateChart"));
+        ServerProfile profile;
+        profile.id = "close-monitor-a";
+        profile.name = "演示 A";
+        profile.host = "192.0.2.10";
+        profile.user = "root";
+        profile.connectionMode = ConnectionMode::Demo;
+        workspace->openOrActivate(profile, false);
+        auto *source = workspace->findChild<SshSession *>();
+        QVERIFY(source);
+        rail->show();
+        MetricSample sample;
+        sample.capturedAt = QDateTime::fromMSecsSinceEpoch(100000);
+        sample.cpuReady = true;
+        sample.cpuPercent = 25;
+        sample.networkRates = {{"eth0", 1000, 2000}};
+        source->metricSampleReceived(sample);
+        QCOMPARE(chart->rates().size(), 1);
+        QCOMPARE(address->text(), profile.host);
+        {
+            CloseDialogResponder cancel(QMessageBox::Cancel);
+            workspace->sessionTabs()->tabCloseRequested(0);
+            QCOMPARE(cancel.count, 1);
+        }
+        QCOMPARE(workspace->sessionCount(), 1);
+        QVERIFY(rail->isVisible());
+        QCOMPARE(chart->rates().size(), 1);
+        auto other = profile;
+        other.id = "close-monitor-b";
+        other.host = "192.0.2.20";
+        workspace->openOrActivate(other, false);
+        QCOMPARE(workspace->sessionCount(), 2);
+        QCOMPARE(answerClose([&] { workspace->sessionTabs()->tabCloseRequested(1); }), 1);
+        QCOMPARE(workspace->sessionCount(), 1);
+        QVERIFY(rail->isVisible());
+        QCOMPARE(address->text(), profile.host);
+        QCOMPARE(chart->rates().size(), 1);
+        QCOMPARE(answerClose([&] { workspace->sessionTabs()->tabCloseRequested(0); }), 1);
+        QCOMPARE(workspace->sessionCount(), 0);
+        QVERIFY(workspace->isHomePageVisible());
+        QVERIFY(rail->isHidden());
+        QVERIFY(address->text().isEmpty());
+        QVERIFY(address->toolTip().isEmpty());
+        QVERIFY(chart->rates().isEmpty());
+        QVERIFY(panel->viewState().networkHistory.isEmpty());
+        for (auto *row : rail->findChildren<MetricCard *>("metricRow")) {
+            QCOMPARE(row->findChild<QLabel *>("metricValue")->text(), QString("--"));
+            QCOMPARE(row->findChild<QProgressBar *>("metricProgress")->value(), 0);
+        }
+        // The deleted-later source can still send queued results during close.
+        source->metricSampleReceived(sample);
+        QVERIFY(chart->rates().isEmpty());
+        QVERIFY(address->text().isEmpty());
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        workspace->openOrActivate(other, false);
+        QCOMPARE(address->text(), other.host);
+        QVERIFY(chart->rates().isEmpty());
+        rail->show();
+        QVERIFY(rail->isVisible());
+        QCOMPARE(credentials.loadCalls, 0);
+    }
+
+    void splitWorkspaceTracksFocusedPaneAndFiles()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("split.sqlite")), nullptr, &credentials);
+        window.resize(1440, 1000);
+        window.show();
+        QTest::qWait(50);
+        auto *workspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
+        auto *tabs = window.findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
+        auto *stack = window.findChild<QStackedWidget *>(QStringLiteral("terminalSessionStack"));
+        QVERIFY(workspace && tabs && stack);
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane")));
+        if (QApplication::platformName() != QStringLiteral("cocoa")) {
+            auto *titlebar = window.findChild<QWidget *>(QStringLiteral("titlebarTabsHost"));
+            QVERIFY(titlebar && titlebar->isAncestorOf(tabs));
+            QVERIFY(!workspace->isAncestorOf(tabs));
+        }
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("split-demo");
+        profile.name = QStringLiteral("北京");
+        profile.host = QStringLiteral("10.0.0.20");
+        profile.user = QStringLiteral("root");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        workspace->openOrActivate(profile, true);
+        auto *group = stack->currentWidget();
+        auto *first = group->property("activeTerminalPane").value<QWidget *>();
+        QVERIFY(first);
+        auto *firstSession = first->findChild<noxshell::SshSession *>();
+        auto *firstTerminal = first->findChild<noxshell::ui::TerminalView *>();
+        auto *firstFiles = first->findChild<noxshell::ui::FilePanel *>();
+        auto *firstDrawer = first->findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        auto *firstSplit = first->findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
+        QVERIFY(firstFiles && firstDrawer && firstSplit);
+        QTRY_VERIFY_WITH_TIMEOUT(firstSession->isConnected(), 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(firstDrawer->isVisible(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(firstFiles->currentPath(), QStringLiteral("/var/www/app"), 1000);
+        firstTerminal->feedText(QStringLiteral("first-pane-buffer\r\n"));
+        first->findChild<QAction *>(QStringLiteral("terminalSplitVerticalAction"))->trigger();
+        QCOMPARE(workspace->sessionCount(), 1);
+        QCOMPARE(workspace->activePaneCount(), 2);
+        QVERIFY(firstDrawer->isHidden());
+        auto *second = group->property("activeTerminalPane").value<QWidget *>();
+        QVERIFY(second && second != first);
+        auto *secondSession = second->findChild<noxshell::SshSession *>();
+        auto *secondTerminal = second->findChild<noxshell::ui::TerminalView *>();
+        auto *secondFiles = second->findChild<noxshell::ui::FilePanel *>();
+        auto *secondDrawer = second->findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        QVERIFY(secondFiles && secondDrawer && secondFiles != firstFiles);
+        QVERIFY(secondSession != firstSession);
+        QVERIFY(secondDrawer->isHidden());
+        QTRY_VERIFY_WITH_TIMEOUT(secondSession->isConnected(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(secondFiles->currentPath(), QStringLiteral("/var/www/app"), 1000);
+        QCOMPARE(window.findChildren<noxshell::ui::FilePanel *>().size(), 2);
+        QVERIFY(firstFiles->findChild<noxshell::ui::TransferQueuePanel *>()
+            != secondFiles->findChild<noxshell::ui::TransferQueuePanel *>());
+        auto toggleFiles = [](QWidget *pane) {
+            pane->findChild<QToolButton *>(QStringLiteral("fileWorkspaceToggleButton"))->click();
+        };
+        toggleFiles(first);
+        QVERIFY(firstDrawer->isVisible());
+        QVERIFY(secondDrawer->isHidden());
+        toggleFiles(second);
+        QVERIFY(firstDrawer->isVisible() && secondDrawer->isVisible());
+        QTest::qWait(50);
+        const auto firstFileRect = QRect(firstFiles->mapTo(group, QPoint{}), firstFiles->size());
+        const auto secondFileRect = QRect(secondFiles->mapTo(group, QPoint{}), secondFiles->size());
+        QVERIFY(firstFileRect.right() < secondFileRect.left());
+        QVERIFY(firstFiles->mapTo(first, QPoint{}).y() > firstTerminal->mapTo(first, QPoint{}).y());
+        QVERIFY(secondFiles->mapTo(second, QPoint{}).y() > secondTerminal->mapTo(second, QPoint{}).y());
+        // Both drawers stay visible while their independent directory histories change.
+        auto *firstPath = firstFiles->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
+        auto *secondPath = secondFiles->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
+        QVERIFY(firstPath && secondPath);
+        firstPath->setText(QStringLiteral("/var"));
+        QTest::keyClick(firstPath, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(firstFiles->currentPath(), QStringLiteral("/var"), 1000);
+        secondPath->setText(QStringLiteral("/etc"));
+        QTest::keyClick(secondPath, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(secondFiles->currentPath(), QStringLiteral("/etc"), 1000);
+        QCOMPARE(firstFiles->currentPath(), QStringLiteral("/var"));
+        QSignalSpy active(workspace, &noxshell::ui::TerminalWorkspace::activeSessionChanged);
+        QTest::mouseClick(firstPath, Qt::LeftButton);
+        QCOMPARE(group->property("activeTerminalPane").value<QWidget *>(), first);
+        QCOMPARE(activeFilePanel(&window), firstFiles);
+        QVERIFY(!active.isEmpty());
+        QCOMPARE(active.last().at(1).value<noxshell::SshSession *>(), firstSession);
+        QTest::mouseClick(secondPath, Qt::LeftButton);
+        QCOMPARE(activeFilePanel(&window), secondFiles);
+        QVERIFY(firstDrawer->isVisible() && secondDrawer->isVisible());
+        first->findChild<noxshell::ui::TerminalPanel *>()->commandSubmitted(QStringLiteral("cd /tmp"));
+        QTRY_COMPARE_WITH_TIMEOUT(firstFiles->currentPath(), QStringLiteral("/tmp"), 1000);
+        QCOMPARE(secondFiles->currentPath(), QStringLiteral("/etc"));
+        QCOMPARE(activeFilePanel(&window), secondFiles);
+        secondFiles->findChild<QToolButton *>(QStringLiteral("fileBackButton"))->click();
+        QTRY_COMPARE_WITH_TIMEOUT(secondFiles->currentPath(), QStringLiteral("/var/www/app"), 1000);
+        QCOMPARE(firstFiles->currentPath(), QStringLiteral("/tmp"));
+        firstSplit->setSizes({480, 300});
+        const auto savedSizes = firstSplit->sizes();
+        toggleFiles(first);
+        QVERIFY(firstDrawer->isHidden() && secondDrawer->isVisible());
+        toggleFiles(first);
+        QTRY_VERIFY(firstDrawer->isVisible() && secondDrawer->isVisible());
+        QTRY_VERIFY(qAbs(firstSplit->sizes().at(0) - savedSizes.at(0)) <= 2);
+        auto *firstLoading = firstFiles->findChild<QWidget *>(QStringLiteral("fileLoadingOverlay"));
+        auto *secondLoading = secondFiles->findChild<QWidget *>(QStringLiteral("fileLoadingOverlay"));
+        QVERIFY(firstLoading && secondLoading);
+        QTRY_VERIFY_WITH_TIMEOUT(!firstLoading->isVisible() && !secondLoading->isVisible(), 2000);
+        QVERIFY(secondFiles->findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"))->topLevelItemCount() > 0);
+        // Cocoa's cached native window image needs a paint cycle after the
+        // asynchronous directory replies remove their loading overlays.
+        QTest::qWait(120);
+        const auto captureDir = qEnvironmentVariable("NOXSHELL_SPLIT_SCREENSHOT_DIR");
+        if (!captureDir.isEmpty()) {
+#ifdef Q_OS_MACOS
+            if (QApplication::platformName() == QStringLiteral("cocoa"))
+                QVERIFY(nativeProbeCaptureWindow(&window, QDir(captureDir).filePath(QStringLiteral("pane-files-native.png"))));
+            else
+#endif
+                QVERIFY(window.grab().save(QDir(captureDir).filePath(QStringLiteral("pane-files.png"))));
+        }
+        QTest::mouseClick(secondTerminal, Qt::LeftButton);
+        second->findChild<QAction *>(QStringLiteral("terminalSplitHorizontalAction"))->trigger();
+        QCOMPARE(workspace->activePaneCount(), 3);
+        QVERIFY(firstDrawer->isHidden() && secondDrawer->isHidden());
+        auto *third = group->property("activeTerminalPane").value<QWidget *>();
+        auto *thirdSession = third->findChild<noxshell::SshSession *>();
+        auto *thirdFiles = third->findChild<noxshell::ui::FilePanel *>();
+        auto *thirdDrawer = third->findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        QVERIFY(thirdFiles && thirdDrawer && thirdFiles != secondFiles);
+        QTRY_VERIFY_WITH_TIMEOUT(thirdSession->isConnected(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(thirdFiles->currentPath(), QStringLiteral("/var/www/app"), 1000);
+        toggleFiles(first);
+        toggleFiles(third);
+        QVERIFY(firstDrawer->isVisible() && thirdDrawer->isVisible() && secondDrawer->isHidden());
+        QTest::qWait(50);
+        QVERIFY(second->mapTo(group, QPoint{}).y() + second->height() <= third->mapTo(group, QPoint{}).y());
+        QVERIFY(thirdFiles->mapTo(group, QPoint{}).x() > firstFiles->mapTo(group, QPoint{}).x());
+        QCOMPARE(firstFiles->currentPath(), QStringLiteral("/tmp"));
+        auto other = profile;
+        other.id = QStringLiteral("other-demo"); other.name = QStringLiteral("localhost");
+        other.host = QStringLiteral("127.0.0.1");
+        workspace->openOrActivate(other, true);
+        QCOMPARE(workspace->activePaneCount(), 1);
+        QVERIFY(activeFilePanel(&window)->isVisible());
+        tabs->setCurrentIndex(0);
+        QCOMPARE(workspace->activePaneCount(), 3);
+        QVERIFY(firstDrawer->isVisible() && thirdDrawer->isVisible() && secondDrawer->isHidden());
+        QSignalSpy closed(workspace, &noxshell::ui::TerminalWorkspace::sessionClosed);
+        {
+            CloseDialogResponder responder(QMessageBox::Cancel);
+            third->findChild<QToolButton *>(QStringLiteral("terminalPaneCloseButton"))->click();
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(workspace->activePaneCount(), 3);
+        QVERIFY(thirdSession->isConnected());
+        QPointer<noxshell::ui::FilePanel> closedFiles(thirdFiles);
+        {
+            CloseDialogResponder responder;
+            third->findChild<QToolButton *>(QStringLiteral("terminalPaneCloseButton"))->click();
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(workspace->activePaneCount(), 2);
+        QCOMPARE(closed.size(), 1);
+        QTRY_VERIFY(closedFiles.isNull());
+        QVERIFY(firstSession->isConnected() && secondSession->isConnected());
+        QVERIFY(firstDrawer->isVisible());
+        QCOMPARE(firstFiles->currentPath(), QStringLiteral("/tmp"));
+        QVERIFY(QString(firstTerminal->plainText()).remove(QLatin1Char('\n')).contains(QStringLiteral("first-pane-buffer")));
+        {
+            CloseDialogResponder responder;
+            tabs->tabCloseRequested(0);
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(workspace->sessionCount(), 1);
+        QCOMPARE(workspace->activePaneCount(), 1);
+        QCOMPARE(closed.size(), 3);
+        QTRY_COMPARE(window.findChildren<noxshell::ui::FilePanel *>().size(), 1);
+        QCOMPARE(credentials.loadCalls, 0);
+        QCOMPARE(credentials.saveCalls, 0);
+    }
+
+    void nativeSessionTabsLiveInTitlebar()
+    {
+#ifndef Q_OS_MACOS
+        QSKIP("Cocoa-only titlebar");
+#else
+        if (QApplication::platformName() != QStringLiteral("cocoa")) QSKIP("Requires Cocoa");
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MemoryCredentialStore credentials;
+        noxshell::ui::MainWindow window(directory.filePath(QStringLiteral("native-tabs.sqlite")), nullptr, &credentials);
+        window.show();
+        window.activateWindow();
+        QTest::qWait(100);
+        auto *workspace = window.findChild<noxshell::ui::TerminalWorkspace *>();
+        auto *tabs = window.findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
+        QVERIFY(workspace && tabs);
+        noxshell::ServerProfile profile;
+        profile.id = QStringLiteral("native-tabs-first"); profile.name = QStringLiteral("localhost");
+        profile.host = QStringLiteral("127.0.0.1"); profile.user = QStringLiteral("root");
+        profile.connectionMode = noxshell::ConnectionMode::Demo;
+        workspace->openOrActivate(profile, false);
+        profile.id = QStringLiteral("native-tabs-second"); profile.name = QStringLiteral("北京");
+        workspace->openOrActivate(profile, false);
+        QVERIFY(workspace->tabToolbar()->isHidden());
+        QCOMPARE(tabs->currentIndex(), 1);
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTab-0")));
+        QCOMPARE(tabs->currentIndex(), 0);
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTab-1")));
+        QCOMPARE(tabs->currentIndex(), 1);
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTab-0")));
+        QVERIFY(nativeProbeTitlebarSelect(&window, 1, 1));
+        QCOMPARE(tabs->property("multiSelectedTabs").toList().size(), 2);
+        QVERIFY(nativeProbeTitlebarTabMenu(&window, 1, QStringLiteral("terminalMergeSelectedAction")));
+        QCOMPARE(workspace->sessionCount(), 1); QCOMPARE(workspace->activePaneCount(), 2);
+        QVERIFY(nativeProbeTitlebarTabMenu(&window, 0, QStringLiteral("terminalUnmergeAction")));
+        QCOMPARE(workspace->sessionCount(), 2); QCOMPARE(workspace->activePaneCount(), 1);
+        QCOMPARE(tabs->currentIndex(), 1);
+        workspace->showServerManager();
+        QVERIFY(workspace->isHomePageVisible());
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTab-1")));
+        QVERIFY(!workspace->isHomePageVisible());
+        {
+            CloseDialogResponder responder(QMessageBox::Cancel);
+            QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTabClose-1")));
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(workspace->sessionCount(), 2);
+        {
+            CloseDialogResponder responder;
+            QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTabClose-1")));
+            QCOMPARE(responder.count, 1);
+        }
+        QCOMPARE(workspace->sessionCount(), 1);
+        window.resize(1180, 720);
+        for (int index = 0; index < 10; ++index) {
+            profile.id = QStringLiteral("overflow-%1").arg(index);
+            profile.name = QStringLiteral("服务器 %1").arg(index);
+            workspace->openOrActivate(profile, false);
+        }
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTab-0")));
+        QCOMPARE(tabs->currentIndex(), 0);
+        QVERIFY(nativeProbeTitlebarClick(&window, QStringLiteral("sessionTab-10")));
+        QCOMPARE(tabs->currentIndex(), 10);
+        QCOMPARE(credentials.loadCalls, 0);
+#endif
+    }
+
     void mainWindowStartsAndCoreInteractionsWork()
     {
+        SettingsGuard settingsGuard;
+        noxshell::AppSettings::instance()->setValue("tabs/showUser", false);
+        noxshell::AppSettings::instance()->setValue("tabs/showHost", false);
+        noxshell::AppSettings::instance()->setValue("tabs/maxTitleLength", 10);
+        const auto restore=QSettings().value("general/openTerminal");
+        QSettings().setValue("general/openTerminal",false);
+        const auto cleanupRestore=qScopeGuard([&]{if(restore.isValid())QSettings().setValue("general/openTerminal",restore);else QSettings().remove("general/openTerminal");});
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
         const auto databasePath = directory.filePath(QStringLiteral("ui-test.sqlite3"));
@@ -5186,34 +8223,31 @@ private slots:
         QVERIFY(sidebar->isVisible());
 
         auto *mainSplitter = window.findChild<QSplitter *>(QStringLiteral("mainWorkspaceSplitter"));
-        auto *terminalFileSplitter = window.findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
         QVERIFY(mainSplitter);
-        QVERIFY(terminalFileSplitter);
         QCOMPARE(mainSplitter->orientation(), Qt::Horizontal);
-        QCOMPARE(terminalFileSplitter->orientation(), Qt::Vertical);
         QCOMPARE(mainSplitter->count(), 2);
-        QCOMPARE(terminalFileSplitter->count(), 2);
         auto *monitorRail = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
         auto *terminalPane = window.findChild<QWidget *>(QStringLiteral("terminalWorkspacePane"));
-        auto *filePane = window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane")));
         QVERIFY(monitorRail);
-        QVERIFY(monitorRail->isVisible());
-        QTest::mouseClick(monitorToggle, Qt::LeftButton);
-        QVERIFY(!monitorRail->isVisible());
+        QVERIFY(monitorRail->isHidden());
         QVERIFY(monitorToggle->toolTip().contains(QStringLiteral("显示")));
         QTest::mouseClick(monitorToggle, Qt::LeftButton);
         QVERIFY(monitorRail->isVisible());
         QVERIFY(monitorToggle->toolTip().contains(QStringLiteral("隐藏")));
+        QTest::mouseClick(monitorToggle, Qt::LeftButton);
+        QVERIFY(monitorRail->isHidden());
+        QVERIFY(monitorToggle->toolTip().contains(QStringLiteral("显示")));
+        QTest::mouseClick(monitorToggle, Qt::LeftButton);
+        QVERIFY(monitorRail->isVisible());
         QVERIFY(terminalPane);
-        QVERIFY(filePane);
+        QTRY_VERIFY(monitorRail->mapTo(&window, QPoint{}).x() < terminalPane->mapTo(&window, QPoint{}).x());
         const auto monitorPosition = monitorRail->mapTo(&window, QPoint{});
         const auto terminalPosition = terminalPane->mapTo(&window, QPoint{});
         QCOMPARE(monitorPosition.x(), 0);
         QVERIFY(homeTabs->isAncestorOf(sidebar));
         QVERIFY(sidebar->width() > 700);
         QVERIFY(monitorPosition.x() < terminalPosition.x());
-        QVERIFY(filePane->isHidden());
-        QCOMPARE(terminalPane->height(), terminalFileSplitter->height());
 
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("serverHeader")));
         QVERIFY(!window.findChild<QWidget *>(QStringLiteral("terminalHeader")));
@@ -5258,11 +8292,21 @@ private slots:
         QCOMPARE(metricRows.size(), 3);
         for (auto *metricRow : metricRows) {
             QCOMPARE(metricRow->height(), 44);
-            auto *progress = metricRow->findChild<QProgressBar *>();
+            auto *progress = metricRow->findChild<QProgressBar *>(QStringLiteral("metricProgress"));
             QVERIFY(progress);
             QCOMPARE(progress->orientation(), Qt::Horizontal);
-            QCOMPARE(progress->height(), 4);
+            QCOMPARE(progress->height(), 24);
             QVERIFY(!progress->isTextVisible());
+            auto *title = metricRow->findChild<QLabel *>(QStringLiteral("metricTitle"));
+            auto *detail = metricRow->findChild<QLabel *>(QStringLiteral("metricDetail"));
+            auto *value = metricRow->findChild<QLabel *>(QStringLiteral("metricValue"));
+            QVERIFY(title && detail && value);
+            QCOMPARE(detail->parentWidget(), progress);
+            QCOMPARE(value->parentWidget(), progress);
+            QVERIFY(title->geometry().right() < progress->geometry().left());
+            QVERIFY(progress->rect().contains(detail->geometry()));
+            QVERIFY(progress->rect().contains(value->geometry()));
+            QVERIFY(detail->geometry().right() < value->geometry().left());
         }
         metricRows.at(0)->setCoreValues({12.0, 34.0, 56.0, 78.0});
         auto *monitorScroll = window.findChild<QScrollArea *>(QStringLiteral("monitorScrollArea"));
@@ -5327,6 +8371,11 @@ private slots:
         auto *loadingOverlay = window.findChild<QWidget *>(QStringLiteral("terminalLoadingOverlay"));
         auto *historyButton = window.findChild<QToolButton *>(QStringLiteral("commandHistoryButton"));
         auto *fileToggleButton = window.findChild<QToolButton *>(QStringLiteral("fileWorkspaceToggleButton"));
+        auto *filePane = window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        auto *terminalFileSplitter = window.findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
+        QVERIFY(filePane && terminalFileSplitter);
+        QCOMPARE(terminalFileSplitter->count(), 2);
+        QCOMPARE(terminalFileSplitter->orientation(), Qt::Vertical);
         auto *historyPanel = window.findChild<noxshell::ui::CommandHistoryPanel *>(
             QStringLiteral("commandHistoryPanel"));
         QVERIFY(input);
@@ -5472,18 +8521,14 @@ private slots:
         QSignalSpy firstReconnectSpy(firstSession, &noxshell::SshSession::connectionChanged);
         QSignalSpy secondReconnectSpy(secondSession, &noxshell::SshSession::connectionChanged);
 
-        auto *fileStack = window.findChild<QStackedWidget *>(QStringLiteral("fileWorkspaceStack"));
-        QVERIFY(fileStack);
-        const auto activeFileServer = [fileStack] {
-            return fileStack->currentWidget()->findChild<QLabel *>(QStringLiteral("fileServerLabel"));
-        };
+        QVERIFY(activeFilePanel(&window));
         tabs->setCurrentIndex(0);
         QTRY_COMPARE_WITH_TIMEOUT(currentHostName(), QStringLiteral("prod-web-01"), 1000);
         QCOMPARE(address->text(), QStringLiteral("10.0.0.11"));
         QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
-        QVERIFY(activeFileServer());
-        QVERIFY(activeFileServer()->text().contains(QStringLiteral("prod-web-01")));
-        auto *firstPath = fileStack->currentWidget()->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
+        QVERIFY(!activeFilePanel(&window)->findChild<QLabel *>(QStringLiteral("fileServerLabel")));
+        auto *firstFilePanel = activeFilePanel(&window);
+        auto *firstPath = activeFilePanel(&window)->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"));
         QVERIFY(firstPath);
         firstPath->setText(QStringLiteral("/var/www/app"));
         QTest::keyClick(firstPath, Qt::Key_Return);
@@ -5493,12 +8538,13 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(currentHostName(), QStringLiteral("db-master-01"), 1000);
         QCOMPARE(address->text(), QStringLiteral("10.0.0.21"));
         QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
-        QVERIFY(activeFileServer()->text().contains(QStringLiteral("db-master-01")));
+        auto *secondFilePanel = activeFilePanel(&window);
+        QVERIFY(secondFilePanel != firstFilePanel);
 
         // 左侧主机列表不再兼任标签导航，单击只保留列表选中项。
         hosts->setCurrentItem(hostItemForName(QStringLiteral("prod-web-01")));
         QCOMPARE(tabs->currentIndex(), 1);
-        QVERIFY(activeFileServer()->text().contains(QStringLiteral("db-master-01")));
+        QCOMPARE(activeFilePanel(&window), secondFilePanel);
 
         // 终端、监控和 SFTP 只通过终端标签联动，切换不得再次握手或重置文件目录。
         tabs->setCurrentIndex(0);
@@ -5508,10 +8554,10 @@ private slots:
         QCOMPARE(firstReconnectSpy.count(), 0);
         QCOMPARE(secondReconnectSpy.count(), 0);
         QTRY_VERIFY_WITH_TIMEOUT(detailProcesses->topLevelItemCount() > 0, 1000);
-        QVERIFY(activeFileServer()->text().contains(QStringLiteral("prod-web-01")));
-        QCOMPARE(fileStack->currentWidget()->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"))->text(),
+        QCOMPARE(activeFilePanel(&window), firstFilePanel);
+        QCOMPARE(activeFilePanel(&window)->findChild<QLineEdit *>(QStringLiteral("remotePathEdit"))->text(),
             QStringLiteral("/var/www/app"));
-        auto *remoteFiles = fileStack->currentWidget()->findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
+        auto *remoteFiles = activeFilePanel(&window)->findChild<QTreeWidget *>(QStringLiteral("remoteFileTree"));
         QVERIFY(remoteFiles);
         QTRY_VERIFY_WITH_TIMEOUT(remoteFiles->topLevelItemCount() > 0, 1000);
         QVERIFY(window.findChildren<noxshell::SshSession *>(QString{}, Qt::FindDirectChildrenOnly).isEmpty());
@@ -5574,17 +8620,15 @@ private slots:
         auto *history = window.findChild<QTreeWidget *>(QStringLiteral("recentLoginList"));
         auto *monitor = window.findChild<QWidget *>(QStringLiteral("monitorRail"));
         auto *search = window.findChild<QLineEdit *>(QStringLiteral("hostSearch"));
-        auto *splitter = window.findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
-        auto *filePane = window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        QSplitter *splitter = nullptr;
+        QWidget *filePane = nullptr;
         auto *terminalPane = window.findChild<QWidget *>(QStringLiteral("terminalWorkspacePane"));
         QVERIFY(workspace && home && manager && hosts && history && monitor && search);
-        QVERIFY(splitter && filePane && terminalPane);
-        QVERIFY(filePane->isHidden());
-        QVERIFY(splitter->handle(1)->isHidden());
-        QCOMPARE(terminalPane->height(), splitter->height());
+        QVERIFY(terminalPane);
+        QVERIFY(!window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane")));
         QVERIFY(!window.findChild<QToolButton *>(QStringLiteral("sidebarToggleButton")));
         QVERIFY(home->isAncestorOf(manager));
-        QCOMPARE(monitor->mapTo(&window, QPoint{}).x(), 0);
+        QVERIFY(monitor->isHidden());
         QCOMPARE(home->currentIndex(), 0);
         QVERIFY(history->isVisible());
         QVERIFY(!manager->isVisible());
@@ -5599,12 +8643,11 @@ private slots:
         QTest::mouseClick(home->tabBar(), Qt::LeftButton, Qt::NoModifier, home->tabBar()->tabRect(1).center());
         QVERIFY(manager->isVisible());
         QCOMPARE(workspace->width(), terminalWidth);
-        QCOMPARE(terminalPane->height(), splitter->height());
         QVERIFY(manager->width() > 1000);
         QCOMPARE(hosts->columnCount(), 7);
         QVERIFY(!hosts->isHeaderHidden());
-        QVERIFY(hosts->palette().color(QPalette::Base).lightness() < 128);
-        QVERIFY(hosts->palette().color(QPalette::Text).lightness() > 128);
+        QCOMPARE(hosts->palette().color(QPalette::Base), noxshell::ui::workspaceColors(dark).surface);
+        QCOMPARE(hosts->palette().color(QPalette::Text), noxshell::ui::workspaceColors(dark).text);
         QVERIFY(capture(QStringLiteral("servers")));
 
         // Filtering and selecting records only read local configuration.
@@ -5634,6 +8677,9 @@ private slots:
         auto *session = workspace->findChild<noxshell::SshSession *>();
         QVERIFY(session);
         QTRY_VERIFY_WITH_TIMEOUT(session->isConnected(), 1000);
+        splitter = window.findChild<QSplitter *>(QStringLiteral("terminalFileSplitter"));
+        filePane = window.findChild<QWidget *>(QStringLiteral("fileWorkspacePane"));
+        QVERIFY(splitter && filePane);
         QVERIFY(filePane->isVisible());
         QVERIFY(splitter->handle(1)->isVisible());
         window.resize(1440, 900);
@@ -5645,19 +8691,17 @@ private slots:
             return sizes.size() == 2 && qAbs(sizes.at(0) - previousSplit.at(0)) <= 2
                 && qAbs(sizes.at(1) - previousSplit.at(1)) <= 2;
         };
-        auto *fileStack = window.findChild<QStackedWidget *>(QStringLiteral("fileWorkspaceStack"));
-        QVERIFY(fileStack);
-        auto *originalFilePanel = fileStack->currentWidget();
+        QVERIFY(activeFilePanel(&window));
+        auto *originalFilePanel = activeFilePanel(&window);
         QSignalSpy connectionChanges(session, &noxshell::SshSession::connectionChanged);
         auto *terminal = workspace->findChild<noxshell::ui::TerminalView *>();
         QVERIFY(terminal);
         const auto buffer = terminal->plainText();
-        auto *newTab = workspace->findChild<QToolButton *>(QStringLiteral("terminalNewTabButton"));
-        auto *sessions = workspace->findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
+        auto *newTab = window.findChild<QToolButton *>(QStringLiteral("terminalNewTabButton"));
+        auto *sessions = window.findChild<QTabBar *>(QStringLiteral("terminalSessionTabs"));
         QVERIFY(newTab && sessions);
         newTab->click();
-        QVERIFY(filePane->isHidden());
-        QTRY_COMPARE(terminalPane->height(), splitter->height());
+        QVERIFY(!filePane->isVisible());
         QCOMPARE(home->currentIndex(), 1);
         QVERIFY(manager->isVisible());
         home->setCurrentIndex(0);
@@ -5666,7 +8710,7 @@ private slots:
         QVERIFY(terminal->isVisible());
         QVERIFY(filePane->isVisible());
         QTRY_VERIFY(splitRestored());
-        QCOMPARE(fileStack->currentWidget(), originalFilePanel);
+        QCOMPARE(activeFilePanel(&window), originalFilePanel);
         QCOMPARE(terminal->plainText(), buffer);
         QVERIFY(session->isConnected());
         QCOMPARE(connectionChanges.count(), 0);
@@ -5690,11 +8734,11 @@ private slots:
         fileToggle->click();
         QVERIFY(filePane->isVisible());
         QTRY_VERIFY(splitRestored());
+        QPointer<QWidget> closedFilePane(filePane);
         QCOMPARE(answerClose([&] { sessions->tabCloseRequested(0); }), 1);
         QTRY_COMPARE(workspace->sessionCount(), 0);
         QVERIFY(workspace->isHomePageVisible());
-        QVERIFY(filePane->isHidden());
-        QTRY_COMPARE(terminalPane->height(), splitter->height());
+        QTRY_VERIFY(closedFilePane.isNull());
     }
 
     void startupAndHostBrowsingNeverReadCredentials()
@@ -6634,6 +9678,8 @@ private slots:
 
 int main(int argc, char **argv)
 {
+    if(argc==3 && QString::fromLocal8Bit(argv[1])==QStringLiteral("--agent-mcp"))
+        return noxshell::runAgentMcpStdio(argc,argv,QString::fromLocal8Bit(argv[2]));
     // Native probes exercise composition/Esc only; source policy uses a fake
     // backend above, so tests never switch the user's real keyboard layout.
     qputenv("NOXSHELL_DISABLE_TERMINAL_INPUT_SOURCE_SWITCHING", "1");

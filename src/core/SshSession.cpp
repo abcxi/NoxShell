@@ -1,8 +1,11 @@
 #include "SshSession.h"
+#include "AppSettings.h"
+#include <QStandardPaths>
 
 #include "Libssh2Worker.h"
 #include "CredentialStore.h"
 #include "ServerRepository.h"
+#include "ServerTools.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -33,6 +36,21 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     , m_credentialStore(credentialStore)
     , m_worker(new Libssh2Worker)
 {
+    auto *idleTimer = new QTimer(this);
+    idleTimer->setInterval(30000);
+    connect(idleTimer, &QTimer::timeout, this, [this]{
+        if(!m_connected || m_demo || property("codingAgentSession").toBool() || m_activeTransferTaskId
+            || !m_lastTerminalInput.isValid()) return;
+        if(m_lastTerminalInput.elapsed() >= qint64(m_idleMinutes)*60000) {
+            disconnectFromHost();
+            emit outputReceived(QStringLiteral("\n连接因长时间没有键盘输入而断开。\n"));
+        }
+    });
+    idleTimer->start();
+    connect(this,&SshSession::rawOutputReceived,this,&SshSession::logOutput);
+    connect(AppSettings::instance(),&AppSettings::changed,this,[this](const QString &key){
+        if(key=="terminal/sessionLog" && !AppSettings::value(key).toBool())m_sessionLog.close();
+    });
     qRegisterMetaType<ServerProfile>();
     qRegisterMetaType<MetricSample>();
     qRegisterMetaType<RemoteFileEntries>();
@@ -50,6 +68,8 @@ SshSession::SshSession(ServerRepository *repository, CredentialStore *credential
     connect(this, &SshSession::homeDirectoryRequested, m_worker, &Libssh2Worker::resolveHomeDirectory, Qt::QueuedConnection);
     connect(this, &SshSession::listDirectoryRequested, m_worker, &Libssh2Worker::listDirectory, Qt::QueuedConnection);
     connect(this, &SshSession::directorySizeRequested, m_worker, &Libssh2Worker::calculateDirectorySize, Qt::QueuedConnection);
+    connect(this, &SshSession::serverToolRequested, m_worker, &Libssh2Worker::runServerTool, Qt::QueuedConnection);
+    connect(m_worker, &Libssh2Worker::serverToolFinished, this, &SshSession::handleServerToolFinished);
     connect(m_worker, &Libssh2Worker::directorySizeCalculated, this,
         [this](quint64 requestId, const QString &path, quint64 bytes, const QString &error) {
             if (requestId != m_directorySizeRequest || !m_connected) return;
@@ -210,9 +230,11 @@ void SshSession::connectToImpl(const ServerProfile &profile, bool suppliedSecret
     // Public/session metadata must not retain copies of connection credentials.
     m_profile.password.clear();
     m_profile.keyPassphrase.clear();
+    m_profile.transportProxy.setPassword({});
     m_demo = profile.connectionMode == ConnectionMode::Demo;
     m_terminalFullScreen = false;
     m_lastTerminalInput.invalidate();
+    m_idleMinutes=qBound(15,AppSettings::value("terminal/idleMinutes").toInt(),720);
     m_connected = false;
     m_connecting = true;
     m_metricsInFlight = false;
@@ -237,6 +259,15 @@ void SshSession::connectToImpl(const ServerProfile &profile, bool suppliedSecret
     }
 
     auto request = profile;
+    request.transportProxy = AppSettings::proxyFor(profile.host, profile.port);
+    request.remoteShell = AppSettings::value("terminal/shell").toString();
+    const auto proxyRef = AppSettings::value("proxy/credentialRef").toString();
+    if (request.transportProxy.type()!=QNetworkProxy::NoProxy && AppSettings::value("proxy/mode")=="manual"
+        && !proxyRef.isEmpty() && m_credentialStore) {
+        const auto secret=m_credentialStore->load(proxyRef);
+        if(!m_credentialStore->lastError().isEmpty()){m_connecting=false;emit connectionChanged(false,QStringLiteral("代理密码无法读取"));return;}
+        request.transportProxy.setPassword(secret.password);
+    }
     if (request.expectedFingerprint.isEmpty()) {
         request.expectedFingerprint = m_repository ? m_repository->knownHostFingerprint(request.host, request.port) : QString{};
     }
@@ -281,9 +312,26 @@ void SshSession::handleConnectionChanged(bool connected, const QString &message,
     m_connecting = !connected && (message.startsWith(QStringLiteral("正在"))
         || message.startsWith(QStringLiteral("TCP 连接")) || message.startsWith(QStringLiteral("等待确认")));
     const QPointer<SshSession> lifetime(this);
-    if (connected) rememberSuccessfulCredential();
+    if (connected) {m_lastTerminalInput.start();rememberSuccessfulCredential();}
     else if (!m_connecting) m_credentialToRemember.reset();
     if (lifetime && generation == m_transportGeneration) emit connectionChanged(connected, message);
+}
+
+void SshSession::logOutput(const QByteArray &bytes)
+{
+    if(m_demo || !m_connected || !AppSettings::value("terminal/sessionLog").toBool())return;
+    if(!m_sessionLog.isOpen()) {
+        const auto directory=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("session-logs");
+        if(!QDir().mkpath(directory))return;
+        QFile::setPermissions(directory,QFile::ReadOwner|QFile::WriteOwner|QFile::ExeOwner);
+        m_sessionLog.setFileName(QDir(directory).filePath(QDateTime::currentDateTimeUtc().toString("yyyyMMdd-HHmmss-")
+            +QUuid::createUuid().toString(QUuid::WithoutBraces)+".log"));
+        if(!m_sessionLog.open(QIODevice::WriteOnly|QIODevice::NewOnly))return;
+        m_sessionLog.setPermissions(QFile::ReadOwner|QFile::WriteOwner);
+    }
+    // Bound a session log; a new file continues the stream once the limit is reached.
+    if(m_sessionLog.size()>=50*1024*1024){m_sessionLog.close();logOutput(bytes);return;}
+    m_sessionLog.write(bytes);
 }
 
 void SshSession::handlePasswordRejected(quint64 generation)
@@ -326,6 +374,10 @@ void SshSession::rememberSuccessfulCredential()
 
 void SshSession::disconnectFromHost()
 {
+    m_sessionLog.close();
+    cancelServerTool();
+    if (const auto request = std::exchange(m_serverToolRequest, 0))
+        emit serverToolFinished(request, {}, QStringLiteral("连接已切换，任务已取消"));
     cancelDirectorySize();
     m_waitingForPassword = false;
     m_credentialToRemember.reset();
@@ -409,6 +461,7 @@ void SshSession::resizeTerminal(int columns, int rows, int pixelWidth, int pixel
 
 void SshSession::requestMetrics()
 {
+    if (m_serverToolRequest) return;
     // Background exec uses the interactive worker: never enqueue blocking
     // samples while vi/top is active, or while the user is typing.
     if (m_terminalFullScreen || (m_lastTerminalInput.isValid() && m_lastTerminalInput.elapsed() < 1200)) return;
@@ -496,6 +549,13 @@ void SshSession::listDirectory(const QString &path)
 
 quint64 SshSession::calculateDirectorySize(const QString &path)
 {
+    if (m_serverToolRequest) {
+        const auto request = nextFileRequestId();
+        QTimer::singleShot(0, this, [this, request, path] {
+            emit directorySizeCalculated(request, path, 0, QStringLiteral("管理任务运行中，请稍后计算目录"));
+        });
+        return request;
+    }
     cancelDirectorySize();
     const auto request = nextFileRequestId();
     m_directorySizeRequest = request;
@@ -523,8 +583,60 @@ quint64 SshSession::calculateDirectorySize(const QString &path)
 void SshSession::cancelDirectorySize()
 {
     m_directorySizeRequest = 0;
-    m_worker->setDesiredDirectorySizeRequest(0);
+    if (!m_serverToolRequest) m_worker->setDesiredDirectorySizeRequest(0);
     emit directorySizeCanceled();
+}
+
+quint64 SshSession::runServerTool(const QJsonObject &options)
+{
+    // Never queue behind another scan, blocking metric request or transfer.
+    if (!m_connected || m_demo || m_serverToolRequest || m_directorySizeRequest
+        || m_metricsInFlight || m_activeTransferTaskId || !m_pendingDirectories.isEmpty()) return 0;
+    const auto command = detail::serverToolCommand(options);
+    if (command.isEmpty()) return 0;
+    const auto request = nextFileRequestId();
+    m_serverToolRequest = request;
+    m_worker->setDesiredDirectorySizeRequest(request);
+    emit serverToolRequested(request, command);
+    return request;
+}
+
+quint64 SshSession::runAgentCommand(const QString &command)
+{
+    if (!m_connected || m_demo || m_serverToolRequest || m_directorySizeRequest
+        || m_metricsInFlight || m_activeTransferTaskId || !m_pendingDirectories.isEmpty()
+        || command.trimmed().isEmpty() || command.toUtf8().size() > 8192) return 0;
+    const auto request = nextFileRequestId();
+    m_serverToolRequest = request;
+    m_agentCommandRequest = true;
+    m_worker->setDesiredDirectorySizeRequest(request);
+    QByteArray script = "# NOXSHELL_AGENT_COMMAND_V1\n";
+    QFile helper(QStringLiteral(":/tools/agent_command.py"));
+    if (!helper.open(QIODevice::ReadOnly)) {m_serverToolRequest=0;m_agentCommandRequest=false;return 0;}
+    auto source=helper.readAll(); source.replace("'", "'\\''");
+    script += "exec python3 -u -c '" + source + "' '" + command.toUtf8().toBase64() + "'";
+    emit serverToolRequested(request, script);
+    return request;
+}
+
+void SshSession::cancelAgentCommand()
+{
+    if (!m_agentCommandRequest || !m_serverToolRequest) return;
+    m_worker->setDesiredDirectorySizeRequest(0);
+}
+
+void SshSession::handleServerToolFinished(quint64 request, const QByteArray &output, const QString &error)
+{
+    if (!request || request != m_serverToolRequest) return;
+    m_serverToolRequest = 0;
+    m_agentCommandRequest = false;
+    emit serverToolFinished(request, output, error);
+}
+
+void SshSession::cancelServerTool(quint64 expectedRequest)
+{
+    if (m_serverToolRequest && (!expectedRequest || expectedRequest == m_serverToolRequest))
+        m_worker->setDesiredDirectorySizeRequest(0);
 }
 
 void SshSession::requestHomeDirectory()

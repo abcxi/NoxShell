@@ -1,4 +1,6 @@
 #include "TerminalView.h"
+#include <QMessageBox>
+#include "AppTheme.h"
 #include "SearchMarkerScrollBar.h"
 #ifdef Q_OS_MACOS
 #include "MacTerminalInput.h"
@@ -33,6 +35,7 @@
 
 #include <utility>
 #include <algorithm>
+#include <iterator>
 
 namespace noxshell::ui {
 
@@ -42,6 +45,15 @@ constexpr int kContentTop = 10;
 constexpr int kContentRight = 6;
 constexpr int kContentBottom = 8;
 constexpr int kScrollBarWidth = 10;
+
+std::pair<QColor, QColor> cellColors(const TerminalCell &cell,
+    const TerminalColors &colors, bool reverseVideo)
+{
+    QColor foreground = cell.defaultForeground ? colors.foreground : cell.foreground;
+    QColor background = cell.defaultBackground ? colors.background : cell.background;
+    if (cell.inverse != reverseVideo) std::swap(foreground, background);
+    return {foreground, background};
+}
 
 TerminalAppearance normalizedAppearance(TerminalAppearance appearance)
 {
@@ -67,6 +79,17 @@ const QRegularExpression &shellPromptExpression()
         "[^\\s#$]+@[^\\s#$]+)[#$]\\s*"));
     return expression;
 }
+
+bool isAltWordArrow(const QKeyEvent *event)
+{
+    // macOS arrow events carry NumericPad/Function flags even on keyboards
+    // without a numeric keypad. Qt exposes those as KeypadModifier; it is not
+    // an additional user-held modifier like Shift, Control, or Command.
+    auto modifiers = event->modifiers();
+    modifiers.setFlag(Qt::KeypadModifier, false);
+    return modifiers == Qt::AltModifier
+        && (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right);
+}
 }
 
 TerminalView::TerminalView(QWidget *parent)
@@ -82,6 +105,10 @@ TerminalView::TerminalView(QWidget *parent)
     setAutoFillBackground(false);
     setMouseTracking(true);
     setAppearance(defaultAppearance());
+    auto *blink = new QTimer(this); blink->setInterval(500);
+    connect(blink,&QTimer::timeout,this,[this]{if(m_hasFocus && m_cursorBlink){m_cursorOn=!m_cursorOn;update(terminalCursorRect().toAlignedRect().adjusted(-2,-2,2,2));}}); blink->start();
+    connect(AppSettings::instance(),&AppSettings::changed,this,[this](const QString &key){if(key.isEmpty()||key.startsWith("terminal/")||key.startsWith("highlight/"))applyPreferences();});
+    applyPreferences();
     setCursor(Qt::IBeamCursor);
     m_scrollBar = new SearchMarkerScrollBar(Qt::Vertical, this);
     m_scrollBar->setObjectName(QStringLiteral("terminalScrollBar"));
@@ -184,7 +211,7 @@ TerminalView::TerminalView(QWidget *parent)
     m_copyCommandBlockImage->setObjectName(QStringLiteral("terminalCommandBlockCopyImage"));
     m_copyCommandBlockImage->setIcon(QIcon(QStringLiteral(":/assets/copy-image.svg")));
     m_copyCommandBlockImage->setIconSize(QSize(16, 16));
-    m_copyCommandBlockImage->setToolTip(QStringLiteral("复制当前命令及输出为图片"));
+    m_copyCommandBlockImage->setToolTip(QStringLiteral("复制当前命令及输出为图片（最多前 300 行，图片不超过 32 MiB）"));
     for (auto *button : {m_copyCommandBlockText, m_copyCommandBlockImage}) {
         button->setFixedSize(26, 24);
         blockToolsLayout->addWidget(button);
@@ -239,6 +266,7 @@ void TerminalView::setAppearance(const TerminalAppearance &appearance)
     m_appearance = normalizedAppearance(appearance);
     m_font = QFont(m_appearance.fontFamily);
     m_font.setPointSize(m_appearance.pointSize);
+    m_font.setWeight(static_cast<QFont::Weight>(qBound(100,AppSettings::value("terminal/fontWeight").toInt(),900)));
     m_font.setStyleHint(QFont::Monospace);
     m_font.setFixedPitch(true);
 
@@ -251,6 +279,38 @@ void TerminalView::setAppearance(const TerminalAppearance &appearance)
         static_cast<int>(m_cellHeight * 6) + kContentTop + kContentBottom);
     if (m_scrollBar) updateGridSize();
     updateInputMethodGeometry();
+    update();
+}
+
+void TerminalView::setCustomHighlightsEnabled(bool enabled)
+{
+    if (m_customHighlightsEnabled == enabled) return;
+    m_customHighlightsEnabled = enabled;
+    applyPreferences();
+}
+
+void TerminalView::applyPreferences()
+{
+    m_copyOnSelect=AppSettings::value("terminal/copyOnSelect").toBool();
+    m_rightClickPaste=AppSettings::value("terminal/rightClick").toString()=="paste";
+    m_bracketedPaste=AppSettings::value("terminal/bracketedPaste").toBool();
+    m_warnPaste=AppSettings::value("terminal/warnMultilinePaste").toBool();
+    m_wheelArrows=AppSettings::value("terminal/wheelBehavior").toString()=="arrows";
+    m_cursorBlink=AppSettings::value("terminal/cursorBlink").toBool();
+    const auto shape=AppSettings::value("terminal/cursorShape").toString();
+    m_cursorShape=shape=="block"?2:shape=="underline"?4:shape=="beam"?6:0;
+    m_paletteName=AppSettings::value("terminal/palette").toString();
+    m_imageFit=AppSettings::value("terminal/backgroundFit").toString();
+    m_imageOpacity=qBound(0,AppSettings::value("terminal/backgroundOpacity").toInt(),100);
+    m_backgroundImage=QPixmap(AppSettings::value("terminal/backgroundImage").toString());
+    m_highlightRules.clear();
+    const auto rules=AppSettings::highlightRules();
+    for(const auto &rule:rules) if(m_customHighlightsEnabled && rule.enabled && rule.color.isValid() && rule.pattern.size()<=512) {
+        QRegularExpression regex("(*LIMIT_MATCH=10000)(*LIMIT_DEPTH=1000)"+rule.pattern); if(regex.isValid()) m_highlightRules.append({regex,rule.color});
+    }
+    m_model.setHistoryLimit(AppSettings::value("terminal/scrollback").toInt());
+    m_commandPromptIndexDirty = true;
+    if(m_scrollBar)updateScrollBar(false);
     update();
 }
 
@@ -271,6 +331,9 @@ void TerminalView::feedText(const QString &text)
     const bool followBottom = m_scrollBar->value() == m_scrollBar->maximum();
     const bool wasAlternate = m_model.alternateScreen();
     m_model.feed(text);
+    m_commandPromptIndexDirty = true;
+    if (QPoint(m_model.cursorColumn(), m_model.historyLineCount() + m_model.cursorRow()) == m_pendingClickPosition)
+        m_pendingClickPosition = {-1, -1};
     const bool modeChanged = wasAlternate != m_model.alternateScreen();
     if (modeChanged) {
         clearSelection();
@@ -278,6 +341,7 @@ void TerminalView::feedText(const QString &text)
         m_pendingCommand.clear();
         m_pendingCommandCursor = 0;
         m_commandTrackingReliable = true;
+        m_pendingClickPosition = {-1, -1};
         emit fullScreenModeChanged(m_model.alternateScreen());
         rebuildSearchMatches(false, false);
     }
@@ -300,6 +364,8 @@ void TerminalView::clear(bool resetModes)
     const bool wasAlternate = m_model.alternateScreen();
     if (resetModes) m_model.reset();
     else m_model.clear();
+    m_commandPromptIndexDirty = true;
+    m_pendingClickPosition = {-1, -1};
     if (wasAlternate && !m_model.alternateScreen()) emit fullScreenModeChanged(false);
     clearSelection();
     clearHoveredCommandBlock();
@@ -310,9 +376,15 @@ void TerminalView::clear(bool resetModes)
 
 bool TerminalView::event(QEvent *event)
 {
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange
+        || event->type() == QEvent::ApplicationPaletteChange) update();
     if (event->type() == QEvent::EnabledChange && !isEnabled()) cancelPreedit();
     if (event->type() == QEvent::ShortcutOverride) {
         auto *keyEvent = static_cast<QKeyEvent *>(event);
+        if (isAltWordArrow(keyEvent)) {
+            keyEvent->accept();
+            return true;
+        }
         const bool commandModifier = keyEvent->modifiers().testFlag(Qt::MetaModifier)
             || keyEvent->modifiers().testFlag(Qt::ControlModifier);
         if (commandModifier
@@ -374,10 +446,20 @@ bool TerminalView::eventFilter(QObject *watched, QEvent *event)
 void TerminalView::paintEvent(QPaintEvent *event)
 {
     QPainter painter(this);
-    const QColor defaultForeground(QStringLiteral("#D0DBE5"));
-    const QColor defaultBackground(QStringLiteral("#0C1825"));
+    auto colors = terminalColors(m_paletteName=="light"?false:m_paletteName=="follow"?isApplicationDarkTheme():true);
+    if(m_paletteName=="solarized"){colors.background=QColor("#002B36");colors.foreground=QColor("#839496");colors.cursor=QColor("#93A1A1");}
+    if(m_paletteName=="dracula"){colors.background=QColor("#282A36");colors.foreground=QColor("#F8F8F2");colors.cursor=QColor("#BD93F9");}
+    const auto &defaultForeground = colors.foreground;
+    const auto &defaultBackground = colors.background;
     const bool reverseVideo = m_model.reverseVideo();
     painter.fillRect(rect(), reverseVideo ? defaultForeground : defaultBackground);
+    if(!reverseVideo && !m_backgroundImage.isNull() && m_imageOpacity>0){
+        painter.save();painter.setOpacity(m_imageOpacity/100.0);
+        if(m_imageFit=="tile")painter.drawTiledPixmap(rect(),m_backgroundImage);
+        else if(m_imageFit=="stretch")painter.drawPixmap(rect(),m_backgroundImage);
+        else {const auto size=m_backgroundImage.size().scaled(this->size(),m_imageFit=="contain"?Qt::KeepAspectRatio:Qt::KeepAspectRatioByExpanding);painter.drawPixmap(QRect((width()-size.width())/2,(height()-size.height())/2,size.width(),size.height()),m_backgroundImage);}
+        painter.restore();
+    }
     painter.setClipRect(QRectF(kContentLeft, kContentTop,
         qMax(0, width() - kContentLeft - kContentRight - kScrollBarWidth),
         qMax(0, height() - kContentTop - kContentBottom)));
@@ -394,17 +476,28 @@ void TerminalView::paintEvent(QPaintEvent *event)
             ++visibleMatchIndex;
         if (!event->rect().intersects(QRect(0, kContentTop + row * m_cellHeight, width(), qCeil(m_cellHeight)))) continue;
         int rowMatchIndex = visibleMatchIndex;
+        QVector<QColor> highlights(m_model.columns());
+        if(!m_model.alternateScreen() && !m_highlightRules.isEmpty()) {
+            const auto text=m_model.documentLineText(documentLine,false);
+            QVector<int> textOffsets; textOffsets.reserve(m_model.columns()); int offset=0;
+            for(int col=0;col<m_model.columns();++col){textOffsets.append(offset); const auto &c=m_model.documentCell(documentLine,col); if(!c.wideContinuation)offset+=c.text.size();}
+            for(const auto &[regex,color]:m_highlightRules){
+                auto matches=regex.globalMatch(text);
+                while(matches.hasNext()){const auto match=matches.next();if(!match.capturedLength())continue;
+                    for(int col=0;col<highlights.size();++col)if(textOffsets[col]>=match.capturedStart()&&textOffsets[col]<match.capturedEnd()&&!highlights[col].isValid())highlights[col]=color;
+                }
+            }
+        }
         for (int column = 0; column < m_model.columns(); ++column) {
             const auto &cell = m_model.documentCell(documentLine, column);
             if (cell.wideContinuation) continue;
-            QColor foreground = cell.inverse ? cell.background : cell.foreground;
-            QColor background = cell.inverse ? cell.foreground : cell.background;
-            if (reverseVideo) std::swap(foreground, background);
+            auto [foreground, background] = cellColors(cell, colors, reverseVideo);
+            if (cell.defaultForeground && !cell.inverse && highlights[column].isValid()) foreground=highlights[column];
             const bool wide = column + 1 < m_model.columns() && m_model.documentCell(documentLine, column + 1).wideContinuation;
             const QRectF cellRect(kContentLeft + column * m_cellWidth, kContentTop + row * m_cellHeight,
                 wide ? m_cellWidth * 2 : m_cellWidth, m_cellHeight);
             if (background != (reverseVideo ? defaultForeground : defaultBackground)) painter.fillRect(cellRect, background);
-            if (isSelected(documentLine, column)) painter.fillRect(cellRect, QColor(49, 84, 119, 180));
+            if (isSelected(documentLine, column)) painter.fillRect(cellRect, colors.selection);
             while (rowMatchIndex < m_searchMatches.size()
                 && m_searchMatches.at(rowMatchIndex).line == documentLine
                 && m_searchMatches.at(rowMatchIndex).endColumn <= column) {
@@ -422,7 +515,7 @@ void TerminalView::paintEvent(QPaintEvent *event)
             if (cell.text == QLatin1String(" ") && !cell.underline) continue;
             if (cell.bold != bold || cell.underline != underline) {
                 auto font = m_font;
-                font.setBold(cell.bold);
+                font.setWeight(cell.bold ? QFont::Bold : m_font.weight());
                 font.setUnderline(cell.underline);
                 painter.setFont(font);
                 bold = cell.bold;
@@ -439,21 +532,21 @@ void TerminalView::paintEvent(QPaintEvent *event)
     }
 
     const int cursorRow = m_model.historyLineCount() + m_model.cursorRow() - firstLine;
-    if (m_preedit.isEmpty() && m_model.cursorVisible() && cursorRow >= 0 && cursorRow < m_model.rows()) {
+    if ((!m_hasFocus || !m_cursorBlink || m_cursorOn) && m_preedit.isEmpty() && m_model.cursorVisible() && cursorRow >= 0 && cursorRow < m_model.rows()) {
         QRectF caret(kContentLeft + m_model.cursorColumn() * m_cellWidth,
             kContentTop + cursorRow * m_cellHeight + 2.0, m_cellWidth, qMax(2.0, m_cellHeight - 4.0));
-        const QColor color(QStringLiteral("#7DB1DE"));
+        const auto &color = colors.cursor;
         if (!m_hasFocus) {
             painter.setPen(color);
             painter.drawRect(caret.adjusted(0.5, 0.5, -0.5, -0.5));
-        } else if (m_model.cursorStyle() <= 2) {
+        } else if ((m_cursorShape ? m_cursorShape : m_model.cursorStyle()) <= 2) {
             painter.fillRect(caret, color);
             painter.setFont(m_font);
             painter.setPen(defaultBackground);
             painter.drawText(QPointF(caret.left(), kContentTop + cursorRow * m_cellHeight + m_ascent),
                 m_model.cell(m_model.cursorRow(), m_model.cursorColumn()).text);
         } else {
-            if (m_model.cursorStyle() <= 4) caret.setTop(caret.bottom() - 2.0);
+            if ((m_cursorShape ? m_cursorShape : m_model.cursorStyle()) <= 4) caret.setTop(caret.bottom() - 2.0);
             else caret.setWidth(2.0);
             painter.fillRect(caret, color);
         }
@@ -463,8 +556,8 @@ void TerminalView::paintEvent(QPaintEvent *event)
         const auto origin = layoutPreedit(layout);
         const auto line = layout.lineAt(0);
         painter.fillRect(QRectF(origin, QSizeF(line.naturalTextWidth() + 3, m_cellHeight)),
-            QColor(QStringLiteral("#17354A")));
-        painter.setPen(QColor(QStringLiteral("#E3F3FF")));
+            colors.preeditBackground);
+        painter.setPen(colors.preeditForeground);
         layout.draw(&painter, origin);
         if (m_preeditCursorVisible) layout.drawCursor(&painter, origin, m_preeditCursor, 2);
     }
@@ -646,7 +739,7 @@ void TerminalView::findPrevious()
     update();
 }
 
-TerminalView::CommandBlock TerminalView::commandBlockAt(const QPointF &position) const
+TerminalView::CommandBlock TerminalView::commandBlockAt(const QPointF &position)
 {
     CommandBlock block;
     if (!m_scrollBar || m_model.alternateScreen() || (m_searchBar && m_searchBar->isVisible())) return block;
@@ -656,27 +749,23 @@ TerminalView::CommandBlock TerminalView::commandBlockAt(const QPointF &position)
     if (!contentRect.contains(position)) return block;
 
     const int hoveredLine = documentPosition(position).y();
-    constexpr int maximumScanLines = 256;
-    for (int line = hoveredLine; line >= qMax(0, hoveredLine - maximumScanLines); --line) {
-        const auto text = m_model.documentLineText(line);
-        const auto match = shellPromptExpression().match(text);
-        if (!match.hasMatch()) continue;
-        // A bare prompt starts a new, not-yet-executed region. It must not
-        // make the previous command appear hovered.
-        if (text.mid(match.capturedEnd()).trimmed().isEmpty()) return block;
-        block.startLine = line;
-        break;
+    // Cache prompt boundaries rather than imposing a 256-line command limit.
+    // The model bounds scrollback to 10,000 lines; mouse motion without new
+    // output only does a binary search, and vi never builds this index.
+    if (m_commandPromptIndexDirty) {
+        m_commandPromptLines.clear();
+        for (int line = 0; line < m_model.documentLineCount(); ++line)
+            if (shellPromptExpression().match(m_model.documentLineText(line)).hasMatch())
+                m_commandPromptLines.append(line);
+        m_commandPromptIndexDirty = false;
     }
-    if (block.startLine < 0) return {};
-
-    block.endLine = m_model.documentLineCount() - 1;
-    for (int line = block.startLine + 1; line < m_model.documentLineCount(); ++line) {
-        if (line > block.startLine + maximumScanLines) return {};
-        if (shellPromptExpression().match(m_model.documentLineText(line)).hasMatch()) {
-            block.endLine = line - 1;
-            break;
-        }
-    }
+    auto next = std::upper_bound(m_commandPromptLines.cbegin(), m_commandPromptLines.cend(), hoveredLine);
+    if (next == m_commandPromptLines.cbegin()) return {};
+    block.startLine = *std::prev(next);
+    const auto prompt = m_model.documentLineText(block.startLine);
+    const auto match = shellPromptExpression().match(prompt);
+    if (prompt.mid(match.capturedEnd()).trimmed().isEmpty()) return {};
+    block.endLine = next == m_commandPromptLines.cend() ? m_model.documentLineCount() - 1 : *next - 1;
     while (block.endLine > block.startLine
         && m_model.documentLineText(block.endLine).trimmed().isEmpty()) {
         --block.endLine;
@@ -752,12 +841,17 @@ QImage TerminalView::commandBlockImage(const CommandBlock &block) const
     constexpr int imagePadding = 10;
     constexpr int maximumRenderedLines = 300;
     const int lineCount = qMin(maximumRenderedLines, block.endLine - block.startLine + 1);
-    const int imageWidth = qMax(1,
-        width() - kContentLeft - kContentRight - kScrollBarWidth + imagePadding * 2);
-    const int imageHeight = qMax(1, qCeil(lineCount * m_cellHeight) + imagePadding * 2);
+    const int imageWidth = qBound(1,
+        width() - kContentLeft - kContentRight - kScrollBarWidth + imagePadding * 2, 16384);
+    constexpr int maximumPixels = 8 * 1024 * 1024;
+    const int imageHeight = qBound(1, qCeil(lineCount * m_cellHeight) + imagePadding * 2, maximumPixels / imageWidth);
     QImage image(imageWidth, imageHeight, QImage::Format_ARGB32_Premultiplied);
-    const QColor defaultForeground(QStringLiteral("#D0DBE5"));
-    const QColor defaultBackground(QStringLiteral("#0C1825"));
+    if (image.isNull()) return {};
+    auto colors = terminalColors(m_paletteName=="light"?false:m_paletteName=="follow"?isApplicationDarkTheme():true);
+    if(m_paletteName=="solarized"){colors.background=QColor("#002B36");colors.foreground=QColor("#839496");colors.cursor=QColor("#93A1A1");}
+    if(m_paletteName=="dracula"){colors.background=QColor("#282A36");colors.foreground=QColor("#F8F8F2");colors.cursor=QColor("#BD93F9");}
+    const auto &defaultForeground = colors.foreground;
+    const auto &defaultBackground = colors.background;
     const bool reverseVideo = m_model.reverseVideo();
     image.fill(reverseVideo ? defaultForeground : defaultBackground);
 
@@ -769,9 +863,7 @@ QImage TerminalView::commandBlockImage(const CommandBlock &block) const
         for (int column = 0; column < m_model.columns(); ++column) {
             const auto &cell = m_model.documentCell(documentLine, column);
             if (cell.wideContinuation) continue;
-            QColor foreground = cell.inverse ? cell.background : cell.foreground;
-            QColor background = cell.inverse ? cell.foreground : cell.background;
-            if (reverseVideo) std::swap(foreground, background);
+            auto [foreground, background] = cellColors(cell, colors, reverseVideo);
             const bool wide = column + 1 < m_model.columns()
                 && m_model.documentCell(documentLine, column + 1).wideContinuation;
             const QRectF cellRect(imagePadding + column * m_cellWidth,
@@ -781,7 +873,7 @@ QImage TerminalView::commandBlockImage(const CommandBlock &block) const
                 painter.fillRect(cellRect, background);
             }
             auto font = m_font;
-            font.setBold(cell.bold);
+            font.setWeight(cell.bold ? QFont::Bold : m_font.weight());
             font.setUnderline(cell.underline);
             painter.setFont(font);
             painter.setPen(foreground);
@@ -804,21 +896,47 @@ void TerminalView::copyHoveredCommandBlockImage()
     if (!image.isNull()) QApplication::clipboard()->setImage(image);
 }
 
+void TerminalView::suspendGridResize()
+{
+    ++m_gridResizeSuspensions;
+}
+
+void TerminalView::resumeGridResize()
+{
+    if (m_gridResizeSuspensions == 0 || --m_gridResizeSuspensions > 0) return;
+    updateGridSize();
+    updateInputMethodGeometry();
+}
+
 void TerminalView::updateGridSize()
 {
+    if (m_gridResizeSuspensions > 0) return;
     const int contentWidth = qMax(1, width() - kContentLeft - kContentRight - kScrollBarWidth);
     const int contentHeight = qMax(1, height() - kContentTop - kContentBottom);
     const int columns = qMax(2, static_cast<int>(contentWidth / m_cellWidth));
     const int rows = qMax(2, static_cast<int>(contentHeight / m_cellHeight));
     if (columns == m_model.columns() && rows == m_model.rows()) return;
     m_model.resize(columns, rows);
+    m_commandPromptIndexDirty = true;
+    m_pendingClickPosition = {-1, -1};
+    clearSelection();
+    clearHoveredCommandBlock();
     updateScrollBar(true);
+    if (!m_model.alternateScreen() && m_searchBar->isVisible()) rebuildSearchMatches(true, false);
     emit terminalSizeChanged(columns, rows, contentWidth, contentHeight);
     update();
 }
 
 QByteArray TerminalView::keySequence(QKeyEvent *event) const
 {
+    if (isAltWordArrow(event)) {
+        const bool left = event->key() == Qt::Key_Left;
+        // Readline's default word bindings in ordinary shells; keep modified
+        // arrows intact in TUIs rather than injecting Escape + a vi command.
+        if (m_model.alternateScreen() || m_model.applicationCursorKeys())
+            return left ? "\x1b[1;3D" : "\x1b[1;3C";
+        return left ? QByteArray("\x1b" "b") : QByteArray("\x1b" "f");
+    }
     switch (event->key()) {
     case Qt::Key_Return: case Qt::Key_Enter: return "\r";
     case Qt::Key_Backspace: return QByteArray(1, '\x7f');
@@ -862,6 +980,11 @@ QByteArray TerminalView::keySequence(QKeyEvent *event) const
 
 void TerminalView::keyPressEvent(QKeyEvent *event)
 {
+    m_cursorOn=true;
+    if (!m_preedit.isEmpty() && isAltWordArrow(event)) {
+        event->accept(); // Do not move the remote cursor behind an IME candidate.
+        return;
+    }
     if (event->key() == Qt::Key_Escape) cancelPreedit();
     else if (!m_preedit.isEmpty()
         && (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
@@ -894,6 +1017,7 @@ void TerminalView::keyPressEvent(QKeyEvent *event)
     }
     const auto sequence = keySequence(event);
     if (!sequence.isEmpty()) {
+        m_pendingClickPosition = {-1, -1};
         clearSelection();
         trackKeyForCommand(event);
         emit inputGenerated(sequence);
@@ -905,6 +1029,7 @@ void TerminalView::keyPressEvent(QKeyEvent *event)
 
 void TerminalView::contextMenuEvent(QContextMenuEvent *event)
 {
+    if (m_rightClickPaste) {if(isEnabled())sendPaste(QApplication::clipboard()->text());event->accept();return;}
     if (!m_contextMenu) return;
     m_copyAction->setEnabled(hasSelection());
     m_pasteAction->setEnabled(isEnabled() && !QApplication::clipboard()->text().isEmpty());
@@ -916,6 +1041,11 @@ void TerminalView::contextMenuEvent(QContextMenuEvent *event)
 void TerminalView::trackKeyForCommand(QKeyEvent *event)
 {
     if (m_model.alternateScreen()) return;
+    if (event->key() == Qt::Key_Escape || isAltWordArrow(event)) {
+        // Word boundaries are chosen by the remote shell, not a local guess.
+        m_commandTrackingReliable = false;
+        return;
+    }
     if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
         submitTrackedCommand();
         return;
@@ -1000,14 +1130,104 @@ void TerminalView::submitTrackedCommand()
 
 QString TerminalView::commandFromCurrentScreenLine() const
 {
-    const int lineIndex = m_model.historyLineCount() + m_model.cursorRow();
-    auto line = m_model.documentLineText(lineIndex, false).left(m_model.cursorColumn());
+    // Include the suffix after the cursor and physical soft-wrapped rows.
+    // Enter can submit a command while its cursor is still in the middle.
+    const auto input = shellInputLine();
+    if (input.cursorCell >= 0) return input.command;
+    // Preserve history capture for simple custom $/# prompts too, without
+    // enabling heuristic mouse relocation in such ambiguous regions.
+    const auto line = m_model.documentLineText(m_model.historyLineCount() + m_model.cursorRow());
     static const QRegularExpression promptExpression(
         QStringLiteral("(?:\\[[^\\]]+\\][#$]|[^\\s]+@[^\\s]+:[^\\s]*[#$]|[#$])\\s+"));
-    auto iterator = promptExpression.globalMatch(line);
+    auto matches = promptExpression.globalMatch(line);
     int commandStart = -1;
-    while (iterator.hasNext()) commandStart = iterator.next().capturedEnd();
+    while (matches.hasNext()) commandStart = matches.next().capturedEnd();
     return commandStart >= 0 ? line.mid(commandStart) : QString{};
+}
+
+TerminalView::ShellInputLine TerminalView::shellInputLine() const
+{
+    ShellInputLine input;
+    if (m_model.alternateScreen() || m_model.applicationCursorKeys()
+        || m_model.mouseTracking() != VtTerminalModel::MouseTracking::None
+        || !m_model.cursorVisible() || m_model.cursorWrapPending() || !m_preedit.isEmpty()) return input;
+    const int cursorLine = m_model.historyLineCount() + m_model.cursorRow();
+    int first = cursorLine, last = cursorLine;
+    constexpr int maximumRows = 32, maximumCells = 4096;
+    while (first > 0 && m_model.documentLineWrapLength(first - 1) >= 0) {
+        if (cursorLine - --first >= maximumRows) return {};
+    }
+    while (m_model.documentLineWrapLength(last) >= 0 && last + 1 < m_model.documentLineCount()) {
+        if (++last - first >= maximumRows) return {};
+    }
+    QString text;
+    QVector<int> textOffsets;
+    int lastColumn = 0;
+    for (int line = first; line <= last; ++line) {
+        int columns = m_model.documentLineWrapLength(line);
+        if (columns < 0) {
+            columns = m_model.columns();
+            while (columns > 0) {
+                const auto &cell = m_model.documentCell(line, columns - 1);
+                if (cell.wideContinuation || cell.text != QStringLiteral(" ")) break;
+                --columns;
+            }
+            if (line == cursorLine) columns = qMax(columns, m_model.cursorColumn());
+        }
+        if (text.size() + columns > maximumCells) return {};
+        for (int column = 0; column < columns; ++column) {
+            const auto &cell = m_model.documentCell(line, column);
+            if (cell.wideContinuation) continue;
+            // A combining sequence/ZWJ cluster can have shell-specific motion
+            // semantics. Refuse it instead of guessing an arrow count.
+            if (cell.text.toUcs4().size() != 1) return {};
+            textOffsets.append(text.size());
+            input.characterCells.append({column, line});
+            text += cell.text;
+        }
+        lastColumn = columns;
+    }
+    textOffsets.append(text.size());
+    input.characterCells.append({lastColumn, last});
+    const auto prompt = shellPromptExpression().match(text);
+    if (!prompt.hasMatch()) return {};
+    input.command = text.mid(prompt.capturedEnd());
+    input.firstInputCell = int(std::lower_bound(textOffsets.cbegin(), textOffsets.cend(), prompt.capturedEnd()) - textOffsets.cbegin());
+    input.cursorCell = input.characterCells.indexOf({m_model.cursorColumn(), cursorLine});
+    if (input.cursorCell < input.firstInputCell) return {};
+    return input;
+}
+
+bool TerminalView::moveShellCursorTo(const QPointF &position)
+{
+    if (!m_scrollBar || m_scrollBar->value() != m_scrollBar->maximum()
+        || m_pendingClickPosition.x() >= 0 || m_searchBar->isVisible()) return false;
+    const QRectF content(kContentLeft, kContentTop,
+        width() - kContentLeft - kContentRight - kScrollBarWidth,
+        height() - kContentTop - kContentBottom);
+    if (!content.contains(position)) return false;
+    const auto input = shellInputLine();
+    if (input.cursorCell < 0 || input.command.isEmpty()) return false;
+    const auto clicked = documentPosition(position);
+    const auto first = input.characterCells.at(input.firstInputCell);
+    const auto last = input.characterCells.last();
+    if (clicked.y() < first.y() || clicked.y() > last.y()
+        || (clicked.y() == first.y() && clicked.x() < first.x())) return false;
+    int target = input.firstInputCell;
+    for (int index = target; index < input.characterCells.size(); ++index) {
+        const auto cell = input.characterCells.at(index);
+        if (cell.y() > clicked.y() || (cell.y() == clicked.y() && cell.x() > clicked.x())) break;
+        target = index;
+    }
+    const int distance = target - input.cursorCell;
+    if (qAbs(distance) > 512) return false;
+    clearSelection();
+    m_commandTrackingReliable = false;
+    if (distance != 0) {
+        m_pendingClickPosition = input.characterCells.at(target);
+        emit inputGenerated(QByteArray(distance < 0 ? "\x1b[D" : "\x1b[C").repeated(qAbs(distance)));
+    }
+    return true;
 }
 
 void TerminalView::updateScrollBar(bool followBottom)
@@ -1083,6 +1303,11 @@ QByteArray TerminalView::mouseReport(int button, const QPointF &position, bool r
 void TerminalView::mousePressEvent(QMouseEvent *event)
 {
     setFocus();
+    if (event->button() == Qt::LeftButton && event->modifiers() == Qt::AltModifier
+        && moveShellCursorTo(event->position())) {
+        event->accept();
+        return;
+    }
     if (event->button() == Qt::RightButton) {
         // Reserve right-click for the local copy/paste menu, even when the
         // remote application has enabled terminal mouse reporting.
@@ -1140,6 +1365,7 @@ void TerminalView::mouseReleaseEvent(QMouseEvent *event)
         m_pressedMouseButton = -1;
     }
     m_selecting = false;
+    if(m_copyOnSelect && hasSelection())copySelection();
     event->accept();
 }
 
@@ -1167,6 +1393,9 @@ void TerminalView::wheelEvent(QWheelEvent *event)
     if (shouldReportMouse(event->modifiers())) {
         const int button = event->angleDelta().y() > 0 ? 64 : 65;
         emit inputGenerated(mouseReport(button, event->position()));
+    } else if(m_model.alternateScreen() && m_wheelArrows) {
+        const int steps=event->angleDelta().y()/120;
+        for(int i=0;i<qMin(30,qAbs(steps)*3);++i)emit inputGenerated(steps>0?QByteArray("\x1b[A"):QByteArray("\x1b[B"));
     } else {
         const int steps = event->angleDelta().y() / 120;
         m_scrollBar->setValue(m_scrollBar->value() - steps * 3);
@@ -1177,17 +1406,20 @@ void TerminalView::wheelEvent(QWheelEvent *event)
 void TerminalView::sendPaste(const QString &text)
 {
     if (text.isEmpty()) return;
+    if(m_warnPaste && (text.contains('\n')||text.contains('\r')) && QMessageBox::warning(this,QStringLiteral("确认多行粘贴"),QStringLiteral("即将发送多行文本，可能执行多条命令。是否继续？"),QMessageBox::Yes|QMessageBox::Cancel,QMessageBox::Cancel)!=QMessageBox::Yes)return;
     cancelPreedit();
+    m_pendingClickPosition = {-1, -1};
     clearSelection();
     trackTextForCommand(text);
     auto payload = text.toUtf8();
-    if (m_model.bracketedPaste()) payload = QByteArray("\x1b[200~") + payload + QByteArray("\x1b[201~");
+    if (m_bracketedPaste && m_model.bracketedPaste()) payload = QByteArray("\x1b[200~") + payload + QByteArray("\x1b[201~");
     emit inputGenerated(payload);
 }
 
 void TerminalView::sendInterrupt()
 {
     cancelPreedit();
+    m_pendingClickPosition = {-1, -1};
     clearSelection();
     m_pendingCommand.clear();
     m_pendingCommandCursor = 0;

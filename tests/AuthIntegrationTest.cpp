@@ -152,6 +152,77 @@ class AuthIntegrationTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void serverToolsResult_data()
+    {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("normal") << QStringLiteral("normal");
+        QTest::newRow("dependency-missing") << QStringLiteral("error");
+        QTest::newRow("output-bounded") << QStringLiteral("oversized");
+    }
+    void serverToolsResult()
+    {
+        QFETCH(QString, mode);
+        LocalSshServer server;
+        QVERIFY(server.start({"-directory-size-mode", mode}));
+        noxshell::Libssh2Worker worker; trustLocalFixture(worker); worker.connectTo(fixtureProfile(server.port));
+        QSignalSpy result(&worker, &noxshell::Libssh2Worker::serverToolFinished);
+        worker.setDesiredDirectorySizeRequest(1);
+        worker.runServerTool(1, "# NOXSHELL_SERVER_TOOLS_V1");
+        QTRY_COMPARE_WITH_TIMEOUT(result.size(), 1, 6000);
+        if (mode == "normal") {
+            QVERIFY(result.first().at(2).toString().isEmpty());
+            QVERIFY(QJsonDocument::fromJson(result.first().at(1).toByteArray()).isObject());
+        } else QVERIFY(!result.first().at(2).toString().isEmpty());
+        QVERIFY(result.first().at(1).toByteArray().size() <= 262144);
+        worker.disconnectFromHost();
+    }
+    void serverToolsCancellationAndStaleRequestKeepTerminalAlive()
+    {
+        LocalSshServer server;
+        QVERIFY(server.start({"-directory-size-mode", "normal", "-shell-mode", "echo", "-extra-channel-delay-ms", "100"}));
+        noxshell::Libssh2Worker worker; trustLocalFixture(worker); worker.connectTo(fixtureProfile(server.port));
+        QSignalSpy result(&worker, &noxshell::Libssh2Worker::serverToolFinished);
+        QByteArray terminal;
+        connect(&worker, &noxshell::Libssh2Worker::rawOutputReceived, &worker, [&](const QByteArray &data) { terminal += data; });
+        worker.setDesiredDirectorySizeRequest(1);
+        worker.runServerTool(1, "# NOXSHELL_SERVER_TOOLS_V1 TOOL_WAIT");
+        QTRY_VERIFY_WITH_TIMEOUT(([&] {
+            server.readEvents(); return std::any_of(server.events.cbegin(), server.events.cend(), [](const auto &e) { return e.value("event") == "tool_started"; });
+        }()), 3000);
+        worker.sendInput("vi-keeps-input\n");
+        QTRY_VERIFY_WITH_TIMEOUT(terminal.contains("vi-keeps-input"), 1500);
+        worker.setDesiredDirectorySizeRequest(0);
+        QTRY_COMPARE_WITH_TIMEOUT(result.size(), 1, 3000);
+        QVERIFY(!result.first().at(2).toString().isEmpty());
+        worker.sendInput("after-tool-cancel\n");
+        QTRY_VERIFY_WITH_TIMEOUT(terminal.contains("after-tool-cancel"), 1500);
+        worker.runServerTool(2, "# NOXSHELL_SERVER_TOOLS_V1"); // canceled before dispatch
+        QCOMPARE(result.size(), 2);
+        worker.setDesiredDirectorySizeRequest(3);
+        worker.runServerTool(3, "# NOXSHELL_SERVER_TOOLS_V1");
+        QTRY_COMPARE_WITH_TIMEOUT(result.size(), 3, 3000);
+        QVERIFY(result.last().at(2).toString().isEmpty());
+        QVERIFY(!terminal.contains("198.51.100.2")); // Exec output never leaks to PTY.
+        worker.disconnectFromHost();
+    }
+
+    void serverToolsUnresponsiveOpenHasHardDeadline()
+    {
+        LocalSshServer server;
+        QVERIFY(server.start({"-directory-size-mode", "normal", "-extra-channel-delay-ms", "30000"}));
+        noxshell::Libssh2Worker worker; trustLocalFixture(worker); worker.connectTo(fixtureProfile(server.port));
+        QSignalSpy result(&worker, &noxshell::Libssh2Worker::serverToolFinished);
+        QSignalSpy states(&worker, &noxshell::Libssh2Worker::connectionChanged);
+        worker.setDesiredDirectorySizeRequest(1);
+        QElapsedTimer elapsed; elapsed.start();
+        worker.runServerTool(1, "# NOXSHELL_SERVER_TOOLS_V1");
+        QTRY_COMPARE_WITH_TIMEOUT(result.size(), 1, 21000);
+        QVERIFY(elapsed.elapsed() < 20500);
+        QVERIFY(!result.first().at(2).toString().isEmpty());
+        QVERIFY(!states.isEmpty());
+        QCOMPARE(states.last().at(0).toBool(), false);
+    }
+
     void directorySizeResult_data()
     {
         QTest::addColumn<QString>("mode");

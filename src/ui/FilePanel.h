@@ -20,6 +20,7 @@ class QAction;
 class QTreeWidgetItem;
 class QEvent;
 class QCheckBox;
+class QSplitter;
 
 namespace noxshell {
 class SshSession;
@@ -27,7 +28,6 @@ class SshSession;
 
 namespace noxshell::ui {
 
-class RemoteFileEditor;
 class RemotePathEdit;
 class TransferQueuePanel;
 
@@ -42,10 +42,17 @@ public:
     void updateServer(const ServerProfile &profile);
     void syncDirectoryFromTerminalCommand(const QString &command);
     [[nodiscard]] QString currentPath() const { return m_currentPath; }
+    void setExpanded(bool expanded);
+
+signals:
+    void expansionRequested(bool expanded);
+    void closeWorkspaceRequested();
+    void fileOpenRequested(const QString &remotePath);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
     void changeEvent(QEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
     void navigateTo(const QString &path, bool addToHistory = true);
@@ -61,6 +68,8 @@ private:
     void navigateUp();
     void uploadFile();
     void uploadLocalFiles(const QStringList &localPaths, const QString &remoteDirectory);
+    void uploadCheckedFiles(const QStringList &localPaths,const QString &destination,const RemoteFileEntries &entries);
+    QHash<QString,QStringList> m_pendingUploads;
     void downloadSelected();
     void createFile();
     void createDirectory();
@@ -84,7 +93,6 @@ private:
     static QString normalizePath(const QString &path);
 
     QPointer<SshSession> m_session;
-    QLabel *m_serverLabel{};
     QLabel *m_statusLabel{};
     RemotePathEdit *m_pathEdit{};
     QTreeWidget *m_directoryTree{};
@@ -96,6 +104,7 @@ private:
     QToolButton *m_refreshButton{};
     QToolButton *m_transferQueueButton{};
     QCheckBox *m_autoSize{};
+    QToolButton *m_expandButton{};
     int m_sortIndex{0};
     QPersistentModelIndex m_pressedSizeAction;
     QMenu *m_contextMenu{};
@@ -106,7 +115,6 @@ private:
     QAction *m_renameAction{};
     QAction *m_removeAction{};
     QAction *m_permissionsAction{};
-    RemoteFileEditor *m_fileEditor{};
     TransferQueuePanel *m_transferQueuePanel{};
     ServerProfile m_profile;
     QString m_currentPath{QStringLiteral("/")};

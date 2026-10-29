@@ -1,6 +1,8 @@
 #pragma once
 
 #include "VtTerminalModel.h"
+#include "../core/AppSettings.h"
+#include <QPixmap>
 
 #include <QPointF>
 #include <QRectF>
@@ -46,11 +48,15 @@ public:
     static void setDefaultAppearance(const TerminalAppearance &appearance);
     void setAppearance(const TerminalAppearance &appearance);
     [[nodiscard]] TerminalAppearance appearance() const { return m_appearance; }
+    void setCustomHighlightsEnabled(bool enabled);
+    [[nodiscard]] bool customHighlightsEnabled() const { return m_customHighlightsEnabled; }
 
     void feedData(const QByteArray &data);
     void feedText(const QString &text);
     void clear(bool resetModes = false);
     void clearSelection();
+    void suspendGridResize();
+    void resumeGridResize();
     [[nodiscard]] QString plainText() const { return m_model.plainText(); }
     [[nodiscard]] QString selectedText() const;
     [[nodiscard]] int historyLineCount() const { return m_model.historyLineCount(); }
@@ -106,6 +112,13 @@ private:
         [[nodiscard]] bool isValid() const { return startLine >= 0 && endLine >= startLine; }
     };
 
+    struct ShellInputLine {
+        QString command;
+        QVector<QPoint> characterCells;
+        int firstInputCell{-1};
+        int cursorCell{-1};
+    };
+
     void updateGridSize();
     void cancelPreedit();
     void updateInputMethodGeometry();
@@ -121,7 +134,7 @@ private:
     void positionCommandBlockTools();
     void copyHoveredCommandBlockText();
     void copyHoveredCommandBlockImage();
-    [[nodiscard]] CommandBlock commandBlockAt(const QPointF &position) const;
+    [[nodiscard]] CommandBlock commandBlockAt(const QPointF &position);
     [[nodiscard]] QString commandBlockText(const CommandBlock &block) const;
     [[nodiscard]] QImage commandBlockImage(const CommandBlock &block) const;
     [[nodiscard]] int columnForTextOffset(int line, int offset) const;
@@ -133,6 +146,8 @@ private:
     void trackTextForCommand(const QString &text);
     void submitTrackedCommand();
     [[nodiscard]] QString commandFromCurrentScreenLine() const;
+    [[nodiscard]] ShellInputLine shellInputLine() const;
+    bool moveShellCursorTo(const QPointF &position);
     void updateScrollBar(bool followBottom);
     [[nodiscard]] QPoint documentPosition(const QPointF &position) const;
     [[nodiscard]] bool hasSelection() const;
@@ -141,6 +156,14 @@ private:
     [[nodiscard]] bool shouldReportMouse(Qt::KeyboardModifiers modifiers) const;
     [[nodiscard]] QByteArray keySequence(QKeyEvent *event) const;
 
+    void applyPreferences();
+    bool m_copyOnSelect{}, m_rightClickPaste{}, m_bracketedPaste{true}, m_warnPaste{}, m_wheelArrows{true};
+    bool m_cursorBlink{true}, m_cursorOn{true};
+    int m_cursorShape{}, m_imageOpacity{20};
+    QString m_paletteName, m_imageFit;
+    QPixmap m_backgroundImage;
+    QList<QPair<QRegularExpression,QColor>> m_highlightRules;
+    bool m_customHighlightsEnabled{true};
     VtTerminalModel m_model;
     QStringDecoder m_decoder{QStringDecoder::Utf8};
     QFont m_font;
@@ -149,6 +172,7 @@ private:
     qreal m_cellHeight{};
     qreal m_ascent{};
     bool m_hasFocus{false};
+    int m_gridResizeSuspensions{};
     bool m_tabKeyDown{false};
     QString m_preedit;
     QList<QTextLayout::FormatRange> m_preeditFormats;
@@ -184,6 +208,9 @@ private:
     QString m_pendingCommand;
     int m_pendingCommandCursor{};
     bool m_commandTrackingReliable{true};
+    QPoint m_pendingClickPosition{-1, -1};
+    QVector<int> m_commandPromptLines;
+    bool m_commandPromptIndexDirty{true};
     CommandBlock m_hoveredCommandBlock;
     QPointF m_lastMousePosition{-1, -1};
 };

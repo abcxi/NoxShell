@@ -10,6 +10,8 @@
 #include <QHash>
 #include <QThread>
 #include <QElapsedTimer>
+#include <QJsonObject>
+#include <QFile>
 
 #include <optional>
 
@@ -39,6 +41,11 @@ public:
     void listDirectory(const QString &path);
     quint64 calculateDirectorySize(const QString &path);
     void cancelDirectorySize();
+    quint64 runServerTool(const QJsonObject &options);
+    quint64 runAgentCommand(const QString &command);
+    void cancelAgentCommand();
+    void cancelServerTool(quint64 expectedRequest = 0);
+    [[nodiscard]] bool serverToolBusy() const { return m_serverToolRequest != 0; }
     void uploadFile(const QString &localPath, const QString &remotePath);
     void downloadFile(const QString &remotePath, const QString &localPath);
     quint64 readFile(const QString &remotePath, quint64 maxBytes = 4 * 1024 * 1024);
@@ -74,6 +81,8 @@ signals:
     void listDirectoryRequested(quint64 requestId, const QString &path);
     void directorySizeRequested(quint64 requestId, const QString &path);
     void directorySizeCanceled();
+    void serverToolRequested(quint64 requestId, const QByteArray &command);
+    void serverToolFinished(quint64 requestId, const QByteArray &output, const QString &error);
     void uploadFileRequested(quint64 requestId, const QString &localPath, const QString &remotePath, quint64 bytesPerSecond);
     void downloadFileRequested(quint64 requestId, const QString &remotePath, const QString &localPath, quint64 bytesPerSecond);
     void readFileRequested(quint64 requestId, const QString &remotePath, quint64 maxBytes);
@@ -107,6 +116,7 @@ signals:
     void transferQueueReset();
 
 private slots:
+    void handleServerToolFinished(quint64 request, const QByteArray &output, const QString &error);
     void handleConnectionChanged(bool connected, const QString &message, quint64 generation);
     void handlePasswordRejected(quint64 generation);
 
@@ -128,6 +138,9 @@ private:
     void restoreTransferQueue();
     [[nodiscard]] qsizetype transferIndex(quint64 taskId) const;
 
+    QFile m_sessionLog;
+    int m_idleMinutes{120};
+    void logOutput(const QByteArray &bytes);
     ServerProfile m_profile;
     bool m_connected{false};
     bool m_terminalFullScreen{false};
@@ -147,6 +160,8 @@ private:
     quint32 m_directoryRequestSerial{};
     QHash<QString, quint64> m_pendingDirectories;
     quint64 m_directorySizeRequest{};
+    quint64 m_serverToolRequest{};
+    bool m_agentCommandRequest{};
     QHash<QString, RemoteFileEntries> m_demoFileOverrides;
     QHash<QString, QByteArray> m_demoFileContents;
     QVector<FileTransferTask> m_transferQueue;

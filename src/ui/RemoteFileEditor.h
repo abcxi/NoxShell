@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QDialog>
+#include <QWidget>
 #include <QVector>
 
 class QCloseEvent;
@@ -19,7 +19,7 @@ class SshSession;
 
 namespace noxshell::ui {
 
-class RemoteFileEditor final : public QDialog {
+class RemoteFileEditor final : public QWidget {
     Q_OBJECT
 
 public:
@@ -33,6 +33,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
     void changeEvent(QEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
     struct Document;
@@ -69,6 +70,7 @@ private:
     QToolButton *m_undoButton{};
     QToolButton *m_redoButton{};
     QToolButton *m_wrapButton{};
+    QToolButton *m_findButton{};
     QWidget *m_findPanel{};
     QWidget *m_replaceRow{};
     QLineEdit *m_findEdit{};

@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
 endif()
 
-project(NoxShell VERSION 0.2.82 LANGUAGES CXX)
+project(NoxShell VERSION 0.2.92 LANGUAGES CXX)
 
 if(APPLE)
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
@@ -50,6 +50,17 @@ endif()
 qt_standard_project_setup()
 
 set(NOXSHELL_CORE_SOURCES
+    src/core/TcpLatencyProbe.cpp
+    src/core/TcpLatencyProbe.h
+    src/core/LocalAgentProcess.cpp
+    src/core/LocalAgentProcess.h
+    src/core/AgentMcpStdio.cpp
+    src/core/AgentMcpStdio.h
+    src/core/AppSettings.cpp
+    src/core/ProxyTunnel.cpp
+    src/core/AppSettings.h
+    src/core/ServerTools.cpp
+    src/core/ServerTools.h
     src/core/AppLogger.cpp
     src/core/AppLogger.h
     src/core/CredentialStore.cpp
@@ -128,6 +139,14 @@ qt_add_executable(NoxShell
     src/ui/NetworkRateChart.h
     src/ui/TerminalPanel.cpp
     src/ui/TerminalPanel.h
+    src/ui/ServerToolsDialog.cpp
+    src/ui/ServerToolsDialog.h
+    src/ui/SoftwareInstallDialog.cpp
+    src/ui/SoftwareInstallDialog.h
+    src/ui/AgentPanel.cpp
+    src/ui/AgentPanel.h
+    src/ui/SettingsPage.cpp
+    src/ui/SettingsPage.h
     src/ui/TerminalSettingsDialog.cpp
     src/ui/TerminalSettingsDialog.h
     src/ui/TerminalWorkspace.cpp
@@ -142,6 +161,9 @@ qt_add_executable(NoxShell
 
 target_link_libraries(NoxShell PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql Qt6::Svg Qt6::Widgets ${NOXSHELL_LIBSSH2_TARGET})
 target_compile_definitions(NoxShell PRIVATE NOXSHELL_APP_VERSION="${PROJECT_VERSION}")
+if(UNIX AND NOT APPLE)
+    target_link_libraries(NoxShell PRIVATE util)
+endif()
 if(WIN32)
     target_link_libraries(NoxShell PRIVATE Advapi32 Ws2_32)
 endif()
@@ -169,16 +191,21 @@ if(BUILD_TESTING)
     if(NOXSHELL_BUILD_AUTH_INTEGRATION_TESTS)
         qt_add_executable(NoxShellAuthIntegrationTest
             tests/AuthIntegrationTest.cpp
+            src/core/AppSettings.cpp
+    src/core/ProxyTunnel.cpp src/core/AppSettings.h
             src/core/Libssh2Worker.cpp src/core/Libssh2Worker.h
             src/core/DirectorySizeCommand.cpp src/core/DirectorySizeCommand.h
             src/core/RemoteDirectoryFallback.cpp src/core/RemoteDirectoryFallback.h
         )
-        target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Qt6::Core Qt6::Network Qt6::Test ${NOXSHELL_LIBSSH2_TARGET})
+        target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Test ${NOXSHELL_LIBSSH2_TARGET})
         if(WIN32)
             target_link_libraries(NoxShellAuthIntegrationTest PRIVATE Ws2_32)
         endif()
         add_test(NAME auth_integration COMMAND NoxShellAuthIntegrationTest -v1)
         set_tests_properties(auth_integration PROPERTIES TIMEOUT 120)
+    endif()
+    if(UNIX AND NOT APPLE)
+        link_libraries(util)
     endif()
     qt_add_executable(NoxShellSmokeTest
         tests/SmokeTest.cpp
@@ -223,7 +250,15 @@ if(BUILD_TESTING)
         src/ui/NetworkRateChart.h
         src/ui/TerminalPanel.cpp
         src/ui/TerminalPanel.h
-        src/ui/TerminalSettingsDialog.cpp
+        src/ui/ServerToolsDialog.cpp
+        src/ui/ServerToolsDialog.h
+        src/ui/SoftwareInstallDialog.cpp
+        src/ui/SoftwareInstallDialog.h
+        src/ui/AgentPanel.cpp
+    src/ui/AgentPanel.h
+    src/ui/SettingsPage.cpp
+    src/ui/SettingsPage.h
+    src/ui/TerminalSettingsDialog.cpp
         src/ui/TerminalSettingsDialog.h
         src/ui/TerminalWorkspace.cpp
         src/ui/TerminalWorkspace.h
@@ -245,6 +280,14 @@ if(BUILD_TESTING)
         target_link_libraries(NoxShellSmokeTest PRIVATE OpenSSL::Crypto "-framework Cocoa" "-framework Security" "-framework Carbon")
     endif()
     add_test(NAME ui_smoke COMMAND NoxShellSmokeTest -v1)
+    find_package(Python3 3.8 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND UNIX)
+        add_test(NAME server_tools_helper COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ServerToolsTest.py")
+        add_test(NAME software_packages_helper COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/SoftwarePackagesTest.py")
+        set_tests_properties(software_packages_helper PROPERTIES TIMEOUT 20)
+        add_test(NAME agent_command_helper COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/AgentCommandTest.py")
+        set_tests_properties(agent_command_helper PROPERTIES TIMEOUT 15)
+    endif()
     set_tests_properties(ui_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
 

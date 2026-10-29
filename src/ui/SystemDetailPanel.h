@@ -17,10 +17,18 @@ class SystemDetailPanel final : public QFrame {
     Q_OBJECT
 
 public:
+    struct ViewState {
+        MetricSample sample;
+        QHash<QString, QVector<NetworkRatePoint>> networkHistory;
+        QString selectedInterface;
+        int processTab{};
+    };
     explicit SystemDetailPanel(QWidget *parent = nullptr);
 
     void setSample(const MetricSample &sample);
     void reset(const QString &detail);
+    [[nodiscard]] ViewState viewState() const;
+    void restoreViewState(const ViewState &state);
 
 private:
     void refreshNetwork();

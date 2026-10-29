@@ -188,6 +188,24 @@ func main() {
 					if err := ssh.Unmarshal(request.Payload, &payload); err != nil {
 						return
 					}
+					if strings.Contains(payload.Command, "NOXSHELL_SERVER_TOOLS_V1") {
+						report("tool_started", nil)
+						var status uint32
+						if strings.Contains(payload.Command, "TOOL_WAIT") {
+							<-inputDone
+							report("tool_stopped", nil)
+							status = 130
+						} else if *sizeMode == "oversized" {
+							_, _ = channel.Write(bytes.Repeat([]byte("x"), 300*1024))
+						} else if *sizeMode == "error" {
+							_, _ = io.WriteString(channel.Stderr(), "python3: unavailable\n")
+							status = 127
+						} else {
+							_, _ = io.WriteString(channel, "{\"rows\":[{\"ip\":\"198.51.100.2\",\"connections\":200}]}\n")
+						}
+						_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+						return
+					}
 					if strings.Contains(payload.Command, "NOXSHELL_DIRECTORY_SIZE_V1") {
 						waiting := *sizeMode == "mixed" && strings.Contains(payload.Command, "p='/wait'")
 						report("size_started", map[string]any{"waiting": waiting})

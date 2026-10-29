@@ -7,6 +7,7 @@
 #include <QListView>
 #include <QTabBar>
 #include <QSet>
+#include <QSignalBlocker>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
@@ -75,8 +76,10 @@ SystemDetailPanel::SystemDetailPanel(QWidget *parent)
     m_networkInterface->setMaxVisibleItems(8);
     auto *networkView = new QListView(m_networkInterface);
     networkView->setUniformItemSizes(true);
+    networkView->setMinimumWidth(160);
     networkView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_networkInterface->setView(networkView);
+    m_networkInterface->addItem(QStringLiteral("全部网卡"), QStringLiteral("__all__"));
     networkHeader->addWidget(networkTitle);
     networkHeader->addStretch();
     networkHeader->addWidget(m_networkInterface);
@@ -85,22 +88,22 @@ SystemDetailPanel::SystemDetailPanel(QWidget *parent)
     auto *rateRow = new QWidget;
     rateRow->setObjectName(QStringLiteral("networkRateRow"));
     auto *rateLayout = new QHBoxLayout(rateRow);
-    rateLayout->setContentsMargins(0, 1, 0, 0);
-    rateLayout->setSpacing(8);
+    rateLayout->setContentsMargins(0, 0, 0, 0);
+    rateLayout->setSpacing(4);
     m_uploadRate = new QLabel(QStringLiteral("↑ --"));
     m_uploadRate->setObjectName(QStringLiteral("networkUploadRate"));
     m_uploadRate->setAccessibleName(QStringLiteral("上传速率"));
-    m_uploadRate->setToolTip(QStringLiteral("上传速率"));
+    m_uploadRate->setToolTip(QStringLiteral("上传速率 · 蓝色实线"));
     m_downloadRate = new QLabel(QStringLiteral("↓ --"));
     m_downloadRate->setObjectName(QStringLiteral("networkDownloadRate"));
     m_downloadRate->setAccessibleName(QStringLiteral("下载速率"));
-    m_downloadRate->setToolTip(QStringLiteral("下载速率"));
-    m_downloadRate->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_downloadRate->setToolTip(QStringLiteral("下载速率 · 橙色虚线"));
+    m_uploadRate->setAlignment(Qt::AlignCenter);
+    m_downloadRate->setAlignment(Qt::AlignCenter);
     rateLayout->addWidget(m_uploadRate, 1);
     rateLayout->addWidget(m_downloadRate, 1);
-    networkLayout->addWidget(rateRow);
-
     m_networkChart = new NetworkRateChart;
+    m_networkChart->setRateFooter(rateRow);
     networkLayout->addWidget(m_networkChart);
     layout->addWidget(networkCard);
 
@@ -188,15 +191,21 @@ void SystemDetailPanel::setSample(const MetricSample &sample)
         if (!activeInterfaces.contains(it.key())) it = m_networkHistory.erase(it); else ++it;
     }
 
-    m_networkInterface->blockSignals(true);
-    m_networkInterface->clear();
-    m_networkInterface->addItem(QStringLiteral("全部网卡"), QStringLiteral("__all__"));
-    for (const auto &network : sample.networkRates)
-        m_networkInterface->addItem(network.interfaceName, network.interfaceName);
-    int selectedIndex = m_networkInterface->findData(selectedInterface);
-    if (selectedIndex < 0) selectedIndex = 0;
-    m_networkInterface->setCurrentIndex(selectedIndex);
-    m_networkInterface->blockSignals(false);
+    bool interfacesChanged = m_networkInterface->count() != sample.networkRates.size() + 1;
+    for (int index = 0; !interfacesChanged && index < sample.networkRates.size(); ++index)
+        interfacesChanged = m_networkInterface->itemData(index + 1).toString() != sample.networkRates.at(index).interfaceName;
+    // Do not destroy the popup model (and its hover/selection) on every sample.
+    if (interfacesChanged) {
+        const QSignalBlocker blocker(m_networkInterface);
+        m_networkInterface->clear();
+        m_networkInterface->addItem(QStringLiteral("全部网卡"), QStringLiteral("__all__"));
+        for (const auto &network : sample.networkRates) {
+            m_networkInterface->addItem(network.interfaceName, network.interfaceName);
+            m_networkInterface->setItemData(m_networkInterface->count() - 1, network.interfaceName, Qt::ToolTipRole);
+        }
+        const int selectedIndex = m_networkInterface->findData(selectedInterface);
+        m_networkInterface->setCurrentIndex(selectedIndex < 0 ? 0 : selectedIndex);
+    }
 
     refreshNetwork();
     refreshProcesses();
@@ -208,7 +217,11 @@ void SystemDetailPanel::reset(const QString &detail)
 {
     m_sample = {};
     m_networkHistory.clear();
-    m_networkInterface->clear();
+    {
+        const QSignalBlocker blocker(m_networkInterface);
+        m_networkInterface->clear();
+        m_networkInterface->addItem(QStringLiteral("全部网卡"), QStringLiteral("__all__"));
+    }
     m_uploadRate->setText(QStringLiteral("↑ --"));
     m_downloadRate->setText(QStringLiteral("↓ --"));
     m_networkChart->setRates({}, 0);
@@ -216,6 +229,20 @@ void SystemDetailPanel::reset(const QString &detail)
     m_fileSystemList->clear();
     m_emptyHint->setText(detail);
     m_emptyHint->show();
+}
+
+SystemDetailPanel::ViewState SystemDetailPanel::viewState() const
+{
+    return {m_sample,m_networkHistory,m_networkInterface->currentData().toString(),m_processTabs->currentIndex()};
+}
+
+void SystemDetailPanel::restoreViewState(const ViewState &state)
+{
+    m_networkHistory=state.networkHistory;
+    m_processTabs->setCurrentIndex(state.processTab);
+    setSample(state.sample);
+    const int index=m_networkInterface->findData(state.selectedInterface);
+    if(index>=0)m_networkInterface->setCurrentIndex(index);
 }
 
 void SystemDetailPanel::refreshNetwork()

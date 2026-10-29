@@ -1,4 +1,5 @@
 #include "RdpLauncher.h"
+#include "AppSettings.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -27,7 +28,7 @@ QString RdpLauncher::endpoint(const ServerProfile &profile)
 QString RdpLauncher::connectionFileContents(const ServerProfile &profile)
 {
     QStringList lines{
-        QStringLiteral("screen mode id:i:2"),
+        QStringLiteral("screen mode id:i:%1").arg(AppSettings::value("general/rdpImmersive").toBool()?2:1),
         QStringLiteral("session bpp:i:32"),
         QStringLiteral("full address:s:%1").arg(endpoint(profile)),
         QStringLiteral("prompt for credentials:i:%1").arg(profile.password.isEmpty() ? 1 : 0),
@@ -140,6 +141,7 @@ RdpLaunchSpec RdpLauncher::launchSpec(
             QStringLiteral("/dynamic-resolution"),
             QStringLiteral("/cert:tofu"),
         };
+        if(AppSettings::value("general/rdpImmersive").toBool())spec.arguments.append(QStringLiteral("/f"));
         if (!profile.user.trimmed().isEmpty()) {
             spec.arguments.append(QStringLiteral("/u:%1").arg(profile.user.trimmed()));
         }

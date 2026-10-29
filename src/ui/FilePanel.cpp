@@ -1,10 +1,11 @@
 #include "FilePanel.h"
+#include "../core/AppSettings.h"
 
 #include "../core/SshSession.h"
 #include "FilePermissionDialog.h"
-#include "RemoteFileEditor.h"
 #include "RemotePathEdit.h"
 #include "TransferQueuePanel.h"
+#include "AppTheme.h"
 
 #include <QDir>
 #include <QCheckBox>
@@ -25,6 +26,7 @@
 #include <QMimeData>
 #include <QProcess>
 #include <QProgressBar>
+#include <QResizeEvent>
 #include <QPainter>
 #include <QMouseEvent>
 #include <QStandardPaths>
@@ -102,8 +104,7 @@ protected:
         option.sortIndicator = QStyleOptionHeader::None;
         style()->drawControl(QStyle::CE_Header, &option, painter, this);
 
-        const bool sortable = column == 0 || column == 1;
-        const bool active = sortable && sortIndicatorSection() == column;
+        const bool active = sortIndicatorSection() == column;
         auto textColor = palette().color(QPalette::Text);
         textColor.setAlpha(active ? 255 : 190);
         auto labelFont = font();
@@ -111,7 +112,7 @@ protected:
         labelFont.setWeight(QFont::Medium);
         painter->setFont(labelFont);
         painter->setPen(active ? palette().color(QPalette::Link) : textColor);
-        const auto labelRect = rect.adjusted(10, 0, sortable ? -31 : -10, -1);
+        const auto labelRect = rect.adjusted(10, 0, active ? -31 : -10, -1);
         painter->drawText(labelRect, Qt::AlignLeft | Qt::AlignVCenter,
             QFontMetrics(labelFont).elidedText(model()->headerData(column, orientation()).toString(),
                 Qt::ElideRight, labelRect.width()));
@@ -119,7 +120,7 @@ protected:
         divider.setAlpha(24);
         painter->setPen(divider);
         painter->drawLine(rect.right(), rect.top() + 11, rect.right(), rect.bottom() - 11);
-        if (sortable) {
+        if (active) {
             painter->setRenderHint(QPainter::Antialiasing);
             auto muted = palette().color(QPalette::Text);
             muted.setAlpha(85);
@@ -220,6 +221,8 @@ public:
             const bool directory = data(0, kDirectoryRole).toBool();
             if (directory != other.data(0, kDirectoryRole).toBool()) return descending ? !directory : directory;
         }
+        if (column >= 2 && text(column) != other.text(column))
+            return QString::localeAwareCompare(text(column), other.text(column)) < 0;
         return QString::localeAwareCompare(text(0), other.text(0)) < 0;
     }
 };
@@ -266,6 +269,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     , m_session(session)
 {
     setObjectName(QStringLiteral("filePanel"));
+    setMinimumWidth(220);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -276,10 +280,6 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     auto *headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(11, 6, 9, 6);
     headerLayout->setSpacing(6);
-    auto *title = new QLabel(QStringLiteral("文件管理"));
-    title->setObjectName(QStringLiteral("filePanelTitle"));
-    m_serverLabel = new QLabel(QStringLiteral("SFTP"));
-    m_serverLabel->setObjectName(QStringLiteral("fileServerLabel"));
     m_transferQueueButton = new QToolButton;
     m_transferQueueButton->setObjectName(QStringLiteral("transferQueueButton"));
     m_contextMenu = new QMenu(this);
@@ -347,8 +347,6 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_autoSize->setObjectName(QStringLiteral("fileAutoDirectorySize"));
     m_autoSize->setToolTip(QStringLiteral("逐个计算当前列表的目录磁盘占用，默认关闭。\n低优先级，每项最多 60 秒；不跟随符号链接、不跨文件系统。\n切换目录或关闭开关会停止旧计算；扫描仍会产生磁盘 I/O。"));
 
-    headerLayout->addWidget(title);
-    headerLayout->addWidget(m_serverLabel);
     headerLayout->addWidget(m_statusLabel);
     headerLayout->addWidget(m_backButton);
     headerLayout->addWidget(m_upButton);
@@ -356,6 +354,23 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     headerLayout->addWidget(m_autoSize);
     headerLayout->addWidget(m_refreshButton);
     headerLayout->addWidget(m_transferQueueButton);
+    m_expandButton = new QToolButton;
+    m_expandButton->setObjectName(QStringLiteral("fileWorkspaceExpandButton"));
+    m_expandButton->setCheckable(true);
+    m_expandButton->setAutoRaise(true);
+    m_expandButton->setFixedSize(26, 26);
+    setExpanded(false);
+    auto *closeWorkspace = new QToolButton;
+    closeWorkspace->setObjectName(QStringLiteral("fileWorkspaceCloseButton"));
+    closeWorkspace->setText(QString::fromUtf8("×"));
+    closeWorkspace->setToolTip(QStringLiteral("收起文件区（保留编辑内容）"));
+    closeWorkspace->setAccessibleName(closeWorkspace->toolTip());
+    closeWorkspace->setAutoRaise(true);
+    closeWorkspace->setFixedSize(26, 26);
+    headerLayout->addWidget(m_expandButton);
+    headerLayout->addWidget(closeWorkspace);
+    connect(m_expandButton, &QToolButton::clicked, this, &FilePanel::expansionRequested);
+    connect(closeWorkspace, &QToolButton::clicked, this, &FilePanel::closeWorkspaceRequested);
 
     m_tree = new QTreeWidget;
     m_tree->setObjectName(QStringLiteral("remoteFileTree"));
@@ -386,6 +401,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
 
     auto *fileListContainer = new QWidget;
     fileListContainer->setObjectName(QStringLiteral("fileListContainer"));
+    fileListContainer->setMinimumWidth(110);
     auto *fileListStack = new QStackedLayout(fileListContainer);
     fileListStack->setContentsMargins(0, 0, 0, 0);
     fileListStack->setStackingMode(QStackedLayout::StackAll);
@@ -434,7 +450,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     m_directoryTree->setRootIsDecorated(true);
     m_directoryTree->setUniformRowHeights(true);
     m_directoryTree->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
-    m_directoryTree->setMinimumWidth(150);
+    m_directoryTree->setMinimumWidth(100);
 
     auto *browserSplitter = new QSplitter(Qt::Horizontal);
     browserSplitter->setObjectName(QStringLiteral("fileBrowserSplitter"));
@@ -473,8 +489,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
     connect(m_tree->header(), &QHeaderView::sectionClicked, this, [this](int column) {
         // QHeaderView changes its sort section even with the native indicator
         // hidden. Restore our state for columns that do not support sorting.
-        if (column != 0 && column != 1) { applyFileSort(m_sortIndex); return; }
-        const int base = column == 0 ? 0 : 2;
+        const int base = column * 2;
         applyFileSort(m_sortIndex == base ? base + 1 : base);
     });
     connect(m_autoSize, &QCheckBox::toggled, this, [this](bool enabled) {
@@ -485,6 +500,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
         }
     });
     connect(m_tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int column) {
+        if (!item) return;
         if (column == 1 && item->data(0, kDirectoryRole).toBool()) return;
         if (item->data(0, kDirectoryRole).toBool()) navigateTo(item->data(0, kPathRole).toString());
         else openFile(item);
@@ -616,7 +632,7 @@ FilePanel::FilePanel(SshSession *session, QWidget *parent)
             updateActionState();
         });
     connect(m_session, &SshSession::connectionChanged, this, [this](bool connected, const QString &message) {
-        if (!connected) cancelSizeCalculations();
+        if (!connected) {cancelSizeCalculations();m_pendingUploads.clear();}
         m_connected = connected;
         m_directoryTree->setEnabled(connected);
         updateActionState();
@@ -643,16 +659,27 @@ FilePanel::~FilePanel()
 void FilePanel::changeEvent(QEvent *event)
 {
     QFrame::changeEvent(event);
+    if (m_expandButton && (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange))
+        setExpanded(m_expandButton->isChecked());
     if (m_tree && (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)) {
         for (int row = 0; row < m_tree->topLevelItemCount(); ++row) updateSizeCell(m_tree->topLevelItem(row));
     }
+}
+
+void FilePanel::resizeEvent(QResizeEvent *event)
+{
+    QFrame::resizeEvent(event);
+    if (!m_autoSize) return;
+    m_autoSize->setVisible(width() >= 600);
+    m_transferQueueButton->setVisible(width() >= 420);
+    m_backButton->setVisible(width() >= 350);
+    m_upButton->setVisible(width() >= 350);
 }
 
 void FilePanel::setServer(const ServerProfile &profile)
 {
     cancelSizeCalculations();
     finishInlineRename(false);
-    m_serverLabel->setText(QStringLiteral("SFTP · %1").arg(profile.name));
     m_profile = profile;
     m_connected = m_session->isConnected() && m_session->profile().id == profile.id;
     m_currentPath = QStringLiteral("/");
@@ -688,7 +715,6 @@ void FilePanel::updateServer(const ServerProfile &profile)
         return;
     }
     m_profile = profile;
-    m_serverLabel->setText(QStringLiteral("SFTP · %1").arg(profile.name));
     m_connected = m_session->isConnected() && m_session->profile().id == profile.id;
     m_directoryTree->setEnabled(m_connected);
     updateActionState();
@@ -767,6 +793,7 @@ void FilePanel::navigateTo(const QString &path, bool addToHistory)
 
 void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entries)
 {
+    if(m_pendingUploads.contains(path))uploadCheckedFiles(m_pendingUploads.take(path),path,entries);
     if (auto *directoryNode = m_pendingDirectoryNodes.take(path)) {
         populateDirectoryNode(directoryNode, entries);
     }
@@ -810,7 +837,7 @@ void FilePanel::showEntries(const QString &path, const RemoteFileEntries &entrie
 void FilePanel::applyFileSort(int index)
 {
     m_sortIndex = index;
-    const int column = index >= 2 ? 1 : 0;
+    const int column = qBound(0, index / 2, m_tree->columnCount() - 1);
     const auto order = index % 2 ? Qt::DescendingOrder : Qt::AscendingOrder;
     m_tree->header()->setSortIndicator(column, order);
     // Only the custom paired arrows are painted, not Qt's native single arrow.
@@ -892,6 +919,7 @@ void FilePanel::startNextDirectorySize()
 
 void FilePanel::showError(const QString &path, const QString &message)
 {
+    if(m_pendingUploads.remove(path))m_statusLabel->setText(QStringLiteral("上传已取消：无法检查目标目录 · ")+message);
     if (auto *directoryNode = m_pendingDirectoryNodes.take(path)) {
         qDeleteAll(directoryNode->takeChildren());
         directoryNode->setData(0, kDirectoryLoadedRole, true);
@@ -1063,9 +1091,17 @@ void FilePanel::uploadFile()
 void FilePanel::uploadLocalFiles(const QStringList &localPaths, const QString &remoteDirectory)
 {
     if (!m_connected || localPaths.isEmpty()) return;
-    int queued = 0;
-    int skipped = 0;
-    const auto destination = normalizePath(remoteDirectory);
+    const auto destination=normalizePath(remoteDirectory);
+    m_pendingUploads[destination].append(localPaths);
+    m_statusLabel->setText(QStringLiteral("正在检查上传目标目录…"));
+    m_session->listDirectory(destination);
+}
+
+void FilePanel::uploadCheckedFiles(const QStringList &localPaths,const QString &destination,const RemoteFileEntries &entries)
+{
+    int queued=0,skipped=0;
+    auto policy=AppSettings::value("files/overwrite").toString();
+    const auto endpoint=m_session->profile();
     for (const auto &localPath : localPaths) {
         const QFileInfo source(localPath);
         if (!source.isFile()) {
@@ -1075,13 +1111,28 @@ void FilePanel::uploadLocalFiles(const QStringList &localPaths, const QString &r
         const auto remotePath = destination == QStringLiteral("/")
             ? QStringLiteral("/") + source.fileName()
             : destination + QLatin1Char('/') + source.fileName();
+        const auto existing=std::find_if(entries.cbegin(),entries.cend(),[&remotePath](const auto &e){return e.path==remotePath;});
+        if(existing!=entries.cend()) {
+            if(existing->directory || policy=="skip"){++skipped;continue;}
+            if(policy!="overwrite") {
+                const auto answer=QMessageBox::question(this,QStringLiteral("上传同名文件"),
+                    QStringLiteral("远端已存在 %1，是否覆盖？").arg(remotePath),
+                    QMessageBox::Yes|QMessageBox::YesToAll|QMessageBox::No|QMessageBox::NoToAll|QMessageBox::Cancel,QMessageBox::No);
+                if(answer==QMessageBox::Cancel)break;
+                if(answer==QMessageBox::NoToAll)policy="skip";
+                if(answer==QMessageBox::YesToAll)policy="overwrite";
+                if(answer==QMessageBox::No || answer==QMessageBox::NoToAll){++skipped;continue;}
+            }
+        }
+        const auto current=m_session->profile();
+        if(!m_connected || endpoint.id!=current.id || endpoint.host!=current.host || endpoint.port!=current.port || endpoint.user!=current.user)break;
         m_session->uploadFile(source.absoluteFilePath(), remotePath);
         ++queued;
     }
     if (queued > 0) {
         m_statusLabel->setText(QStringLiteral("  已加入 %1 个上传任务%2")
                 .arg(queued)
-                .arg(skipped > 0 ? QStringLiteral("，已跳过 %1 个目录或无效项").arg(skipped) : QString{}));
+                .arg(skipped > 0 ? QStringLiteral("，已跳过 %1 个同名文件、目录或无效项").arg(skipped) : QString{}));
     } else if (skipped > 0) {
         m_statusLabel->setText(QStringLiteral("  拖拽上传暂不支持本地目录，请选择文件。"));
     }
@@ -1119,15 +1170,17 @@ void FilePanel::openFile(QTreeWidgetItem *item)
     if (!m_connected || !item || item->data(0, kDirectoryRole).toBool()) return;
     const auto path = item->data(0, kPathRole).toString();
     if (path.isEmpty()) return;
-    if (!m_fileEditor) {
-        m_fileEditor = new RemoteFileEditor(m_session, m_profile.name, path, this);
-        connect(m_fileEditor, &QObject::destroyed, this, [this] { m_fileEditor = nullptr; });
-    } else {
-        m_fileEditor->openFile(path);
-    }
-    m_fileEditor->show();
-    m_fileEditor->raise();
-    m_fileEditor->activateWindow();
+    emit fileOpenRequested(path);
+}
+
+void FilePanel::setExpanded(bool expanded)
+{
+    m_expandButton->setChecked(expanded);
+    m_expandButton->setIcon(terminalToolIcon(expanded ? QStringLiteral(":/assets/file-area-restore.svg")
+                                                    : QStringLiteral(":/assets/file-area-expand.svg")));
+    m_expandButton->setIconSize(QSize(16, 16));
+    m_expandButton->setToolTip(expanded ? QStringLiteral("还原文件区") : QStringLiteral("放大文件区"));
+    m_expandButton->setAccessibleName(m_expandButton->toolTip());
 }
 
 void FilePanel::createFile()

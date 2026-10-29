@@ -4,8 +4,13 @@
 #endif
 
 #include <QApplication>
+#include <QBuffer>
+#include <QFile>
 #include <QGuiApplication>
+#include <QImageReader>
+#include <QMap>
 #include <QPalette>
+#include <QPixmap>
 #include <QSettings>
 #include <QStyle>
 #include <QStyleHints>
@@ -56,28 +61,379 @@ bool isApplicationDarkTheme()
     return qApp && qApp->property("noxshellDarkTheme").toBool();
 }
 
+WorkspaceColors workspaceColors(bool dark)
+{
+    if (dark) return {QColor("#14171C"), QColor("#1C2026"), QColor("#20242B"), QColor("#272C34"),
+        QColor("#303640"), QColor("#52759E"), QColor("#D7DBE3"), QColor("#929BAA")};
+    return {QColor("#F1F2F5"), QColor("#FAFAFB"), QColor("#FFFFFF"), QColor("#F2F3F6"),
+        QColor("#E4E6EB"), QColor("#91B5E6"), QColor("#303640"), QColor("#79808E")};
+}
+
+TerminalColors terminalColors(bool dark)
+{
+    const auto theme = workspaceColors(dark);
+    if (dark) return {theme.text, theme.canvas, QColor("#8DB8EC"),
+        QColor(67, 91, 125, 180), QColor("#E3F3FF"), QColor("#2A3545")};
+    return {theme.text, theme.canvas, QColor("#246FC0"),
+        QColor(147, 192, 240, 150), QColor("#17233D"), QColor("#E8F3FF")};
+}
+
+QIcon terminalToolIcon(const QString &resource)
+{
+    QFile file(resource);
+    if (!file.open(QIODevice::ReadOnly)) return QIcon(resource);
+    auto svg = file.readAll();
+    if (!isApplicationDarkTheme()) {
+        svg.replace("#9FB1C2", "#536D88");
+        svg.replace("#53C99C", "#19855C");
+    }
+    QBuffer buffer(&svg);
+    buffer.open(QIODevice::ReadOnly);
+    QImageReader reader(&buffer, "SVG");
+    reader.setScaledSize(QSize(48, 48));
+    const auto image = reader.read();
+    if (image.isNull()) return QIcon(resource);
+    auto pixmap = QPixmap::fromImage(image);
+    pixmap.setDevicePixelRatio(2);
+    return QIcon(pixmap);
+}
+
+namespace {
+// Workspace surfaces are deliberately less saturated than status/accent
+// colours. Keep these adjoining regions together instead of tuning each
+// panel independently in the legacy control/dialog stylesheet below.
+QString workspaceStyleSheet(bool dark)
+{
+    auto style = QStringLiteral(R"QSS(
+        QMainWindow, QWidget#appRoot, QWidget#operationsWorkspace,
+        QWidget#terminalWorkspacePane, QWidget#terminalSessionsPage,
+        QWidget#fileWorkspacePane { background:@background@; }
+        QWidget#monitorRail, QScrollArea#monitorScrollArea, QWidget#monitorScrollContent {
+            background:@background@; border:0;
+        }
+        QFrame#monitorIdentity { background:@background@; border:0; border-bottom:1px solid @line@; }
+        QFrame#statusBar { background:@surface@; border:0; border-top:1px solid @line@; }
+        QLabel#mutedLabel, QLabel#fileStatusLabel, QLabel#fileServerLabel { color:@muted@; }
+        QLabel#serverAddress { color:@text@; }
+        QFrame#monitorIdentity QLabel#serverAddress { font-size:12px; }
+        QLabel#serverLatency { color:@muted@; font-size:10px; background:transparent; }
+        QFrame#monitorMetricSummary, QFrame#networkSectionCard,
+        QFrame#processSectionCard, QFrame#fileSystemSectionCard {
+            background:@surface@; border:1px solid @line@; border-radius:7px;
+        }
+        QFrame#monitorSystemSummary { border:0; border-bottom:1px solid @line@; }
+        QLabel#monitorSystemTitle, QLabel#monitorUptimeValue,
+        QLabel#detailSectionTitle, QLabel#metricValue { color:@text@; }
+        QLabel#metricTitle, QLabel#metricDetail, QLabel#monitorSystemCaption { color:@muted@; }
+        QTabBar#processMetricTabs { background:transparent; }
+        QTabBar#processMetricTabs::tab { background:@canvas@; color:@muted@; }
+        QTabBar#processMetricTabs::tab:selected { background:@selection@; color:@accent@; }
+        QTreeWidget#realtimeProcessList, QTreeWidget#fileSystemUsageList {
+            background:@surface@; alternate-background-color:@canvas@; color:@text@;
+        }
+        QTreeWidget#realtimeProcessList QHeaderView::section,
+        QTreeWidget#fileSystemUsageList QHeaderView::section {
+            background:@surface@; color:@muted@; border:0;
+        }
+        QSplitter#mainWorkspaceSplitter::handle,
+        QSplitter#terminalPaneSplitter::handle,
+        QSplitter#terminalFileSplitter::handle,
+        QSplitter#paneEditorSplitter::handle { background:@background@; border:0; }
+        QSplitter#fileBrowserSplitter::handle { background:@line@; border:0; }
+        QSplitter#mainWorkspaceSplitter::handle:hover,
+        QSplitter#terminalPaneSplitter::handle:hover,
+        QSplitter#terminalFileSplitter::handle:hover,
+        QSplitter#paneEditorSplitter::handle:hover,
+        QSplitter#fileBrowserSplitter::handle:hover { background:@focusLine@; }
+        QScrollBar::handle:vertical { background:@scrollThumb@; }
+        QFrame#filePanel { background:@surface@; border:0; border-radius:0; }
+        QWidget#fileToolbar { background:@surface@; border:0; border-bottom:1px solid @line@; }
+        QLineEdit#remotePathEdit {
+            background:@canvas@; color:@text@; border:1px solid @line@; border-radius:5px;
+        }
+        QLineEdit#remotePathEdit:focus { border-color:@focusLine@; }
+        QToolButton#remotePathSegment { color:@muted@; }
+        QToolButton#remotePathSegment[current="true"] { color:@text@; }
+        QTreeWidget#remoteDirectoryTree {
+            background:@surface@; color:@text@; border:0;
+        }
+        QTreeWidget#remoteFileTree {
+            background:@surface@; color:@text@; alternate-background-color:@canvas@; border:0;
+        }
+        QTreeWidget#remoteFileTree::item { border:0; }
+        QTreeWidget#remoteFileTree::item:selected,
+        QTreeWidget#remoteDirectoryTree::item:selected { background:@selection@; color:@accent@; }
+        QTreeWidget#remoteFileTree QHeaderView::section {
+            background:@surface@; color:@muted@; border:0; border-bottom:1px solid @line@;
+        }
+        QWidget#remoteFileEditor { background:@surface@; }
+        QTabBar#remoteFileEditorTabs { background:@canvas@; border:0; border-bottom:1px solid @line@; }
+        QTabBar#remoteFileEditorTabs::tab {
+            background:@canvas@; color:@muted@; border:0; border-bottom:2px solid transparent;
+        }
+        QTabBar#remoteFileEditorTabs::tab:selected {
+            background:@surface@; color:@text@; border:0; border-bottom:2px solid @accent@;
+        }
+        QTabBar#remoteFileEditorTabs::tab:hover:!selected { background:@raised@; }
+        QFrame#remoteFileEditorToolbar, QFrame#remoteFileEditorStatusBar {
+            background:@surface@; border:0;
+        }
+        QFrame#remoteFileEditorToolbar { border-bottom:1px solid @line@; }
+        QFrame#remoteFileEditorStatusBar { border-top:1px solid @line@; }
+        QLabel#remoteFileEditorPath, QLabel#remoteFileEditorStatus,
+        QLabel#remoteFileEditorPosition, QLabel#remoteFileEditorLanguage { color:@muted@; }
+        QPlainTextEdit#remoteFileEditorText { background:@surface@; color:@text@; }
+        QWidget#paneAgentPanel { background:@canvas@; }
+        QLabel#agentStatus { color:@muted@; font-size:11px; }
+        QLabel#agentLanguageHint { color:@muted@; font-size:11px; background:transparent; }
+        QWidget#agentToolbar QPushButton { min-height:24px; padding:0 8px; font-size:11px; }
+        QWidget#agentToolbar QComboBox { min-height:24px; padding:0 24px 0 8px; font-size:11px; }
+        QTextBrowser#agentChineseGuide { color:@text@; background:@surface@; border:1px solid @line@; border-radius:5px; padding:8px; font-size:12px; }
+        QTreeWidget#availableSoftwareList { color:@text@; background:@canvas@; alternate-background-color:@surface@; border:1px solid @line@; font-weight:400; }
+        QTreeWidget#availableSoftwareList::item { border:0; border-bottom:1px solid @line@; padding:3px 0; }
+        QPlainTextEdit#softwareInstallLog { color:@text@; background:@canvas@; border:1px solid @line@; border-radius:4px; font-weight:400; }
+        QLabel#softwareSafetyNote, QLabel#softwareInstallStatus { color:@muted@; font-size:11px; font-weight:400; }
+        QWidget#terminalRecentPage { background:@surface@; }
+        QLabel#recentLoginTitle, QLabel#recentLoginHint { color:@text@; }
+        QLabel#recentLoginEmpty, QLabel#credentialManagerStatus { color:@muted@; }
+        QTabWidget#connectionHomeTabs::pane { background:@surface@; border:0; }
+        QTabBar#connectionHomeTabBar { background:@surface@; }
+        QTabBar#connectionHomeTabBar::tab { color:@muted@; background:transparent; }
+        QTabBar#connectionHomeTabBar::tab:selected { color:@text@; background:transparent; border-bottom-color:@accent@; }
+        QTabWidget#connectionHomeTabs QTreeWidget#hostList, QTreeWidget#recentLoginList,
+        QTreeWidget#savedCredentialList {
+            background:@surface@; color:@text@; alternate-background-color:@canvas@; border:1px solid @line@;
+        }
+        QTabWidget#connectionHomeTabs QTreeWidget::item { border:0; }
+        QTabWidget#connectionHomeTabs QTreeWidget::item:selected,
+        QTabWidget#connectionHomeTabs QTreeWidget::branch:selected {
+            background:@selection@; color:@accent@;
+        }
+        QTabWidget#connectionHomeTabs QTreeWidget QHeaderView::section {
+            background:@canvas@; color:@muted@; border:0; border-bottom:1px solid @line@;
+        }
+        QTabWidget#connectionHomeTabs QFrame#hostSidebar { background:@surface@; border:0; }
+        QTabWidget#connectionHomeTabs QLabel#hostManagementHint { color:@muted@; }
+        QTabWidget#connectionHomeTabs QLineEdit#hostSearch {
+            background:@canvas@; color:@text@; border:1px solid @line@; border-radius:5px;
+        }
+        QTabWidget#connectionHomeTabs QLineEdit#hostSearch:focus { border-color:@focusLine@; }
+        QTabWidget#connectionHomeTabs QPushButton#hostAddButton {
+            background:@accent@; color:white; border:1px solid @accent@;
+        }
+        QTabWidget#connectionHomeTabs QPushButton#hostAddButton:hover { background:@focusLine@; }
+        QTabBar#connectionHomeTabBar::tab:hover { background:@canvas@; color:@text@; }
+        QPushButton#editSavedCredential, QPushButton#deleteSavedCredential {
+            color:@text@; background:@surface@; border:1px solid @line@;
+        }
+        QPushButton#editSavedCredential:hover, QPushButton#deleteSavedCredential:hover { background:@raised@; }
+    )QSS");
+    const auto c = workspaceColors(dark);
+    const QMap<QString, QColor> tokens{{"background",c.background},{"canvas",c.canvas},{"surface",c.surface},
+        {"raised",c.raised},{"line",c.line},{"focusLine",c.focusLine},{"text",c.text},{"muted",c.muted},
+        {"selection",QColor(dark ? "#293C53" : "#EAF1FC")},{"accent",QColor(dark ? "#8BB8EE" : "#3978C8")},
+        {"scrollThumb",QColor(dark ? "#4B535F" : "#C8CDD5")}};
+    for (auto it=tokens.cbegin();it!=tokens.cend();++it) style.replace("@"+it.key()+"@",it.value().name());
+    return style;
+}
+
+QString terminalStyleSheet(bool dark)
+{
+    auto style = QStringLiteral(R"QSS(
+        QFrame#terminalSplitPane { border:1px solid @border@; border-radius:6px; background:@canvas@; }
+        QFrame#terminalSplitPane[activeSplitPane="true"] { border-color:@focusLine@; }
+        QFrame#terminalPanel, QFrame#terminalPanel[activeSplitPane="true"] {
+            border:0; border-radius:0; background:@canvas@;
+        }
+        QWidget#terminalOutput { background: @canvas@; border: 0; }
+        QFrame#terminalCommandBlockTools {
+            background: @overlay@; border: 1px solid @controlBorder@; border-radius: 5px;
+        }
+        QToolButton#terminalCommandBlockCopyText,
+        QToolButton#terminalCommandBlockCopyImage {
+            background: transparent; border: 0; border-radius: 3px; padding: 0;
+        }
+        QToolButton#terminalCommandBlockCopyText:hover,
+        QToolButton#terminalCommandBlockCopyImage:hover { background: @hover@; }
+        QFrame#terminalSearchBar {
+            background: @overlay@; border: 1px solid @controlBorder@; border-radius: 5px;
+        }
+        QLineEdit#terminalSearchInput {
+            color: @text@; background: @canvas@; border: 1px solid @controlBorder@;
+            border-radius: 4px; min-height: 25px; padding: 0 7px;
+            selection-color: #17233D; selection-background-color: #FFF36A;
+        }
+        QLineEdit#terminalSearchInput:focus { border-color: #69A8D8; }
+        QLabel#terminalSearchCounter { color: @muted@; font-size: 11px; }
+        QToolButton#terminalSearchPrevious, QToolButton#terminalSearchNext,
+        QToolButton#terminalSearchClose {
+            color: @muted@; background: transparent; border: 0; border-radius: 3px;
+            padding: 0; font-size: 15px;
+        }
+        QToolButton#terminalSearchPrevious:hover, QToolButton#terminalSearchNext:hover,
+        QToolButton#terminalSearchClose:hover { color: @text@; background: @hover@; }
+        QToolButton#terminalSearchPrevious:disabled, QToolButton#terminalSearchNext:disabled { color: @disabled@; }
+        QLineEdit#terminalInput {
+            background: @canvas@; border: 0;
+            border-radius: 0; color: @text@; font-family: Menlo, Monaco, Consolas, monospace;
+            padding-left: 11px;
+        }
+        QWidget#terminalInputRow { background: @canvas@; border:0; }
+        QWidget#terminalInputRow QLineEdit#terminalInput { border-top: 0; }
+        QToolButton[terminalFooterButton="true"] {
+            background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 0;
+        }
+        QToolButton[terminalFooterButton="true"]:hover,
+        QToolButton[terminalFooterButton="true"]:checked {
+            background: @pressed@; border-color: @controlBorder@;
+        }
+        QFrame#commandHistoryPanel {
+            background: @surface@; border: 0; border-top: 1px solid @controlBorder@;
+        }
+        QLabel#commandHistoryTitle { color: @text@; font-size: 13px; font-weight: 650; }
+        QLabel#commandHistoryScope {
+            color: @muted@; background: @active@; border: 1px solid @controlBorder@;
+            border-radius: 3px; padding: 2px 5px; font-size: 10px;
+        }
+        QTabBar#commandHistoryTabs { background: transparent; }
+        QTabBar#commandHistoryTabs::tab {
+            min-width: 48px; min-height: 25px; padding: 0 6px; color: @muted@;
+            background: transparent; border: 0; border-bottom: 2px solid transparent;
+        }
+        QTabBar#commandHistoryTabs::tab:selected { color: @selectedText@; border-bottom-color: #1684FF; }
+        QLineEdit#commandHistorySearch {
+            color: @text@; background: @canvas@; border: 1px solid @controlBorder@;
+            border-radius: 4px; min-height: 25px; padding: 0 7px;
+            selection-color: @selectedText@; selection-background-color: @selected@;
+        }
+        QLineEdit#commandHistorySearch:focus { border-color: #1684FF; }
+        QToolButton#commandHistoryClearButton, QToolButton#commandHistoryCloseButton,
+        QToolButton#commandHistoryClearSearchButton {
+            color: @muted@; background: transparent; border: 1px solid @controlBorder@;
+            border-radius: 4px; min-height: 25px; padding: 0 7px;
+        }
+        QToolButton#commandHistoryCloseButton, QToolButton#commandHistoryClearSearchButton {
+            min-width: 25px; max-width: 25px; padding: 0; font-size: 16px;
+        }
+        QToolButton#commandHistoryClearSearchButton:disabled { color: @disabled@; border-color: @border@; }
+        QToolButton#commandHistoryClearButton:hover, QToolButton#commandHistoryCloseButton:hover,
+        QToolButton#commandHistoryClearSearchButton:hover {
+            color: @text@; background: @pressed@;
+        }
+        QTreeWidget#commandHistoryList {
+            color: @text@; background: @canvas@; alternate-background-color: @surface@;
+            border: 1px solid @border@; outline: 0;
+        }
+        QTreeWidget#commandHistoryList::item { min-height: 28px; border-bottom: 1px solid @border@; }
+        QTreeWidget#commandHistoryList::item:selected { color: @selectedText@; background: @selected@; }
+        QTreeWidget#commandHistoryList QHeaderView::section {
+            color: @muted@; background: @raised@; border: 0; border-bottom: 1px solid @border@;
+            min-height: 25px; padding: 0 6px;
+        }
+        QFrame#terminalPaneHeader, QFrame#terminalPaneHeader[activeSplitPane="true"] {
+            background:@canvas@; border:0; border-radius:0;
+        }
+        QLabel#terminalPaneIdentity { color:@muted@; font-size:11px; }
+        QTabBar#terminalModeTabs { background:transparent; border:0; }
+        QTabBar#terminalModeTabs::tab {
+            min-width:0; min-height:14px; max-height:14px; padding:1px 7px; margin:1px 2px;
+            color:@muted@; background:transparent; border:1px solid transparent; border-radius:9px;
+            font-size:11px; font-weight:400;
+        }
+        QTabBar#terminalModeTabs::tab:selected { color:@selectedText@; background:@canvas@; border:1px solid #73B4F6; font-weight:600; }
+        QTabBar#terminalModeTabs::tab:hover:!selected { background:@hover@; border-color:@border@; }
+        QFrame#terminalPaneHeader QToolButton { color:@muted@; background:transparent; border:0; border-radius:4px; padding:0; font-size:14px; }
+        QFrame#terminalPaneHeader QToolButton:hover { color:@text@; background:@hover@; }
+        QToolButton#terminalPaneCloseButton:hover { color:#DC5265; background:rgba(220,82,101,24); }
+        QFrame#terminalPaneHeader QToolButton::menu-indicator { image:none; }
+        QWidget#titlebarTabsHost QWidget#terminalTabToolbar { background:transparent; border:0; }
+        QWidget#titlebarTabsHost QTabBar#terminalSessionTabs { background:transparent; }
+        QWidget#terminalTabToolbar { background: @surface@; border-bottom: 1px solid @border@; }
+        QTabBar#terminalSessionTabs { background: @surface@; }
+        QTabBar#terminalSessionTabs::tab {
+            min-width: 0; min-height: 30px; padding: 0 4px; color: @muted@;
+            background: @raised@; border-right: 1px solid @border@;
+        }
+        QTabBar#terminalSessionTabs::tab:selected { color: @selectedText@; background: @canvas@; border-bottom: 2px solid #1684FF; }
+        QWidget#terminalTabCloseContainer { background: transparent; }
+        QToolButton#terminalTabCloseButton {
+            color: @muted@; background: transparent; border: 0; border-radius: 3px;
+            font-size: 16px; padding: 0;
+        }
+        QToolButton#terminalTabCloseButton:hover { color: @selectedText@; background: @controlBorder@; }
+        QToolButton#terminalNewTabButton {
+            color: @muted@; background: @raised@; border: 1px solid @controlBorder@; border-radius: 4px;
+            font-size: 18px; padding: 0;
+        }
+        QToolButton#terminalNewTabButton:hover { color: @text@; background: @pressed@; }
+        QWidget#terminalLoadingOverlay { background: @overlayTint@; }
+        QFrame#terminalLoadingCard {
+            background: @overlay@; border: 1px solid @controlBorder@; border-radius: 7px;
+        }
+        QLabel#terminalLoadingTitle { color: @text@; font-size: 15px; font-weight: 650; }
+        QLabel#terminalLoadingDetail { color: @muted@; font-size: 12px; }
+        QLineEdit#terminalConnectionPassword {
+            background: @canvas@; color: @text@; border: 1px solid @controlBorder@;
+            border-radius: 4px; padding: 7px; selection-background-color: #007DB8;
+        }
+        QCheckBox#terminalRememberPassword { color: @muted@; background: transparent; }
+        QPushButton#terminalPasswordConnectButton {
+            background: #007DB8; color: white; border: 1px solid #168FC3;
+            border-radius: 4px; padding: 6px 10px;
+        }
+        QPushButton#terminalPasswordConnectButton:hover { background: #168DC3; }
+        QPushButton#terminalPasswordConnectButton:disabled { background: @raised@; color: @disabled@; }
+        QProgressBar#terminalLoadingProgress { border: 0; border-radius: 2px; background: @border@; }
+        QProgressBar#terminalLoadingProgress::chunk { background: #1684FF; border-radius: 2px; }
+        QWidget#terminalLoadingOverlay QLabel#asciiCredentialHint { color:@warning@; }
+    )QSS");
+    const auto colors = terminalColors(dark);
+    style.replace(QStringLiteral("@canvas@"), colors.background.name());
+    style.replace(QStringLiteral("@text@"), colors.foreground.name());
+    const auto theme = workspaceColors(dark);
+    style.replace(QStringLiteral("@surface@"), theme.surface.name());
+    style.replace(QStringLiteral("@raised@"), theme.raised.name());
+    style.replace(QStringLiteral("@overlay@"), dark ? QStringLiteral("#102A40") : QStringLiteral("#F4F8FD"));
+    style.replace(QStringLiteral("@border@"), theme.line.name());
+    style.replace(QStringLiteral("@focusLine@"), theme.focusLine.name());
+    style.replace(QStringLiteral("@controlBorder@"), dark ? QStringLiteral("#31506B") : QStringLiteral("#B8CADC"));
+    style.replace(QStringLiteral("@hover@"), dark ? QStringLiteral("#294159") : QStringLiteral("#E2EDF9"));
+    style.replace(QStringLiteral("@pressed@"), dark ? QStringLiteral("#1C344A") : QStringLiteral("#DEECFB"));
+    style.replace(QStringLiteral("@active@"), dark ? QStringLiteral("#17354A") : QStringLiteral("#E8F3FF"));
+    style.replace(QStringLiteral("@muted@"), theme.muted.name());
+    style.replace(QStringLiteral("@disabled@"), dark ? QStringLiteral("#536B80") : QStringLiteral("#9AAABC"));
+    style.replace(QStringLiteral("@selected@"), dark ? QStringLiteral("#17466F") : QStringLiteral("#DDEEFF"));
+    style.replace(QStringLiteral("@selectedText@"), dark ? QStringLiteral("#FFFFFF") : QStringLiteral("#145CA8"));
+    style.replace(QStringLiteral("@overlayTint@"), dark ? QStringLiteral("rgba(7, 18, 29, 190)") : QStringLiteral("rgba(243, 246, 250, 220)"));
+    style.replace(QStringLiteral("@warning@"), dark ? QStringLiteral("#E2AB64") : QStringLiteral("#A75B00"));
+    return style;
+}
+} // namespace
+
 QString applicationStyleSheet(bool dark)
 {
     auto style = QStringLiteral(R"QSS(
         * {
             font-family: "PingFang SC", "Hiragino Sans GB", "Helvetica Neue", Helvetica, Arial;
             font-size: 13px;
-            color: #17233D;
+            font-weight: 400;
+            color: #303640;
         }
         QMainWindow, QWidget#appRoot { background: #F3F6FA; }
         QToolBar#windowControlsToolbar {
             background: transparent; border: 0; spacing: 3px; padding: 1px 6px;
         }
-        QToolButton#monitorToggleButton,
+        QToolButton#newConnectionButton, QToolButton#monitorToggleButton,
         QToolButton#terminalSettingsButton, QToolButton#themeModeButton {
             background: transparent; border: 1px solid transparent; border-radius: 5px;
         }
         QToolButton#themeModeButton { font-size:16px; font-family:"Helvetica Neue", Arial; }
-        QToolButton#monitorToggleButton:hover,
+        QToolButton#newConnectionButton::menu-indicator { image: none; }
+        QToolButton#newConnectionButton:hover, QToolButton#monitorToggleButton:hover,
         QToolButton#terminalSettingsButton:hover, QToolButton#themeModeButton:hover {
             background: #E8EDF3; border-color: #CCD7E3;
         }
-        QToolButton#monitorToggleButton:pressed,
+        QToolButton#newConnectionButton:pressed, QToolButton#monitorToggleButton:pressed,
         QToolButton#terminalSettingsButton:pressed, QToolButton#themeModeButton:pressed { background: #DCE5EE; }
         QLabel#windowToolbarTitle { color: #46566A; font-size: 12px; font-weight: 650; }
         QToolButton#windowMinimizeButton, QToolButton#windowMaximizeButton,
@@ -99,7 +455,6 @@ QString applicationStyleSheet(bool dark)
         }
         QLabel#portInlineLabel { color:#53657B; }
         QLabel#asciiCredentialHint { color:#A75B00; font-size:11px; }
-        QWidget#terminalLoadingOverlay QLabel#asciiCredentialHint { color:#E2AB64; }
         QLabel#permissionFileName { color:#18324F; font-weight:650; }
         QToolButton#copyHostAddressButton { border: 0; border-radius: 4px; background: transparent; }
         QToolButton#copyHostAddressButton:hover { background: #E8F3FF; }
@@ -151,6 +506,7 @@ QString applicationStyleSheet(bool dark)
         }
         QPushButton:hover { border-color: #8BBFFF; color: #0052D9; }
         QPushButton:pressed { background: #E8F3FF; }
+        QPushButton#cancelServerTools:disabled { color:#8A9BAF; background:#EDF2F7; border-color:#DFE6EF; }
         QPushButton#primaryButton { background: #006EFF; border-color: #006EFF; color: white; }
         QPushButton#primaryButton:hover { background: #005FE5; }
         QPushButton#hostAddButton { min-width: 100px; padding: 0 12px; }
@@ -259,13 +615,17 @@ QString applicationStyleSheet(bool dark)
         QLabel#detailSectionTitle { font-size:12px; font-weight:600; color:#263E55; }
         QLabel#detailMuted { color:#8B9AAF; font-size:10px; }
         QWidget#networkRateRow { background:transparent; }
-        QLabel#networkUploadRate { color:#427AE3; font-size:14px; font-weight:600; }
-        QLabel#networkDownloadRate { color:#129D86; font-size:14px; font-weight:600; }
+        QLabel#networkUploadRate { color:#2F6FD6; font-size:10px; font-weight:500; }
+        QLabel#networkDownloadRate { color:#B8600B; font-size:10px; font-weight:500; }
         QComboBox#networkInterfaceCombo { min-height:25px; padding:0 2px 0 8px; font-size:11px; }
         QComboBox#networkInterfaceCombo::drop-down { width:26px; border:0; border-left:1px solid #E1E7EF; }
         QComboBox#networkInterfaceCombo::down-arrow { image:url(:/assets/chevron-down.svg); width:12px; height:12px; }
-        QComboBox#networkInterfaceCombo QAbstractItemView { outline:0; padding:3px; }
+        QComboBox#networkInterfaceCombo QAbstractItemView {
+            color:#33485E; background:#FFFFFF; font-size:12px; outline:0; padding:3px;
+            selection-background-color:#E8F1FF; selection-color:#1E5BAA;
+        }
         QComboBox#networkInterfaceCombo QAbstractItemView::item { min-height:26px; padding:0 7px; border-radius:3px; }
+        QComboBox#networkInterfaceCombo QAbstractItemView::item:selected { color:#1E5BAA; background:#E8F1FF; }
         QTabBar#processMetricTabs::tab {
             min-width:40px; min-height:27px; max-height:27px; padding:0 5px;
             color:#60758B; background:#F3F6FA; font-size:11px; border:0; border-radius:5px;
@@ -309,34 +669,6 @@ QString applicationStyleSheet(bool dark)
         QToolButton#transferOpenDirectory:focus { border:1px solid #1684FF; }
         QLabel#alertTitle { color: #9A4E1D; font-weight: 650; }
         QLabel#alertText { color: #8A6A54; font-size: 11px; }
-        QWidget#terminalOutput { background: #0C1825; border: 0; }
-        QFrame#terminalCommandBlockTools {
-            background: #102A40; border: 1px solid #3A6688; border-radius: 5px;
-        }
-        QToolButton#terminalCommandBlockCopyText,
-        QToolButton#terminalCommandBlockCopyImage {
-            background: transparent; border: 0; border-radius: 3px; padding: 0;
-        }
-        QToolButton#terminalCommandBlockCopyText:hover,
-        QToolButton#terminalCommandBlockCopyImage:hover { background: #294B68; }
-        QFrame#terminalSearchBar {
-            background: #102A40; border: 1px solid #31506B; border-radius: 5px;
-        }
-        QLineEdit#terminalSearchInput {
-            color: #E8F1F8; background: #0C1825; border: 1px solid #3B5B76;
-            border-radius: 4px; min-height: 25px; padding: 0 7px;
-            selection-color: #17233D; selection-background-color: #FFF36A;
-        }
-        QLineEdit#terminalSearchInput:focus { border-color: #69A8D8; }
-        QLabel#terminalSearchCounter { color: #A9BDCF; font-size: 11px; }
-        QToolButton#terminalSearchPrevious, QToolButton#terminalSearchNext,
-        QToolButton#terminalSearchClose {
-            color: #B8C9D8; background: transparent; border: 0; border-radius: 3px;
-            padding: 0; font-size: 15px;
-        }
-        QToolButton#terminalSearchPrevious:hover, QToolButton#terminalSearchNext:hover,
-        QToolButton#terminalSearchClose:hover { color: white; background: #294159; }
-        QToolButton#terminalSearchPrevious:disabled, QToolButton#terminalSearchNext:disabled { color: #536B80; }
         QWidget#terminalRecentPage { background: #0C1825; }
         QLabel#recentLoginTitle { color: #F2F6FA; font-size: 18px; font-weight: 650; }
         QLabel#recentLoginHint, QLabel#recentLoginEmpty { color: #7F95AA; }
@@ -394,100 +726,6 @@ QString applicationStyleSheet(bool dark)
             color: #8EA3B7; background: #132235; border: 0; border-bottom: 1px solid #22364C;
             min-height: 30px; padding: 0 8px;
         }
-        QLineEdit#terminalInput {
-            background: #101E2D; border: 0; border-top: 1px solid #22364C;
-            border-radius: 0; color: #F2F6FA; font-family: Menlo, Monaco, Consolas, monospace;
-            padding-left: 11px;
-        }
-        QWidget#terminalInputRow { background: #101E2D; border-top: 1px solid #22364C; }
-        QWidget#terminalInputRow QLineEdit#terminalInput { border-top: 0; }
-        QToolButton#commandHistoryButton, QToolButton#fileWorkspaceToggleButton {
-            background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 0;
-        }
-        QToolButton#commandHistoryButton:hover, QToolButton#fileWorkspaceToggleButton:hover,
-        QToolButton#commandHistoryButton:checked {
-            background: #1C344A; border-color: #31506B;
-        }
-        QFrame#commandHistoryPanel {
-            background: #101E2D; border: 0; border-top: 1px solid #294159;
-        }
-        QLabel#commandHistoryTitle { color: #E7EEF5; font-size: 13px; font-weight: 650; }
-        QLabel#commandHistoryScope {
-            color: #8FB3D1; background: #182C3E; border: 1px solid #29445B;
-            border-radius: 3px; padding: 2px 5px; font-size: 10px;
-        }
-        QTabBar#commandHistoryTabs { background: transparent; }
-        QTabBar#commandHistoryTabs::tab {
-            min-width: 48px; min-height: 25px; padding: 0 6px; color: #8EA3B7;
-            background: transparent; border: 0; border-bottom: 2px solid transparent;
-        }
-        QTabBar#commandHistoryTabs::tab:selected { color: #FFFFFF; border-bottom-color: #1684FF; }
-        QLineEdit#commandHistorySearch {
-            color: #D8E4EF; background: #0C1825; border: 1px solid #31506B;
-            border-radius: 4px; min-height: 25px; padding: 0 7px;
-            selection-color: #FFFFFF; selection-background-color: #17466F;
-        }
-        QLineEdit#commandHistorySearch:focus { border-color: #1684FF; }
-        QToolButton#commandHistoryClearButton, QToolButton#commandHistoryCloseButton,
-        QToolButton#commandHistoryClearSearchButton {
-            color: #9FB1C2; background: transparent; border: 1px solid #31506B;
-            border-radius: 4px; min-height: 25px; padding: 0 7px;
-        }
-        QToolButton#commandHistoryCloseButton, QToolButton#commandHistoryClearSearchButton {
-            min-width: 25px; max-width: 25px; padding: 0; font-size: 16px;
-        }
-        QToolButton#commandHistoryClearSearchButton:disabled { color: #536B80; border-color: #22364C; }
-        QToolButton#commandHistoryClearButton:hover, QToolButton#commandHistoryCloseButton:hover,
-        QToolButton#commandHistoryClearSearchButton:hover {
-            color: #FFFFFF; background: #1C344A;
-        }
-        QTreeWidget#commandHistoryList {
-            color: #D8E4EF; background: #0C1825; alternate-background-color: #101E2D;
-            border: 1px solid #22364C; outline: 0;
-        }
-        QTreeWidget#commandHistoryList::item { min-height: 28px; border-bottom: 1px solid #1A2C3E; }
-        QTreeWidget#commandHistoryList::item:selected { color: #FFFFFF; background: #17466F; }
-        QTreeWidget#commandHistoryList QHeaderView::section {
-            color: #8EA3B7; background: #132235; border: 0; border-bottom: 1px solid #22364C;
-            min-height: 25px; padding: 0 6px;
-        }
-        QWidget#terminalTabToolbar { background: #101E2D; border-bottom: 1px solid #22364C; }
-        QTabBar#terminalSessionTabs { background: #101E2D; }
-        QTabBar#terminalSessionTabs::tab {
-            min-width: 0; min-height: 30px; padding: 0 4px; color: #8EA3B7;
-            background: #132235; border-right: 1px solid #22364C;
-        }
-        QTabBar#terminalSessionTabs::tab:selected { color: #FFFFFF; background: #0C1825; border-bottom: 2px solid #1684FF; }
-        QWidget#terminalTabCloseContainer { background: transparent; }
-        QToolButton#terminalTabCloseButton {
-            color: #91A4B7; background: transparent; border: 0; border-radius: 3px;
-            font-size: 16px; padding: 0;
-        }
-        QToolButton#terminalTabCloseButton:hover { color: #FFFFFF; background: #294159; }
-        QToolButton#terminalNewTabButton {
-            color: #B9C8D6; background: #132235; border: 1px solid #294159; border-radius: 4px;
-            font-size: 18px; padding: 0;
-        }
-        QToolButton#terminalNewTabButton:hover { color: #FFFFFF; background: #1C344A; }
-        QWidget#terminalLoadingOverlay { background: rgba(7, 18, 29, 190); }
-        QFrame#terminalLoadingCard {
-            background: #13263A; border: 1px solid #31506B; border-radius: 7px;
-        }
-        QLabel#terminalLoadingTitle { color: #F1F6FA; font-size: 15px; font-weight: 650; }
-        QLabel#terminalLoadingDetail { color: #9FB1C2; font-size: 12px; }
-        QLineEdit#terminalConnectionPassword {
-            background: #071B2A; color: #E3EDF5; border: 1px solid #3A647E;
-            border-radius: 4px; padding: 7px; selection-background-color: #007DB8;
-        }
-        QCheckBox#terminalRememberPassword { color: #B9CCD9; background: transparent; }
-        QPushButton#terminalPasswordConnectButton {
-            background: #007DB8; color: white; border: 1px solid #168FC3;
-            border-radius: 4px; padding: 6px 10px;
-        }
-        QPushButton#terminalPasswordConnectButton:hover { background: #168DC3; }
-        QPushButton#terminalPasswordConnectButton:disabled { background: #23465D; color: #9FB1C2; }
-        QProgressBar#terminalLoadingProgress { border: 0; border-radius: 2px; background: #263C50; }
-        QProgressBar#terminalLoadingProgress::chunk { background: #1684FF; border-radius: 2px; }
         QTreeWidget {
             background: white; border: 0; alternate-background-color: #FAFBFC;
             outline: 0; show-decoration-selected: 1;
@@ -509,7 +747,15 @@ QString applicationStyleSheet(bool dark)
         QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
         QScrollBar::handle:vertical { background: #C6D0DB; min-height: 28px; border-radius: 5px; margin: 2px; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QDialog#remoteFileEditor { background:#F3F6FA; }
+        QWidget#remoteFileEditor { background:#F3F6FA; }
+        QToolButton#fileWorkspaceExpandButton, QToolButton#fileWorkspaceCloseButton {
+            color:#536D88; background:transparent; border:1px solid transparent; border-radius:4px;
+            font-size:17px; padding:0;
+        }
+        QToolButton#fileWorkspaceExpandButton:hover, QToolButton#fileWorkspaceExpandButton:checked,
+        QToolButton#fileWorkspaceCloseButton:hover { color:#2469BA; background:#E8F3FF; border-color:#C4DBF8; }
+        QSplitter#paneEditorSplitter::handle { background:#D8E2ED; }
+        QSplitter#paneEditorSplitter::handle:hover { background:#8BBDF4; }
         QPlainTextEdit#remoteFileEditorText {
             color:#25354A; background:#FFFFFF; border:0; border-radius:0; padding:0;
             selection-background-color:#D7E9FF; selection-color:#173A64;
@@ -563,20 +809,20 @@ QString applicationStyleSheet(bool dark)
         QLabel#remoteFileEditorLanguage { color:#476885; font-size:11px; background:transparent; }
     )QSS");
 
-    if (!dark) return style;
+    if (!dark) return style + workspaceStyleSheet(false) + terminalStyleSheet(false);
     style += QStringLiteral(R"QSS(
-        * { color: #D7E2EE; }
+        * { color: #D7DBE3; }
         QLabel#asciiCredentialHint { color:#E2AB64; }
         QMainWindow, QDialog, QMessageBox, QInputDialog, QWidget#appRoot,
         QWidget#operationsWorkspace, QWidget#terminalWorkspacePane, QWidget#fileWorkspacePane {
             background: #111820;
         }
         QToolBar#windowControlsToolbar { background: #171F29; border-bottom: 1px solid #2A3542; }
-        QToolButton#monitorToggleButton:hover,
+        QToolButton#newConnectionButton:hover, QToolButton#monitorToggleButton:hover,
         QToolButton#terminalSettingsButton:hover, QToolButton#themeModeButton:hover {
             background: #263241; border-color: #3A495A;
         }
-        QToolButton#monitorToggleButton:pressed,
+        QToolButton#newConnectionButton:pressed, QToolButton#monitorToggleButton:pressed,
         QToolButton#terminalSettingsButton:pressed, QToolButton#themeModeButton:pressed {
             background: #303E4E;
         }
@@ -622,6 +868,7 @@ QString applicationStyleSheet(bool dark)
         }
         QPushButton:hover { color: #76B8FF; border-color: #528AC1; background: #222F3D; }
         QPushButton:pressed { background: #293949; }
+        QPushButton#cancelServerTools:disabled { color:#738397; background:#1B2632; border-color:#2D3A49; }
         QPushButton#primaryButton { color: white; background: #1677D2; border-color: #2588E5; }
         QPushButton#primaryButton:hover { background: #2388E8; }
         QMenu { color:#DCE6F0; background:#1A232D; border-color:#3A4654; }
@@ -695,8 +942,12 @@ QString applicationStyleSheet(bool dark)
         QPushButton#credentialSettingsButton { color:#8FA0B2; border-top-color:#303D4A; }
         QWidget#networkRateRow { background:transparent; }
         QLabel#networkUploadRate { color:#7BAAFF; }
-        QLabel#networkDownloadRate { color:#54CDB5; }
+        QLabel#networkDownloadRate { color:#FFB15C; }
         QComboBox#networkInterfaceCombo::drop-down { border-left-color:#354252; }
+        QComboBox#networkInterfaceCombo QAbstractItemView {
+            color:#DCE6F0; background:#1A232D; selection-background-color:#243F5E; selection-color:#E3EFFF;
+        }
+        QComboBox#networkInterfaceCombo QAbstractItemView::item:selected { color:#E3EFFF; background:#243F5E; }
         QTabBar#processMetricTabs::tab { color:#91A3B6; background:#1C2631; }
         QTabBar#processMetricTabs::tab:selected { color:#8ABBFF; background:#243950; border:0; }
         QTreeWidget#realtimeProcessList, QTreeWidget#fileSystemUsageList {
@@ -730,7 +981,12 @@ QString applicationStyleSheet(bool dark)
             color:#FFFFFF; background:#263442; border-color:#52708C;
         }
         QFrame#remoteFileFindPanel QToolButton:checked { color:#70B7FF; background:#173D5D; border-color:#3F83B8; }
-        QDialog#remoteFileEditor { background:#141D28; }
+        QWidget#remoteFileEditor { background:#141D28; }
+        QToolButton#fileWorkspaceExpandButton, QToolButton#fileWorkspaceCloseButton { color:#A8BCD1; }
+        QToolButton#fileWorkspaceExpandButton:hover, QToolButton#fileWorkspaceExpandButton:checked,
+        QToolButton#fileWorkspaceCloseButton:hover { color:#DFECFF; background:#263F5E; border-color:#3B5A7C; }
+        QSplitter#paneEditorSplitter::handle { background:#303D4A; }
+        QSplitter#paneEditorSplitter::handle:hover { background:#3F83B8; }
         QPlainTextEdit#remoteFileEditorText { color:#D5DFED; background:#18222F; border:0; selection-background-color:#304F76; selection-color:#F0F6FF; }
         QPlainTextEdit#remoteFileEditorText:disabled { color:#7D8EA4; background:#17202B; }
         QTabBar#remoteFileEditorTabs { background:#121B26; border-bottom-color:#2C3A4B; }
@@ -754,7 +1010,7 @@ QString applicationStyleSheet(bool dark)
         QLabel#remoteFileEditorStatus, QLabel#remoteFileEditorPosition { color:#8198B0; }
         QLabel#remoteFileEditorLanguage { color:#A0B9D4; }
     )QSS");
-    return style;
+    return style + workspaceStyleSheet(true) + terminalStyleSheet(true);
 }
 
 void applyApplicationTheme(ThemeMode mode)
@@ -803,6 +1059,14 @@ void applyApplicationTheme(ThemeMode mode)
         palette.setColor(QPalette::Disabled, QPalette::Text, QColor(QStringLiteral("#9AA7B6")));
         palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(QStringLiteral("#9AA7B6")));
     }
+    const auto theme = workspaceColors(dark);
+    palette.setColor(QPalette::Window, theme.background);
+    palette.setColor(QPalette::WindowText, theme.text);
+    palette.setColor(QPalette::Base, theme.surface);
+    palette.setColor(QPalette::AlternateBase, theme.canvas);
+    palette.setColor(QPalette::Text, theme.text);
+    palette.setColor(QPalette::Button, theme.surface);
+    palette.setColor(QPalette::ButtonText, theme.text);
     application->setProperty("noxshellDarkTheme", dark);
     application->setPalette(palette);
     application->setStyleSheet(applicationStyleSheet(dark));

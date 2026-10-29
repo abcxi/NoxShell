@@ -1,10 +1,20 @@
 <RCC>
   <qresource prefix="/">
+        <file>tools/agent_command.py</file>
+    <file>tools/server_tools.py</file>
+    <file>assets/process-management.svg</file>
+    <file>assets/speed-test.svg</file>
+    <file>assets/traffic-observation.svg</file>
+    <file>assets/software-install.svg</file>
+    <file>tools/server_packages.py</file>
+    <file>assets/terminal-shell.svg</file>
+    <file>assets/agent-mode.svg</file>
     <file>assets/app-icon.png</file>
         <file>assets/sidebar-collapse.svg</file>
         <file>assets/sidebar-expand.svg</file>
         <file>assets/monitor-collapse.svg</file>
         <file>assets/monitor-expand.svg</file>
+        <file>assets/add.svg</file>
         <file>assets/copy.svg</file>
         <file>assets/copy-image.svg</file>
         <file>assets/transfer-queue.svg</file>
@@ -24,5 +34,7 @@
         <file>assets/editor-undo.svg</file>
         <file>assets/editor-redo.svg</file>
         <file>assets/editor-find.svg</file>
+        <file>assets/file-area-expand.svg</file>
+        <file>assets/file-area-restore.svg</file>
   </qresource>
 </RCC>

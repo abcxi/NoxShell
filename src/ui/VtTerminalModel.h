@@ -10,6 +10,9 @@ struct TerminalCell {
     QString text{QStringLiteral(" ")};
     QColor foreground{QStringLiteral("#D0DBE5")};
     QColor background{QStringLiteral("#0C1825")};
+    // Defaults are resolved by the view, so existing output follows theme changes.
+    bool defaultForeground{true};
+    bool defaultBackground{true};
     bool bold{false};
     bool underline{false};
     bool inverse{false};
@@ -30,6 +33,7 @@ public:
     void feed(const QString &text);
     void resize(int columns, int rows);
     void reset();
+    void setHistoryLimit(int limit);
     void clear();
 
     [[nodiscard]] int columns() const { return m_columns; }
@@ -37,6 +41,7 @@ public:
     [[nodiscard]] int cursorColumn() const { return m_cursorColumn; }
     [[nodiscard]] int cursorRow() const { return m_cursorRow; }
     [[nodiscard]] bool cursorVisible() const { return m_cursorVisible; }
+    [[nodiscard]] bool cursorWrapPending() const { return m_wrapPending; }
     [[nodiscard]] int cursorStyle() const { return m_cursorStyle; }
     [[nodiscard]] bool reverseVideo() const { return m_reverseVideo; }
     [[nodiscard]] bool applicationCursorKeys() const { return m_applicationCursorKeys; }
@@ -49,10 +54,17 @@ public:
     [[nodiscard]] const TerminalCell &cell(int row, int column) const;
     [[nodiscard]] const TerminalCell &documentCell(int line, int column) const;
     [[nodiscard]] QString documentLineText(int line, bool trimRight = true) const;
+    [[nodiscard]] int documentLineWrapLength(int line) const;
     [[nodiscard]] QString plainText() const;
 
 private:
     enum class ParserState { Ground, Escape, Csi, Osc, OscEscape, Charset };
+    struct TerminalLine {
+        QVector<TerminalCell> cells;
+        // -1 is an explicit line ending; otherwise the next row continues
+        // this logical line. A wide character can leave unused padding.
+        int wrapLength{-1};
+    };
 
     void processCharacter(char32_t character);
     void processControl(char32_t character);
@@ -60,7 +72,7 @@ private:
     void processCsi(char32_t finalCharacter);
     void processSgr(const QVector<int> &parameters);
     void putCharacter(char32_t character);
-    void lineFeed();
+    void lineFeed(int wrapLength = -1);
     void reverseIndex();
     void scrollUp(int count = 1);
     void scrollDown(int count = 1);
@@ -77,11 +89,14 @@ private:
     [[nodiscard]] static bool isCombining(char32_t character);
     [[nodiscard]] int index(int row, int column) const { return row * m_columns + column; }
 
+    int m_historyLimit{5000};
     int m_columns{};
     int m_rows{};
     QVector<TerminalCell> m_cells;
-    QVector<QVector<TerminalCell>> m_scrollback;
+    QVector<int> m_lineWrapLengths;
+    QVector<TerminalLine> m_scrollback;
     QVector<TerminalCell> m_primaryCells;
+    QVector<int> m_primaryLineWrapLengths;
     int m_cursorColumn{};
     int m_cursorRow{};
     int m_savedColumn{};
@@ -91,6 +106,7 @@ private:
     int m_scrollTop{};
     int m_scrollBottom{};
     bool m_wrapPending{false};
+    bool m_primaryWrapPending{false};
     bool m_cursorVisible{true};
     int m_cursorStyle{6};
     bool m_reverseVideo{false};

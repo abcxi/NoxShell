@@ -4,6 +4,7 @@
 #include <QLinearGradient>
 #include <QPainter>
 #include <QPainterPath>
+#include <QResizeEvent>
 #include <algorithm>
 #include <cmath>
 
@@ -24,7 +25,7 @@ NetworkRateChart::NetworkRateChart(QWidget *parent) : QWidget(parent)
     setObjectName(QStringLiteral("networkRateChart"));
     setFixedHeight(92);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    setToolTip(QStringLiteral("最近 60 秒的真实采样；曲线仅做视觉插值，不平均或改变采样值。"));
+    setToolTip(QStringLiteral("蓝色实线：上传；橙色虚线：下载。\n最近 60 秒的真实采样；曲线仅做视觉插值，不平均或改变采样值。"));
 }
 
 void NetworkRateChart::setRates(QVector<NetworkRatePoint> rates, qint64 nowMs)
@@ -38,7 +39,32 @@ void NetworkRateChart::setRates(QVector<NetworkRatePoint> rates, qint64 nowMs)
         if (!m_rates.isEmpty() && point.timestampMs <= m_rates.last().timestampMs) continue;
         m_rates.append(point);
     }
+    layoutFooter();
     update();
+}
+
+void NetworkRateChart::setRateFooter(QWidget *footer)
+{
+    m_rateFooter=footer;
+    if(footer){footer->setParent(this);footer->show();layoutFooter();}
+}
+
+void NetworkRateChart::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    layoutFooter();
+}
+
+void NetworkRateChart::layoutFooter()
+{
+    if(!m_rateFooter)return;
+    // Preserve the full plot. Rates share the existing time-axis row instead
+    // of introducing another line above the graph.
+    const int available=qMax(0,width()-78);
+    const int fontSize=available<120?9:10;
+    const auto style=QStringLiteral("QLabel{font-size:%1px;font-weight:500;}").arg(fontSize);
+    if(m_rateFooter->styleSheet()!=style)m_rateFooter->setStyleSheet(style);
+    m_rateFooter->setGeometry(43,height()-17,available,15);
 }
 
 void NetworkRateChart::paintEvent(QPaintEvent *)
@@ -46,8 +72,10 @@ void NetworkRateChart::paintEvent(QPaintEvent *)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     const bool dark = isApplicationDarkTheme();
-    const QColor muted(dark ? "#8395A9" : "#8998AA");
-    const QRectF plot = QRectF(rect()).adjusted(49, 8, -9, -21);
+    const auto theme=workspaceColors(dark);
+    const QColor muted=theme.muted;
+    // Keep the scale inside the chart instead of reserving a wide left gutter.
+    const QRectF plot = QRectF(rect()).adjusted(5, 7, -6, -20);
     if (plot.width() <= 0 || plot.height() <= 0) return;
     double maximum = 1;
     for (const auto &point : m_rates) maximum = std::max({maximum, point.upload, point.download});
@@ -58,11 +86,8 @@ void NetworkRateChart::paintEvent(QPaintEvent *)
     painter.setFont(font);
     for (int row = 0; row <= 2; ++row) {
         const qreal y = plot.top() + plot.height() * row / 2;
-        painter.setPen(QPen(QColor(dark ? "#2B3947" : "#EAF0F6"), 1, Qt::DashLine));
+        painter.setPen(QPen(theme.line, 1, Qt::DashLine));
         painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
-        painter.setPen(muted);
-        painter.drawText(QRectF(0, y - 6, 42, 12), Qt::AlignRight | Qt::AlignVCenter,
-            row == 2 ? QStringLiteral("0") : rateLabel(maximum * (2 - row) / 2));
     }
     const auto series = [&](bool upload, QColor color) {
         if (m_rates.isEmpty()) return;
@@ -94,18 +119,35 @@ void NetworkRateChart::paintEvent(QPaintEvent *)
         gradient.setColorAt(1, fill);
         painter.fillPath(area, gradient);
         painter.setBrush(Qt::NoBrush);
-        painter.setPen(QPen(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        QPen stroke(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        if (!upload) stroke.setDashPattern({3.0, 2.0});
+        painter.setPen(stroke);
         painter.drawPath(path);
         painter.setPen(Qt::NoPen);
         auto halo = color;
         halo.setAlpha(30);
         painter.setBrush(halo);
         painter.drawEllipse(previous, 4, 4);
-        painter.setBrush(color);
-        painter.drawEllipse(previous, 2, 2);
+        if (upload) {
+            painter.setBrush(color);
+            painter.drawEllipse(previous, 2, 2);
+        } else {
+            painter.setPen(QPen(color, 1.5));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(QRectF(previous - QPointF(2.5, 2.5), QSizeF(5, 5)));
+        }
     };
-    series(true, QColor(dark ? "#7BAAFF" : "#427AE3"));
-    series(false, QColor(dark ? "#54CDB5" : "#129D86"));
+    series(true, QColor(dark ? "#7BAAFF" : "#2F6FD6"));
+    series(false, QColor(dark ? "#FFB15C" : "#B8600B"));
+    // Transparent scale text never masks a line/fill underneath it.
+    for (int row = 0; row <= 2; ++row) {
+        const QString label = row == 2 ? QStringLiteral("0") : rateLabel(maximum * (2 - row) / 2);
+        const qreal y = plot.top() + plot.height() * row / 2;
+        const qreal top = row == 0 ? y + 1 : row == 2 ? y - 13 : y - 6;
+        const QRectF badge(plot.left() + 1, top, painter.fontMetrics().horizontalAdvance(label) + 6, 12);
+        painter.setPen(muted);
+        painter.drawText(badge.adjusted(3, 0, -3, 0), Qt::AlignLeft | Qt::AlignVCenter, label);
+    }
     painter.setPen(muted);
     painter.drawText(QRectF(plot.left(), height() - 16, plot.width(), 14), Qt::AlignLeft, QStringLiteral("60 秒前"));
     painter.drawText(QRectF(plot.left(), height() - 16, plot.width(), 14), Qt::AlignRight, QStringLiteral("现在"));

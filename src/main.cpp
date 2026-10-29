@@ -4,6 +4,7 @@
 #include "core/AppLogger.h"
 #include "core/ServerRepository.h"
 #include "core/CredentialStore.h"
+#include "core/AgentMcpStdio.h"
 
 #include <QApplication>
 #include <QFont>
@@ -21,6 +22,8 @@
 
 int main(int argc, char *argv[])
 {
+    if(argc==3 && QString::fromLocal8Bit(argv[1])==QStringLiteral("--agent-mcp"))
+        return noxshell::runAgentMcpStdio(argc,argv,QString::fromLocal8Bit(argv[2]));
     noxshell::ui::Application app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("玄壳"));
     QApplication::setOrganizationName(QStringLiteral("NoxShell"));

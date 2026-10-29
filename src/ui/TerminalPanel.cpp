@@ -1,4 +1,11 @@
 #include "TerminalPanel.h"
+#include "../core/AppSettings.h"
+#include <QCompleter>
+#include <QStringListModel>
+#include <QAbstractItemView>
+#include "AppTheme.h"
+#include "ServerToolsDialog.h"
+#include "SoftwareInstallDialog.h"
 #include <QCheckBox>
 
 #include "../core/SshSession.h"
@@ -17,11 +24,38 @@
 #include <QShortcut>
 #include <QStackedLayout>
 #include <QToolButton>
+#include <QShowEvent>
 #include <QVBoxLayout>
 
 namespace noxshell::ui {
 
 namespace {
+class HistoryCompleter final : public QCompleter {
+public:
+    using QCompleter::QCompleter;
+protected:
+    bool eventFilter(QObject *object,QEvent *event) override {
+        if(event->type()==QEvent::KeyPress && popup()->isVisible()) {
+            auto *key=static_cast<QKeyEvent*>(event);
+            const bool tab=AppSettings::value("terminal/completionAccept")=="Tab";
+            if(tab && (key->key()==Qt::Key_Return || key->key()==Qt::Key_Enter)) {
+                popup()->hide();return false;
+            }
+            if(tab && key->key()==Qt::Key_Tab) {
+                if(!popup()->currentIndex().isValid())popup()->setCurrentIndex(completionModel()->index(0,0));
+                QKeyEvent accept(QEvent::KeyPress,Qt::Key_Return,Qt::NoModifier);
+                return QCompleter::eventFilter(object,&accept);
+            }
+            const bool ctrl=AppSettings::value("terminal/completionCycle")=="ctrl";
+            if(ctrl && key->modifiers()==Qt::ControlModifier && (key->key()==Qt::Key_N || key->key()==Qt::Key_P)) {
+                QKeyEvent cycle(QEvent::KeyPress,key->key()==Qt::Key_N?Qt::Key_Down:Qt::Key_Up,Qt::NoModifier);
+                return QCompleter::eventFilter(object,&cycle);
+            }
+            if(ctrl && (key->key()==Qt::Key_Up || key->key()==Qt::Key_Down))return true;
+        }
+        return QCompleter::eventFilter(object,event);
+    }
+};
 bool isConnectionProgress(const QString &message)
 {
     return message.startsWith(QStringLiteral("正在"))
@@ -32,9 +66,10 @@ bool isConnectionProgress(const QString &message)
 
 TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, QWidget *parent)
     : QFrame(parent)
+    , m_repository(repository)
     , m_session(session)
 {
-    setStyleSheet(QStringLiteral("TerminalPanel{border:1px solid #203349;border-radius:5px;background:#0C1825;}"));
+    setObjectName(QStringLiteral("terminalPanel"));
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -157,24 +192,67 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
     inputLayout->setSpacing(3);
     m_input = new QLineEdit;
     m_input->setObjectName(QStringLiteral("terminalInput"));
-    m_input->setPlaceholderText(QStringLiteral("输入命令并按 Enter（输入 help 查看原型命令）"));
+    m_input->setAccessibleName(QStringLiteral("命令输入"));
     m_input->setEnabled(false);
     m_output->setEnabled(false);
     m_input->installEventFilter(this);
+    m_completionModel=new QStringListModel(this);
+    m_completer=new HistoryCompleter(m_completionModel,this);
+    m_completer->setCompletionMode(QCompleter::PopupCompletion);
+    m_completer->setCaseSensitivity(Qt::CaseInsensitive);
+    m_completer->setMaxVisibleItems(8);
+    connect(AppSettings::instance(),&AppSettings::changed,this,[this](const QString &key){
+        if(key.startsWith("terminal/"))refreshCompletions();
+    });
+    refreshCompletions();
     m_historyButton = new QToolButton;
     m_historyButton->setObjectName(QStringLiteral("commandHistoryButton"));
-    m_historyButton->setIcon(QIcon(QStringLiteral(":/assets/command-history.svg")));
+    m_historyButton->setProperty("terminalFooterButton", true);
+    m_historyButton->setProperty("terminalIconResource", QStringLiteral(":/assets/command-history.svg"));
+    m_historyButton->setIcon(terminalToolIcon(QStringLiteral(":/assets/command-history.svg")));
     m_historyButton->setIconSize(QSize(18, 18));
     m_historyButton->setFixedSize(29, 29);
     m_historyButton->setCheckable(true);
     m_historyButton->setToolTip(QStringLiteral("命令历史与收藏"));
     m_fileWorkspaceButton = new QToolButton;
     m_fileWorkspaceButton->setObjectName(QStringLiteral("fileWorkspaceToggleButton"));
-    m_fileWorkspaceButton->setIcon(QIcon(QStringLiteral(":/assets/file-panel-hide.svg")));
+    m_fileWorkspaceButton->setProperty("terminalFooterButton", true);
+    m_fileWorkspaceButton->setProperty("terminalIconResource", QStringLiteral(":/assets/file-panel-hide.svg"));
+    m_fileWorkspaceButton->setIcon(terminalToolIcon(QStringLiteral(":/assets/file-panel-hide.svg")));
     m_fileWorkspaceButton->setIconSize(QSize(18, 18));
     m_fileWorkspaceButton->setFixedSize(29, 29);
     m_fileWorkspaceButton->setToolTip(QStringLiteral("隐藏文件管理"));
     inputLayout->addWidget(m_input, 1);
+    const QStringList toolNames{QStringLiteral("进程管理"), QStringLiteral("网速测试"), QStringLiteral("流量观测")};
+    const QStringList toolIcons{"process-management", "speed-test", "traffic-observation"};
+    for (int index = 0; index < toolNames.size(); ++index) {
+        auto *button = new QToolButton;
+        button->setObjectName(QStringLiteral("serverToolButton%1").arg(index));
+        button->setProperty("terminalFooterButton", true);
+        button->setToolTip(toolNames[index]); button->setAccessibleName(toolNames[index]);
+        button->setToolTipDuration(4000);
+        const auto iconResource = QStringLiteral(":/assets/%1.svg").arg(toolIcons[index]);
+        button->setProperty("terminalIconResource", iconResource);
+        button->setIcon(terminalToolIcon(iconResource));
+        button->setIconSize(QSize(18, 18)); button->setFixedSize(29, 29);
+        inputLayout->addWidget(button);
+        connect(button, &QToolButton::clicked, this, [this, index] {
+            if (!m_tools) m_tools = new ServerToolsDialog(m_session, this);
+            m_tools->showPage(index);
+        });
+    }
+    auto *software = new QToolButton;
+    software->setObjectName("softwareInstallButton");software->setProperty("terminalFooterButton",true);
+    software->setProperty("terminalIconResource",QStringLiteral(":/assets/software-install.svg"));
+    software->setIcon(terminalToolIcon(QStringLiteral(":/assets/software-install.svg")));
+    software->setIconSize(QSize(18,18));software->setFixedSize(29,29);
+    software->setToolTip(QStringLiteral("软件安装"));software->setAccessibleName(QStringLiteral("软件安装"));
+    software->setToolTipDuration(4000);inputLayout->addWidget(software);
+    connect(software,&QToolButton::clicked,this,[this]{
+        if(m_software&&!m_software->belongsToCurrentProfile()){m_software->hide();m_software->deleteLater();m_software=nullptr;}
+        if(!m_software)m_software=new SoftwareInstallDialog(m_session,this);
+        m_software->showManager();
+    });
     inputLayout->addWidget(m_historyButton);
     inputLayout->addWidget(m_fileWorkspaceButton);
 
@@ -234,7 +312,7 @@ TerminalPanel::TerminalPanel(SshSession *session, ServerRepository *repository, 
         });
     connect(m_session, &SshSession::promptChanged, this, [this](const QString &prompt) {
         m_prompt = prompt;
-        m_input->setPlaceholderText(prompt);
+        // Keep the input hint generic; the active tab already names the host.
         m_input->setFocus();
     });
     connect(m_session, &SshSession::connectionChanged, this, [this](bool connected, const QString &message) {
@@ -258,6 +336,7 @@ void TerminalPanel::setServer(const ServerProfile &profile)
     m_connectionPassword->clear();
     m_profile = profile;
     m_commandHistory->setServerId(profile.id);
+    refreshCompletions();
     m_output->clear(true);
     m_prompt.clear();
     m_input->clear();
@@ -266,11 +345,24 @@ void TerminalPanel::setServer(const ServerProfile &profile)
     hideConnectionLoading();
 }
 
+void TerminalPanel::changeEvent(QEvent *event)
+{
+    QFrame::changeEvent(event);
+    if (event->type() != QEvent::PaletteChange && event->type() != QEvent::StyleChange
+        && event->type() != QEvent::ApplicationPaletteChange) return;
+    for (auto *button : findChildren<QToolButton *>()) {
+        const auto resource = button->property("terminalIconResource").toString();
+        if (!resource.isEmpty()) button->setIcon(terminalToolIcon(resource));
+    }
+}
+
 void TerminalPanel::setFileWorkspaceVisible(bool visible)
 {
     if (!m_fileWorkspaceButton) return;
-    m_fileWorkspaceButton->setIcon(QIcon(visible ? QStringLiteral(":/assets/file-panel-hide.svg")
-                                                   : QStringLiteral(":/assets/file-panel-show.svg")));
+    const auto resource = visible ? QStringLiteral(":/assets/file-panel-hide.svg")
+                                  : QStringLiteral(":/assets/file-panel-show.svg");
+    m_fileWorkspaceButton->setProperty("terminalIconResource", resource);
+    m_fileWorkspaceButton->setIcon(terminalToolIcon(resource));
     m_fileWorkspaceButton->setToolTip(visible ? QStringLiteral("隐藏文件管理")
                                               : QStringLiteral("显示文件管理"));
 }
@@ -296,6 +388,14 @@ void TerminalPanel::updateServer(const ServerProfile &profile)
 bool TerminalPanel::isConnected() const
 {
     return m_session && m_session->isConnected();
+}
+
+void TerminalPanel::showEvent(QShowEvent *event)
+{
+    // Tool dialogs are nonmodal: keep footer names available while they have
+    // focus. Qt requires this attribute on the top-level window, not a button.
+    window()->setAttribute(Qt::WA_AlwaysShowToolTips);
+    QFrame::showEvent(event);
 }
 
 bool TerminalPanel::eventFilter(QObject *watched, QEvent *event)
@@ -368,6 +468,19 @@ void TerminalPanel::submitCommand()
 void TerminalPanel::rememberCommand(const QString &command)
 {
     if (m_commandHistory) m_commandHistory->recordCommand(command);
+    refreshCompletions();
+}
+
+void TerminalPanel::refreshCompletions()
+{
+    if(!m_completer)return;
+    QStringList commands;
+    if(m_repository)for(const auto &entry:m_repository->loadCommandHistory(false,500))
+        if(entry.serverId==m_profile.id && !entry.command.trimmed().isEmpty() && !commands.contains(entry.command))commands.append(entry.command);
+    if(!AppSettings::value("terminal/prediction").toBool())commands.sort(Qt::CaseInsensitive);
+    m_completionModel->setStringList(commands);
+    m_completer->setWrapAround(AppSettings::value("terminal/completionWrap").toBool());
+    m_input->setCompleter(AppSettings::value("terminal/autoComplete").toBool()?m_completer:nullptr);
 }
 
 void TerminalPanel::appendOutput(const QString &text)

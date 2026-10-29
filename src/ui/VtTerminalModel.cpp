@@ -26,7 +26,15 @@ TerminalCell VtTerminalModel::blankCell() const
     TerminalCell cell;
     cell.foreground = m_attributes.foreground;
     cell.background = m_attributes.background;
+    cell.defaultForeground = m_attributes.defaultForeground;
+    cell.defaultBackground = m_attributes.defaultBackground;
     return cell;
+}
+
+void VtTerminalModel::setHistoryLimit(int limit)
+{
+    m_historyLimit = qBound(1,limit,10000);
+    if (m_scrollback.size()>m_historyLimit) m_scrollback.remove(0,m_scrollback.size()-m_historyLimit);
 }
 
 void VtTerminalModel::reset()
@@ -43,6 +51,8 @@ void VtTerminalModel::reset()
     m_cursorStyle = 6;
     m_alternateScreen = false;
     m_primaryCells.clear();
+    m_primaryLineWrapLengths.clear();
+    m_primaryWrapPending = false;
     m_reverseVideo = false;
     m_applicationCursorKeys = false;
     m_bracketedPaste = false;
@@ -58,6 +68,7 @@ void VtTerminalModel::clear()
 {
     m_scrollback.clear();
     m_cells.fill(blankCell(), m_columns * m_rows);
+    m_lineWrapLengths.fill(-1, m_rows);
     m_cursorColumn = 0;
     m_cursorRow = 0;
     m_wrapPending = false;
@@ -68,26 +79,122 @@ void VtTerminalModel::resize(int columns, int rows)
     columns = qMax(2, columns);
     rows = qMax(2, rows);
     if (columns == m_columns && rows == m_rows) return;
+    // Rebuild logical lines across both scrollback and the visible screen.
+    // Soft wraps are layout boundaries, not newlines: joining them before
+    // rewrapping makes narrowing and widening reversible, even repeatedly.
+    const auto reflow = [&](const QVector<TerminalCell> &source, const QVector<int> &sourceWraps,
+                            int &cursorColumn, int &cursorRow, bool &wrapPending,
+                            QVector<int> &targetWraps, bool keepScreenTop) {
+        QVector<TerminalLine> lines;
+        QVector<TerminalCell> logical;
+        int logicalCursor = -1;
+        int logicalScreenTop = -1;
+        int mappedRow = 0;
+        int mappedColumn = 0;
+        int mappedScreenTop = 0;
+        bool mappedWrapPending = false;
+        const auto flush = [&] {
+            TerminalLine line{QVector<TerminalCell>(columns, blankCell())};
+            int target = 0;
+            for (int offset = 0; offset < logical.size(); ++offset) {
+                // Keep a wide glyph and its continuation cell together.
+                if (target == columns || (target == columns - 1 && offset + 1 < logical.size()
+                        && logical.at(offset + 1).wideContinuation)) {
+                    line.wrapLength = target;
+                    lines.append(std::move(line));
+                    line = {QVector<TerminalCell>(columns, blankCell())};
+                    target = 0;
+                }
+                if (offset == logicalCursor) { mappedRow = lines.size(); mappedColumn = target; }
+                if (offset == logicalScreenTop) mappedScreenTop = lines.size();
+                line.cells[target++] = logical.at(offset);
+            }
+            if (logicalCursor == logical.size()) {
+                mappedRow = lines.size();
+                mappedColumn = qMin(target, columns - 1);
+                mappedWrapPending = target == columns;
+            }
+            if (logicalScreenTop == logical.size()) mappedScreenTop = lines.size();
+            lines.append(std::move(line));
+            logical.clear();
+            logicalCursor = logicalScreenTop = -1;
+        };
+        const auto isEmptyCell = [](const TerminalCell &cell) {
+            return cell.text == QStringLiteral(" ") && !cell.wideContinuation && !cell.underline
+                && !cell.inverse && cell.defaultBackground;
+        };
+        const auto appendLine = [&](const QVector<TerminalCell> &original, int wrapLength,
+                                    bool cursorLine, bool screenTop) {
+            int end = wrapLength >= 0 ? qMin(wrapLength, static_cast<int>(original.size()))
+                                     : static_cast<int>(original.size());
+            if (wrapLength < 0) while (end > 0 && isEmptyCell(original.at(end - 1))) --end;
+            if (cursorLine) {
+                // A pending autowrap is an insertion position after the last
+                // cell, not a new blank cell or an already-existing newline.
+                const int insertionColumn = wrapPending ? m_columns : cursorColumn;
+                logicalCursor = logical.size() + insertionColumn;
+                end = qMax(end, insertionColumn);
+            }
+            if (screenTop) logicalScreenTop = logical.size();
+            for (int column = 0; column < end; ++column) logical.append(original.at(column));
+            if (wrapLength < 0) flush();
+        };
+        for (const auto &line : m_scrollback) appendLine(line.cells, line.wrapLength, false, false);
+        int lastRow = qMin(cursorRow, m_rows - 1);
+        for (int row = m_rows - 1; row > lastRow; --row) {
+            bool nonempty = sourceWraps.value(row, -1) >= 0;
+            for (int column = 0; column < m_columns; ++column) {
+                if (!isEmptyCell(source.at(index(row, column)))) { nonempty = true; break; }
+            }
+            if (nonempty) { lastRow = row; break; }
+        }
+        for (int row = 0; row <= lastRow; ++row)
+            appendLine(source.mid(row * m_columns, m_columns), sourceWraps.value(row, -1), row == cursorRow, row == 0);
+        if (!logical.isEmpty() || logicalCursor >= 0 || logicalScreenTop >= 0) flush();
+        const int screenStart = qMax(keepScreenTop ? mappedScreenTop : 0, static_cast<int>(lines.size()) - rows);
+        m_scrollback = lines.mid(0, screenStart);
+        const int maxScrollbackLines = m_historyLimit;
+        if (m_scrollback.size() > maxScrollbackLines)
+            m_scrollback.remove(0, m_scrollback.size() - maxScrollbackLines);
+        QVector<TerminalCell> screen(columns * rows, blankCell());
+        targetWraps.fill(-1, rows);
+        for (int row = screenStart; row < lines.size(); ++row) {
+            for (int column = 0; column < columns; ++column)
+                screen[(row - screenStart) * columns + column] = lines.at(row).cells.at(column);
+            targetWraps[row - screenStart] = lines.at(row).wrapLength;
+        }
+        cursorColumn = qBound(0, mappedColumn, columns - 1);
+        cursorRow = qBound(0, mappedRow - screenStart, rows - 1);
+        wrapPending = mappedWrapPending;
+        return screen;
+    };
     QVector<TerminalCell> resized(columns * rows, blankCell());
+    QVector<int> resizedWraps(rows, -1);
     const int copiedRows = qMin(rows, m_rows);
     const int copiedColumns = qMin(columns, m_columns);
-    for (int row = 0; row < copiedRows; ++row) {
-        for (int column = 0; column < copiedColumns; ++column) {
-            resized[row * columns + column] = m_cells.value(index(row, column));
+    if (!m_alternateScreen && m_columns > 0 && m_rows > 0) {
+        resized = reflow(m_cells, m_lineWrapLengths, m_cursorColumn, m_cursorRow,
+            m_wrapPending, resizedWraps, false);
+    } else {
+        // Full-screen applications redraw after the PTY resize; retain their
+        // rectangular coordinate system while preserving the saved shell grid.
+        for (int row = 0; row < copiedRows; ++row) {
+            for (int column = 0; column < copiedColumns; ++column)
+                resized[row * columns + column] = m_cells.value(index(row, column));
+            if (columns == m_columns) resizedWraps[row] = m_lineWrapLengths.value(row, -1);
         }
+        m_wrapPending = false;
     }
     if (m_alternateScreen && !m_primaryCells.isEmpty()) {
-        QVector<TerminalCell> primary(columns * rows, blankCell());
-        for (int row = 0; row < copiedRows; ++row)
-            for (int column = 0; column < copiedColumns; ++column)
-                primary[row * columns + column] = m_primaryCells.at(index(row, column));
-        m_primaryCells = std::move(primary);
-        m_primaryCursorColumn = qBound(0, m_primaryCursorColumn, columns - 1);
-        m_primaryCursorRow = qBound(0, m_primaryCursorRow, rows - 1);
+        QVector<int> primaryWraps;
+        m_primaryCells = reflow(m_primaryCells, m_primaryLineWrapLengths, m_primaryCursorColumn,
+            m_primaryCursorRow, m_primaryWrapPending, primaryWraps, rows >= m_rows);
+        m_primaryLineWrapLengths = std::move(primaryWraps);
     }
     m_columns = columns;
     m_rows = rows;
     m_cells = std::move(resized);
+    m_lineWrapLengths = std::move(resizedWraps);
     m_scrollTop = 0;
     m_scrollBottom = rows - 1;
     clampCursor();
@@ -103,10 +210,17 @@ const TerminalCell &VtTerminalModel::documentCell(int line, int column) const
 {
     if (column < 0 || column >= m_columns || line < 0 || line >= documentLineCount()) return kFallbackCell;
     if (line < historyLineCount()) {
-        const auto &historyLine = m_scrollback.at(line);
+        const auto &historyLine = m_scrollback.at(line).cells;
         return column < historyLine.size() ? historyLine.at(column) : kFallbackCell;
     }
     return cell(line - historyLineCount(), column);
+}
+
+int VtTerminalModel::documentLineWrapLength(int line) const
+{
+    if (line < 0 || line >= documentLineCount()) return -1;
+    return line < historyLineCount() ? m_scrollback.at(line).wrapLength
+        : m_lineWrapLengths.at(line - historyLineCount());
 }
 
 QString VtTerminalModel::documentLineText(int line, bool trimRight) const
@@ -263,16 +377,23 @@ void VtTerminalModel::processCsi(char32_t finalCharacter)
     }
     case 'L': {
         const int count = qMin(qMax(1, first), m_scrollBottom - m_cursorRow + 1);
-        for (int row = m_scrollBottom; row >= m_cursorRow + count; --row)
+        for (int row = m_scrollBottom; row >= m_cursorRow + count; --row) {
             for (int column = 0; column < m_columns; ++column) m_cells[index(row, column)] = m_cells[index(row - count, column)];
+            m_lineWrapLengths[row] = m_lineWrapLengths[row - count];
+        }
         for (int row = m_cursorRow; row < m_cursorRow + count; ++row) eraseCells(row, 0, m_columns - 1);
+        if (m_cursorRow > 0) m_lineWrapLengths[m_cursorRow - 1] = -1;
+        m_lineWrapLengths[m_scrollBottom] = -1;
         break;
     }
     case 'M': {
         const int count = qMin(qMax(1, first), m_scrollBottom - m_cursorRow + 1);
-        for (int row = m_cursorRow; row <= m_scrollBottom - count; ++row)
+        for (int row = m_cursorRow; row <= m_scrollBottom - count; ++row) {
             for (int column = 0; column < m_columns; ++column) m_cells[index(row, column)] = m_cells[index(row + count, column)];
+            m_lineWrapLengths[row] = m_lineWrapLengths[row + count];
+        }
         for (int row = m_scrollBottom - count + 1; row <= m_scrollBottom; ++row) eraseCells(row, 0, m_columns - 1);
+        if (m_cursorRow > 0) m_lineWrapLengths[m_cursorRow - 1] = -1;
         break;
     }
     case 'h': case 'l':
@@ -293,11 +414,20 @@ void VtTerminalModel::processCsi(char32_t finalCharacter)
         break;
     default: break;
     }
-    m_wrapPending = false;
+    if (finalCharacter != 'm' && finalCharacter != 'h' && finalCharacter != 'l' && finalCharacter != 'q')
+        m_wrapPending = false;
 }
 
 void VtTerminalModel::processSgr(const QVector<int> &parameters)
 {
+    const auto setForeground = [this](const QColor &color, bool isDefault = false) {
+        m_attributes.foreground = color;
+        m_attributes.defaultForeground = isDefault;
+    };
+    const auto setBackground = [this](const QColor &color, bool isDefault = false) {
+        m_attributes.background = color;
+        m_attributes.defaultBackground = isDefault;
+    };
     for (int index = 0; index < parameters.size(); ++index) {
         const int value = parameters.at(index);
         if (value == 0) resetAttributes();
@@ -307,12 +437,12 @@ void VtTerminalModel::processSgr(const QVector<int> &parameters)
         else if (value == 22) m_attributes.bold = false;
         else if (value == 24) m_attributes.underline = false;
         else if (value == 27) m_attributes.inverse = false;
-        else if (value >= 30 && value <= 37) m_attributes.foreground = indexedColor(value - 30);
-        else if (value >= 40 && value <= 47) m_attributes.background = indexedColor(value - 40);
-        else if (value >= 90 && value <= 97) m_attributes.foreground = indexedColor(value - 90 + 8);
-        else if (value >= 100 && value <= 107) m_attributes.background = indexedColor(value - 100 + 8);
-        else if (value == 39) m_attributes.foreground = QColor(QStringLiteral("#D0DBE5"));
-        else if (value == 49) m_attributes.background = QColor(QStringLiteral("#0C1825"));
+        else if (value >= 30 && value <= 37) setForeground(indexedColor(value - 30));
+        else if (value >= 40 && value <= 47) setBackground(indexedColor(value - 40));
+        else if (value >= 90 && value <= 97) setForeground(indexedColor(value - 90 + 8));
+        else if (value >= 100 && value <= 107) setBackground(indexedColor(value - 100 + 8));
+        else if (value == 39) setForeground(kFallbackCell.foreground, true);
+        else if (value == 49) setBackground(kFallbackCell.background, true);
         else if ((value == 38 || value == 48) && index + 1 < parameters.size()) {
             QColor color;
             if (parameters.at(index + 1) == 5 && index + 2 < parameters.size()) {
@@ -323,8 +453,8 @@ void VtTerminalModel::processSgr(const QVector<int> &parameters)
                 index += 4;
             }
             if (color.isValid()) {
-                if (value == 38) m_attributes.foreground = color;
-                else m_attributes.background = color;
+                if (value == 38) setForeground(color);
+                else setBackground(color);
             }
         }
     }
@@ -350,19 +480,22 @@ QColor VtTerminalModel::indexedColor(int index)
 
 void VtTerminalModel::putCharacter(char32_t character)
 {
-    if (isCombining(character) && m_cursorColumn > 0) {
-        auto &previous = m_cells[index(m_cursorRow, m_cursorColumn - 1)];
+    if (isCombining(character) && (m_cursorColumn > 0 || m_wrapPending)) {
+        int previousColumn = m_wrapPending ? m_cursorColumn : m_cursorColumn - 1;
+        if (m_cells.at(index(m_cursorRow, previousColumn)).wideContinuation && previousColumn > 0) --previousColumn;
+        auto &previous = m_cells[index(m_cursorRow, previousColumn)];
         previous.text += QString::fromUcs4(&character, 1);
         return;
     }
     if (m_wrapPending) {
         m_cursorColumn = 0;
-        lineFeed();
+        lineFeed(m_columns);
     }
     const bool wide = isWide(character);
     if (wide && m_cursorColumn == m_columns - 1) {
+        const int wrapLength = m_cursorColumn;
         m_cursorColumn = 0;
-        lineFeed();
+        lineFeed(wrapLength);
     }
     auto cellValue = m_attributes;
     cellValue.text = QString::fromUcs4(&character, 1);
@@ -382,8 +515,9 @@ void VtTerminalModel::putCharacter(char32_t character)
     }
 }
 
-void VtTerminalModel::lineFeed()
+void VtTerminalModel::lineFeed(int wrapLength)
 {
+    m_lineWrapLengths[m_cursorRow] = wrapLength;
     if (m_cursorRow == m_scrollBottom) scrollUp();
     else m_cursorRow = qMin(m_rows - 1, m_cursorRow + 1);
     m_wrapPending = false;
@@ -403,27 +537,36 @@ void VtTerminalModel::scrollUp(int count)
             QVector<TerminalCell> historyLine;
             historyLine.reserve(m_columns);
             for (int column = 0; column < m_columns; ++column) historyLine.append(m_cells.at(index(row, column)));
-            m_scrollback.append(std::move(historyLine));
+            m_scrollback.append({std::move(historyLine), m_lineWrapLengths.at(row)});
         }
-        constexpr int maxScrollbackLines = 5000;
+        const int maxScrollbackLines = m_historyLimit;
         if (m_scrollback.size() > maxScrollbackLines) m_scrollback.remove(0, m_scrollback.size() - maxScrollbackLines);
     }
-    for (int row = m_scrollTop; row <= m_scrollBottom - count; ++row)
+    for (int row = m_scrollTop; row <= m_scrollBottom - count; ++row) {
         for (int column = 0; column < m_columns; ++column) m_cells[index(row, column)] = m_cells[index(row + count, column)];
+        m_lineWrapLengths[row] = m_lineWrapLengths[row + count];
+    }
     for (int row = m_scrollBottom - count + 1; row <= m_scrollBottom; ++row) eraseCells(row, 0, m_columns - 1);
+    if (m_scrollTop > 0) m_lineWrapLengths[m_scrollTop - 1] = -1;
 }
 
 void VtTerminalModel::scrollDown(int count)
 {
     count = qMin(qMax(1, count), m_scrollBottom - m_scrollTop + 1);
-    for (int row = m_scrollBottom; row >= m_scrollTop + count; --row)
+    for (int row = m_scrollBottom; row >= m_scrollTop + count; --row) {
         for (int column = 0; column < m_columns; ++column) m_cells[index(row, column)] = m_cells[index(row - count, column)];
+        m_lineWrapLengths[row] = m_lineWrapLengths[row - count];
+    }
     for (int row = m_scrollTop; row < m_scrollTop + count; ++row) eraseCells(row, 0, m_columns - 1);
+    m_lineWrapLengths[m_scrollBottom] = -1;
+    if (m_scrollTop > 0) m_lineWrapLengths[m_scrollTop - 1] = -1;
 }
 
 void VtTerminalModel::eraseCells(int row, int from, int to)
 {
     if (row < 0 || row >= m_rows) return;
+    if (to >= m_columns - 1 || (m_lineWrapLengths[row] >= 0 && to >= m_lineWrapLengths[row] - 1))
+        m_lineWrapLengths[row] = -1;
     for (int column = qMax(0, from); column <= qMin(m_columns - 1, to); ++column) m_cells[index(row, column)] = blankCell();
 }
 
@@ -453,20 +596,28 @@ void VtTerminalModel::setAlternateScreen(bool enabled, bool saveCursor)
     if (enabled == m_alternateScreen) return;
     if (enabled) {
         m_primaryCells = m_cells;
+        m_primaryLineWrapLengths = m_lineWrapLengths;
         m_primaryCursorColumn = m_cursorColumn;
         m_primaryCursorRow = m_cursorRow;
+        m_primaryWrapPending = m_wrapPending;
         m_alternateScreen = true;
         m_cells.fill(blankCell(), m_columns * m_rows);
+        m_lineWrapLengths.fill(-1, m_rows);
         m_cursorColumn = 0;
         m_cursorRow = 0;
         m_wrapPending = false;
     } else {
-        if (!m_primaryCells.isEmpty()) m_cells = m_primaryCells;
+        if (!m_primaryCells.isEmpty()) {
+            m_cells = m_primaryCells;
+            m_lineWrapLengths = m_primaryLineWrapLengths;
+        }
         if (saveCursor) {
             m_cursorColumn = m_primaryCursorColumn;
             m_cursorRow = m_primaryCursorRow;
         }
+        m_wrapPending = saveCursor && m_primaryWrapPending;
         m_primaryCells.clear();
+        m_primaryLineWrapLengths.clear();
         m_alternateScreen = false;
         clampCursor();
     }

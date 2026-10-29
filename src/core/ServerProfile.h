@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QMetaType>
+#include <QNetworkProxy>
 
 namespace noxshell {
 
@@ -40,6 +41,9 @@ struct ServerProfile {
     QString expectedFingerprint;
     QString id;
     QString credentialRef;
+    // Transient connection options, never written to the server database.
+    QNetworkProxy transportProxy{QNetworkProxy::NoProxy};
+    QString remoteShell;
 };
 
 inline QString stateText(ServerState state)

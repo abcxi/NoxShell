@@ -42,6 +42,7 @@ public slots:
     void resolveHomeDirectory(quint64 requestId);
     void listDirectory(quint64 requestId, const QString &path);
     void calculateDirectorySize(quint64 requestId, const QString &path);
+    void runServerTool(quint64 requestId, const QByteArray &command);
     void uploadFile(quint64 requestId, const QString &localPath, const QString &remotePath, quint64 bytesPerSecond);
     void downloadFile(quint64 requestId, const QString &remotePath, const QString &localPath, quint64 bytesPerSecond);
     void readFile(quint64 requestId, const QString &remotePath, quint64 maxBytes);
@@ -68,6 +69,7 @@ signals:
     void directoryListed(quint64 requestId, const QString &path, const RemoteFileEntries &entries);
     void directoryListingFailed(quint64 requestId, const QString &path, const QString &message);
     void directorySizeCalculated(quint64 requestId, const QString &path, quint64 bytes, const QString &error);
+    void serverToolFinished(quint64 requestId, const QByteArray &output, const QString &error);
     void fileOperationProgress(quint64 requestId, RemoteFileOperation operation, const QString &path, quint64 completed, quint64 total);
     void fileOperationFinished(quint64 requestId, RemoteFileOperation operation, const QString &path);
     void fileOperationFailed(quint64 requestId, RemoteFileOperation operation, const QString &path, const QString &message);
@@ -134,6 +136,9 @@ private:
     QByteArray m_sizeCommand, m_sizeOutput, m_sizeError;
     QElapsedTimer m_sizeClock;
     bool m_sizeStopSent{};
+    QByteArray m_pendingToolCommand;
+    bool m_sizeIsTool{};
+    bool m_sizeIsAgentCommand{};
 };
 
 } // namespace noxshell

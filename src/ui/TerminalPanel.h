@@ -3,12 +3,16 @@
 #include "../core/ServerProfile.h"
 
 #include <QFrame>
+#include <QPointer>
 
+class QCompleter;
+class QStringListModel;
 class QLabel;
 class QLineEdit;
 class QToolButton;
 class QPushButton;
 class QCheckBox;
+class QShowEvent;
 
 namespace noxshell {
 class SshSession;
@@ -19,6 +23,8 @@ namespace noxshell::ui {
 
 class TerminalView;
 class CommandHistoryPanel;
+class ServerToolsDialog;
+class SoftwareInstallDialog;
 
 class TerminalPanel final : public QFrame {
     Q_OBJECT
@@ -38,6 +44,8 @@ signals:
     void fileWorkspaceToggleRequested();
 
 protected:
+    void changeEvent(QEvent *event) override;
+    void showEvent(QShowEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
@@ -46,6 +54,10 @@ private:
     void showConnectionLoading(const QString &message);
     void hideConnectionLoading();
     void rememberCommand(const QString &command);
+    void refreshCompletions();
+    ServerRepository *m_repository{};
+    QCompleter *m_completer{};
+    QStringListModel *m_completionModel{};
 
     SshSession *m_session{};
     QWidget *m_loadingOverlay{};
@@ -60,6 +72,8 @@ private:
     QToolButton *m_historyButton{};
     QToolButton *m_fileWorkspaceButton{};
     QString m_prompt;
+    QPointer<ServerToolsDialog> m_tools;
+    QPointer<SoftwareInstallDialog> m_software;
     ServerProfile m_profile;
 };
 

@@ -33,15 +33,14 @@ MetricCard::MetricCard(const QString &title, const QColor &accent, QWidget *pare
     auto *summaryRow = new QWidget;
     summaryRow->setObjectName(QStringLiteral("metricSummaryRow"));
     summaryRow->setFixedHeight(kSummaryHeight);
-    auto *summaryLayout = new QVBoxLayout(summaryRow);
-    summaryLayout->setContentsMargins(12, 7, 12, 9);
-    summaryLayout->setSpacing(3);
-    auto *valueRow = new QHBoxLayout;
-    valueRow->setSpacing(6);
+    auto *valueRow = new QHBoxLayout(summaryRow);
+    valueRow->setContentsMargins(12, 7, 12, 9);
+    valueRow->setSpacing(4);
 
     auto *titleLabel = new QLabel(title);
     titleLabel->setObjectName(QStringLiteral("metricTitle"));
     titleLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    titleLabel->setMinimumWidth(26);
     m_value = new QLabel(QStringLiteral("--"));
     m_value->setObjectName(QStringLiteral("metricValue"));
     m_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -53,20 +52,26 @@ MetricCard::MetricCard(const QString &title, const QColor &accent, QWidget *pare
     m_detail->setMinimumWidth(0);
     m_detail->installEventFilter(this);
     valueRow->addWidget(titleLabel);
-    valueRow->addWidget(m_detail, 1);
-    valueRow->addWidget(m_value);
-    summaryLayout->addLayout(valueRow);
 
     m_progress = new QProgressBar;
     m_progress->setObjectName(QStringLiteral("metricProgress"));
     m_progress->setRange(0, 100);
     m_progress->setTextVisible(false);
-    m_progress->setFixedHeight(4);
+    m_progress->setMinimumWidth(0);
+    m_progress->setFixedHeight(24);
+    m_progress->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_progress->setOrientation(Qt::Horizontal);
     m_progress->setAccessibleName(title);
     applyProgressStyle();
 
-    summaryLayout->addWidget(m_progress);
+    // Both readings live inside the full-width track after the title. The
+    // labels stay above the translucent fill and never compete with its width.
+    auto *readings = new QHBoxLayout(m_progress);
+    readings->setContentsMargins(6, 0, 6, 0);
+    readings->setSpacing(4);
+    readings->addWidget(m_detail, 1);
+    readings->addWidget(m_value);
+    valueRow->addWidget(m_progress, 1, Qt::AlignVCenter);
     layout->addWidget(summaryRow);
 
     m_corePanel = new QFrame(this, Qt::ToolTip | Qt::FramelessWindowHint | Qt::WindowDoesNotAcceptFocus);
@@ -102,17 +107,21 @@ void MetricCard::applyProgressStyle()
 {
     if (!m_progress) return;
     const bool dark = isApplicationDarkTheme();
+    QColor fill = m_accent;
+    fill.setAlpha(dark ? 75 : 46);
     m_progress->setStyleSheet(QStringLiteral(
-        "QProgressBar{border:0;border-radius:2px;background:%1;}"
-        "QProgressBar::chunk{border:0;border-radius:2px;background:%2;}")
-        .arg(dark ? QStringLiteral("#2B3948") : QStringLiteral("#EAF0F6"), m_accent.name()));
+        "QProgressBar{border:0;border-radius:4px;background:%1;}"
+        "QProgressBar::chunk{border:0;border-radius:4px;background:%2;}"
+        "QProgressBar QLabel{background:transparent;}"
+        "QProgressBar QLabel#metricValue{font-size:13px;}")
+        .arg(workspaceColors(dark).raised.name(), fill.name(QColor::HexArgb)));
 
     if (!m_corePanel) return;
     for (auto *progress : m_corePanel->findChildren<QProgressBar *>(QStringLiteral("metricCoreProgress"))) {
         progress->setStyleSheet(QStringLiteral(
             "QProgressBar{border:0;border-radius:2px;background:%1;}"
             "QProgressBar::chunk{border-radius:2px;background:%2;}")
-                .arg(dark ? QStringLiteral("#2C3946") : QStringLiteral("#E5EBF1"), m_accent.name()));
+                .arg(workspaceColors(dark).raised.name(), m_accent.name()));
     }
 }
 

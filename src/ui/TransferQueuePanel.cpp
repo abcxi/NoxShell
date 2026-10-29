@@ -125,9 +125,11 @@ void TransferQueuePanel::updateTask(const FileTransferTask &task)
     m_tasks.insert(task.id, task);
     auto *item = m_items.value(task.id, nullptr);
     if (!item) {
-        item = new QListWidgetItem(m_list);
+        item = new QListWidgetItem;
         item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(task.id));
         item->setSizeHint(QSize(0, 78));
+        // Newest submissions first; progress/state changes keep their original row.
+        m_list->insertItem(0, item);
         m_items.insert(task.id, item);
     }
     auto *row = m_list->itemWidget(item);
@@ -231,7 +233,10 @@ void TransferQueuePanel::updateTask(const FileTransferTask &task)
         ? QStringLiteral("打开所在目录\n%1").arg(QFileInfo(task.localPath).absolutePath()) : QString{});
     item->setToolTip(task.message.isEmpty() ? path->text() : task.message);
     updateSummary();
-    if (isNewTask) emit taskAdded();
+    if (isNewTask) {
+        m_list->scrollToTop();
+        emit taskAdded();
+    }
 }
 
 void TransferQueuePanel::openDownloadDirectory(quint64 taskId)

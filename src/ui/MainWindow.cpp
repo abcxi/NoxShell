@@ -1,4 +1,7 @@
 #include "MainWindow.h"
+#include "SettingsPage.h"
+#include "../core/AppSettings.h"
+#include <QShortcut>
 
 #include <QPointer>
 
@@ -6,7 +9,6 @@
 #include "../core/CredentialStore.h"
 #include "../core/ServerRepository.h"
 #include "../core/RdpLauncher.h"
-#include "FilePanel.h"
 #include "HostSidebar.h"
 #include "MetricCard.h"
 #ifdef Q_OS_MACOS
@@ -59,6 +61,68 @@
 namespace noxshell::ui {
 
 namespace {
+QStringList monitorEndpoint(const ServerProfile &profile)
+{
+    // Cache only non-secret routing identity, never passwords or key material.
+    return {profile.id,profile.host,QString::number(profile.port),profile.user,
+        QString::number(static_cast<int>(profile.connectionMode))};
+}
+
+class HoverMenuToolButton final : public QToolButton {
+public:
+    using QToolButton::QToolButton;
+
+    void setupHoverMenu(QMenu *menu)
+    {
+        setMenu(menu);
+        // A hover menu must leave the button clickable, so show it without
+        // the mouse grab that QMenu::popup / QToolButton::showMenu normally use.
+        menu->setWindowFlags(Qt::ToolTip | Qt::FramelessWindowHint);
+        menu->setAttribute(Qt::WA_ShowWithoutActivating);
+        menu->installEventFilter(this);
+        connect(menu, &QMenu::triggered, menu, &QWidget::hide);
+        connect(this, &QToolButton::clicked, menu, &QWidget::hide);
+    }
+
+protected:
+    void enterEvent(QEnterEvent *event) override
+    {
+        QToolButton::enterEvent(event);
+        QTimer::singleShot(200, this, [this] {
+            if (underMouse() && !isDown() && menu() && !menu()->isVisible()) {
+                menu()->move(mapToGlobal(QPoint(0, height())));
+                menu()->show();
+            }
+        });
+    }
+
+    void leaveEvent(QEvent *event) override
+    {
+        QToolButton::leaveEvent(event);
+        scheduleHide();
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == menu() && event->type() == QEvent::Leave) scheduleHide();
+        return QToolButton::eventFilter(watched, event);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (menu()) menu()->hide();
+        QToolButton::mousePressEvent(event);
+    }
+
+private:
+    void scheduleHide()
+    {
+        QTimer::singleShot(250, this, [this] {
+            if (menu() && !underMouse() && !menu()->underMouse()) menu()->hide();
+        });
+    }
+};
+
 class WindowControlsToolbar final : public QToolBar {
 public:
     explicit WindowControlsToolbar(QWidget *parent = nullptr)
@@ -148,6 +212,22 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
     terminalAppearance.autoEnglishInput = settings.value(
         QStringLiteral("terminal/autoEnglishInput"), true).toBool();
     TerminalView::setDefaultAppearance(terminalAppearance);
+    auto *settingsShortcut = new QShortcut(this); settingsShortcut->setContext(Qt::WindowShortcut);
+    const auto updateSettingsKey = [settingsShortcut] {settingsShortcut->setKey(QKeySequence(QSettings().value("shortcuts/settings","Ctrl+,").toString()));};
+    connect(settingsShortcut,&QShortcut::activated,this,&MainWindow::showTerminalSettings);
+    connect(AppSettings::instance(),&AppSettings::changed,this,[this,updateSettingsKey](const QString &key){
+        updateSettingsKey();
+        if(key=="ui/themeMode")setThemeMode(themeModeFromSetting(AppSettings::value(key).toString()));
+        if (key.isEmpty() || key.startsWith("terminal/")) {
+            auto appearance = TerminalView::defaultAppearance();
+            appearance.fontFamily=AppSettings::value("terminal/fontFamily").toString();
+            appearance.pointSize=AppSettings::value("terminal/fontSize").toInt();
+            appearance.lineSpacing=AppSettings::value("terminal/lineSpacing").toDouble();
+            appearance.autoEnglishInput=AppSettings::value("terminal/autoEnglishInput").toBool();
+            TerminalView::setDefaultAppearance(appearance);
+            for(auto *terminal:findChildren<TerminalView*>())terminal->setAppearance(appearance);
+        }
+    }); updateSettingsKey();
 #ifdef Q_OS_MACOS
     m_nativeTitleBarControls = QApplication::platformName() == QStringLiteral("cocoa");
 #endif
@@ -173,6 +253,12 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
     rootLayout->addWidget(body, 1);
     rootLayout->addWidget(createStatusBar());
     setCentralWidget(root);
+    setMonitorVisible(false);
+    if (m_titlebarTabsHost && m_terminalWorkspace) {
+        auto *tabs = m_terminalWorkspace->tabToolbar();
+        tabs->setParent(m_titlebarTabsHost);
+        m_titlebarTabsHost->layout()->addWidget(tabs);
+    }
 
     if (m_monitorToggleButton) {
         connect(m_monitorToggleButton, &QToolButton::clicked, this, [this] {
@@ -181,25 +267,37 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
     }
 #ifdef Q_OS_MACOS
     if (m_nativeTitleBarControls) {
+        m_terminalWorkspace->setNativeTitlebarTabs(true);
+        connect(m_terminalWorkspace, &TerminalWorkspace::tabsChanged, this, [this] {
+            updateMacTitleBarSessionTabs(this, m_terminalWorkspace->sessionTabs());
+        });
         QTimer::singleShot(0, this, [this] {
             const auto install = [this] {
                 return installMacTitleBarControls(this,
+                    [this] { addServer(); },
+                    [this] { showCredentialManager(); },
+                    [this] { showServerManager(); },
                     [this] { setMonitorVisible(m_monitorRail->isHidden()); },
                     [this] { showTerminalSettings(); },
                     [this](int mode) { setThemeMode(static_cast<ThemeMode>(mode)); },
                     static_cast<int>(m_themeMode));
             };
             if (install()) {
+                updateMacTitleBarSessionTabs(this, m_terminalWorkspace->sessionTabs());
                 updateMacTitleBarControls(this, m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
                 qInfo().noquote() << QStringLiteral("macOS 原生标题栏控件已安装");
             } else {
                 QTimer::singleShot(100, this, [this] {
                     const bool installed = installMacTitleBarControls(this,
+                        [this] { addServer(); },
+                        [this] { showCredentialManager(); },
+                        [this] { showServerManager(); },
                         [this] { setMonitorVisible(m_monitorRail->isHidden()); },
                         [this] { showTerminalSettings(); },
                         [this](int mode) { setThemeMode(static_cast<ThemeMode>(mode)); },
                         static_cast<int>(m_themeMode));
                     if (installed) {
+                        updateMacTitleBarSessionTabs(this, m_terminalWorkspace->sessionTabs());
                         updateMacTitleBarControls(this, m_monitorRail && m_monitorRail->isVisible(), static_cast<int>(m_themeMode));
                         qInfo().noquote() << QStringLiteral("macOS 原生标题栏控件已安装");
                     }
@@ -278,6 +376,13 @@ MainWindow::MainWindow(QString databasePath, QWidget *parent, CredentialStore *c
     });
 }
 
+MainWindow::~MainWindow()
+{
+    // QWidget deletes child pages after derived members have been destroyed.
+    // Disconnect their cache-cleanup callbacks while the maps are still alive.
+    for(const auto &connection:m_monitorCleanupConnections)QObject::disconnect(connection);
+}
+
 QToolBar *MainWindow::createWindowToolbar()
 {
     auto *toolbar = new WindowControlsToolbar(this);
@@ -286,7 +391,26 @@ QToolBar *MainWindow::createWindowToolbar()
     toolbar->setMovable(false);
     toolbar->setFloatable(false);
     toolbar->setIconSize(QSize(20, 20));
-    toolbar->setFixedHeight(34);
+    toolbar->setFixedHeight(36);
+
+    m_newConnectionButton = new HoverMenuToolButton;
+    m_newConnectionButton->setObjectName(QStringLiteral("newConnectionButton"));
+    m_newConnectionButton->setIcon(QIcon(QStringLiteral(":/assets/add.svg")));
+    m_newConnectionButton->setIconSize(QSize(18, 18));
+    m_newConnectionButton->setFixedSize(30, 28);
+    m_newConnectionButton->setToolTip(QStringLiteral("新建连接；停留以打开管理菜单"));
+    m_newConnectionButton->setAccessibleName(QStringLiteral("新建连接"));
+    m_newConnectionButton->setPopupMode(QToolButton::DelayedPopup);
+    auto *connectionMenu = new QMenu(m_newConnectionButton);
+    connectionMenu->setObjectName(QStringLiteral("connectionManagementMenu"));
+    auto *credentialAction = connectionMenu->addAction(QStringLiteral("凭据管理"));
+    credentialAction->setObjectName(QStringLiteral("credentialManagerAction"));
+    auto *serverAction = connectionMenu->addAction(QStringLiteral("服务器管理"));
+    serverAction->setObjectName(QStringLiteral("serverManagerAction"));
+    static_cast<HoverMenuToolButton *>(m_newConnectionButton)->setupHoverMenu(connectionMenu);
+    connect(m_newConnectionButton, &QToolButton::clicked, this, &MainWindow::addServer);
+    connect(credentialAction, &QAction::triggered, this, &MainWindow::showCredentialManager);
+    connect(serverAction, &QAction::triggered, this, &MainWindow::showServerManager);
 
     m_monitorToggleButton = new QToolButton;
     m_monitorToggleButton->setObjectName(QStringLiteral("monitorToggleButton"));
@@ -331,19 +455,17 @@ QToolBar *MainWindow::createWindowToolbar()
         setThemeMode(static_cast<ThemeMode>(action->data().toInt()));
     });
 
+    toolbar->addWidget(m_newConnectionButton);
     toolbar->addWidget(m_monitorToggleButton);
     toolbar->addWidget(m_settingsButton);
 
-    auto *leftSpacer = new QWidget;
-    leftSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    toolbar->addWidget(leftSpacer);
-    auto *title = new QLabel(QStringLiteral("玄壳 · 远程连接管理"));
-    title->setObjectName(QStringLiteral("windowToolbarTitle"));
-    title->setAlignment(Qt::AlignCenter);
-    toolbar->addWidget(title);
-    auto *rightSpacer = new QWidget;
-    rightSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    toolbar->addWidget(rightSpacer);
+    m_titlebarTabsHost = new QWidget;
+    m_titlebarTabsHost->setObjectName(QStringLiteral("titlebarTabsHost"));
+    m_titlebarTabsHost->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    auto *tabsLayout = new QHBoxLayout(m_titlebarTabsHost);
+    tabsLayout->setContentsMargins(0, 0, 0, 0);
+    tabsLayout->setSpacing(0);
+    toolbar->addWidget(m_titlebarTabsHost);
     toolbar->addWidget(m_themeModeButton);
 
 #ifdef Q_OS_WIN
@@ -417,29 +539,19 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
 
 void MainWindow::showTerminalSettings()
 {
-    const auto previous = TerminalView::defaultAppearance();
-    TerminalSettingsDialog dialog(previous, this);
-    const auto applyAppearance = [this](const TerminalAppearance &appearance) {
-        TerminalView::setDefaultAppearance(appearance);
-        const auto terminals = findChildren<TerminalView *>();
-        for (auto *terminal : terminals) terminal->setAppearance(appearance);
-    };
-    connect(&dialog, &TerminalSettingsDialog::appearancePreviewRequested, this,
-        [applyAppearance](const QString &family, int size, double spacing, bool autoEnglish) {
-            applyAppearance({family, size, spacing, autoEnglish});
-        });
+    auto *page = new SettingsPage(m_credentialStore);
+    connect(page, &SettingsPage::themeModeRequested, this, [this](const QString &mode) {setThemeMode(themeModeFromSetting(mode));});
+    m_terminalWorkspace->showSettings(page);
+}
 
-    if (dialog.exec() == QDialog::Accepted) {
-        const auto selected = dialog.appearance();
-        applyAppearance(selected);
-        QSettings settings;
-        settings.setValue(QStringLiteral("terminal/fontFamily"), selected.fontFamily);
-        settings.setValue(QStringLiteral("terminal/fontSize"), selected.pointSize);
-        settings.setValue(QStringLiteral("terminal/lineSpacing"), selected.lineSpacing);
-        settings.setValue(QStringLiteral("terminal/autoEnglishInput"), selected.autoEnglishInput);
-    } else {
-        applyAppearance(previous);
-    }
+void MainWindow::showCredentialManager()
+{
+    if (m_terminalWorkspace) m_terminalWorkspace->showCredentialManager();
+}
+
+void MainWindow::showServerManager()
+{
+    if (m_terminalWorkspace) m_terminalWorkspace->showServerManager();
 }
 
 void MainWindow::setThemeMode(ThemeMode mode, bool persist)
@@ -497,37 +609,6 @@ void MainWindow::setMonitorVisible(bool visible)
 #endif
 }
 
-void MainWindow::setFileWorkspaceVisible(bool visible)
-{
-    m_fileWorkspaceVisible = visible;
-    updateFileWorkspaceVisibility();
-    if (m_terminalWorkspace) m_terminalWorkspace->setFileWorkspaceVisible(visible);
-}
-
-void MainWindow::updateFileWorkspaceVisibility()
-{
-    if (!m_fileWorkspacePane || !m_terminalFileSplitter || !m_terminalWorkspace) return;
-    // The home page uses the whole right-hand workspace. This temporary layout
-    // change must not overwrite the user's file-panel preference or split ratio.
-    const bool visible = m_fileWorkspaceVisible && !m_terminalWorkspace->isHomePageVisible();
-    if (!visible) {
-        if (m_terminalFileSplitSizes.isEmpty() && m_fileWorkspacePane->isVisible()) {
-            const auto sizes = m_terminalFileSplitter->sizes();
-            if (sizes.size() == 2 && sizes.at(0) > 0 && sizes.at(1) > 0)
-                m_terminalFileSplitSizes = sizes;
-        }
-        m_fileWorkspacePane->hide();
-    } else if (m_fileWorkspacePane->isHidden()) {
-        m_fileWorkspacePane->show();
-        if (m_terminalFileSplitSizes.size() == 2) {
-            m_terminalFileSplitter->setSizes(m_terminalFileSplitSizes);
-        } else {
-            const int available = qMax(400, m_terminalFileSplitter->height());
-            m_terminalFileSplitter->setSizes({available * 65 / 100, available * 35 / 100});
-        }
-    }
-}
-
 QWidget *MainWindow::createWorkspace()
 {
     auto *workspace = new QWidget;
@@ -546,21 +627,7 @@ QWidget *MainWindow::createWorkspace()
     operationsLayout->setContentsMargins(0, 0, 0, 0);
     operationsLayout->setSpacing(0);
 
-    auto *terminalFileSplitter = new QSplitter(Qt::Vertical);
-    m_terminalFileSplitter = terminalFileSplitter;
-    terminalFileSplitter->setObjectName(QStringLiteral("terminalFileSplitter"));
-    terminalFileSplitter->setChildrenCollapsible(false);
-    terminalFileSplitter->addWidget(createTerminalWorkspace());
-    terminalFileSplitter->addWidget(createFileWorkspace());
-    terminalFileSplitter->setStretchFactor(0, 65);
-    terminalFileSplitter->setStretchFactor(1, 35);
-    terminalFileSplitter->setSizes({560, 300});
-    connect(terminalFileSplitter, &QSplitter::splitterMoved, this, [this] {
-        if (m_fileWorkspacePane->isVisible())
-            m_terminalFileSplitSizes = m_terminalFileSplitter->sizes();
-    });
-    updateFileWorkspaceVisibility();
-    operationsLayout->addWidget(terminalFileSplitter, 1);
+    operationsLayout->addWidget(createTerminalWorkspace(), 1);
 
     mainSplitter->addWidget(operations);
     mainSplitter->setStretchFactor(0, 0);
@@ -584,17 +651,17 @@ QWidget *MainWindow::createMetricStrip()
     auto *identity = new QFrame;
     identity->setObjectName(QStringLiteral("monitorIdentity"));
     auto *identityLayout = new QVBoxLayout(identity);
-    identityLayout->setContentsMargins(13, 10, 12, 9);
+    identityLayout->setContentsMargins(10, 10, 10, 9);
     identityLayout->setSpacing(5);
     auto *titleRow = new QHBoxLayout;
-    titleRow->setSpacing(5);
+    titleRow->setSpacing(2);
     m_serverMeta = new QLabel(QStringLiteral("未选择主机"));
     m_serverMeta->setObjectName(QStringLiteral("serverAddress"));
     auto *copyAddress = new QToolButton;
     copyAddress->setObjectName(QStringLiteral("copyHostAddressButton"));
     copyAddress->setIcon(QIcon(QStringLiteral(":/assets/copy.svg")));
     copyAddress->setIconSize(QSize(15, 15));
-    copyAddress->setFixedSize(27, 27);
+    copyAddress->setFixedSize(20, 27);
     copyAddress->setToolTip(QStringLiteral("复制 IP 地址"));
     copyAddress->setAccessibleName(QStringLiteral("复制 IP 地址"));
     m_onlineBadge = new QLabel(QStringLiteral("○ 待连接"));
@@ -602,6 +669,12 @@ QWidget *MainWindow::createMetricStrip()
     titleRow->addWidget(m_serverMeta);
     titleRow->addWidget(copyAddress);
     titleRow->addStretch();
+    m_serverLatency = new QLabel;
+    m_serverLatency->setObjectName(QStringLiteral("serverLatency"));
+    m_serverLatency->setAccessibleName(QStringLiteral("服务器 TCP 延迟"));
+    m_serverLatency->setToolTip(QStringLiteral("当前顶部标签的 TCP 连接探测耗时，包含代理协商，并非 ICMP 延迟。\n每个标签共用一个任务，仅当前标签每 10 秒检测一次。"));
+    m_serverLatency->hide();
+    titleRow->addWidget(m_serverLatency);
     titleRow->addWidget(m_onlineBadge);
     identityLayout->addLayout(titleRow);
     railLayout->addWidget(identity);
@@ -693,28 +766,41 @@ QWidget *MainWindow::createTerminalWorkspace()
         }
         if (changed) m_sidebar->refreshServers(saved);
     });
-    connect(m_terminalWorkspace, &TerminalWorkspace::homePageVisibilityChanged,
-        this, &MainWindow::updateFileWorkspaceVisibility);
     layout->addWidget(m_terminalWorkspace);
-    connect(m_terminalWorkspace, &TerminalWorkspace::activeSessionChanged,
-        this, &MainWindow::activateTerminalSession);
+    connect(m_terminalWorkspace, &TerminalWorkspace::monitorSessionChanged,
+        this, &MainWindow::activateMonitorSession);
+    connect(m_terminalWorkspace, &TerminalWorkspace::latencyChanged, this,
+        [this](QWidget *page, const QString &text) {
+            if (page && page != m_monitorPage) return;
+            m_serverLatency->setText(text);
+            m_serverLatency->setVisible(!text.isEmpty());
+        });
     connect(m_terminalWorkspace, &TerminalWorkspace::sessionClosed,
         this, &MainWindow::releaseSession);
+    connect(m_terminalWorkspace, &TerminalWorkspace::sessionCountChanged, this, [this](int count) {
+        if (count != 0) return;
+        // Closing the final tab has no replacement monitor source to publish.
+        // Drop its snapshot as well as its channel before returning home, so
+        // delayed metrics cannot repopulate the now-hidden rail.
+        m_session.clear();
+        m_monitorPage.clear();
+        m_currentServer = {};
+        m_hasMetricSample = false;
+        m_monitorStates.clear();
+        m_monitorCacheOrder.clear();
+        resetMetrics(QStringLiteral("没有打开的 SSH 会话"));
+        m_serverMeta->clear();
+        m_serverMeta->setToolTip({});
+        m_serverLatency->clear();
+        m_serverLatency->hide();
+        setConnectionBadge(QStringLiteral("○ 离线"), QStringLiteral("#738297"), QStringLiteral("#EEF2F6"));
+        if (m_sampleStatus) m_sampleStatus->setText(QStringLiteral("采样等待中    传输任务 0"));
+        setMonitorVisible(false);
+    });
     connect(m_terminalWorkspace, &TerminalWorkspace::sessionConnectionChanged,
         this, [this](const QString &serverId, bool connected, const QString &message) {
             updateConnectionPresentation(serverId, connected, message);
         });
-    connect(m_terminalWorkspace, &TerminalWorkspace::commandSubmitted, this,
-        [this](const QString &serverId, const QString &command) {
-            QTimer::singleShot(180, this, [this, serverId, command] {
-                if (m_filePanel && serverId == m_currentServer.id) {
-                    m_filePanel->syncDirectoryFromTerminalCommand(command);
-                }
-            });
-        });
-    connect(m_terminalWorkspace, &TerminalWorkspace::fileWorkspaceToggleRequested, this, [this] {
-        setFileWorkspaceVisible(!m_fileWorkspaceVisible);
-    });
     return container;
 }
 
@@ -727,24 +813,6 @@ QWidget *MainWindow::createMonitorWorkspace()
     layout->setSpacing(0);
     m_systemDetailPanel = new SystemDetailPanel;
     layout->addWidget(m_systemDetailPanel);
-    return widget;
-}
-
-QWidget *MainWindow::createFileWorkspace()
-{
-    auto *widget = new QWidget;
-    m_fileWorkspacePane = widget;
-    widget->setObjectName(QStringLiteral("fileWorkspacePane"));
-    auto *layout = new QVBoxLayout(widget);
-    layout->setContentsMargins(8, 4, 8, 8);
-    m_fileWorkspaceStack = new QStackedWidget;
-    m_fileWorkspaceStack->setObjectName(QStringLiteral("fileWorkspaceStack"));
-    m_filePlaceholder = new QLabel(QStringLiteral("选择 SSH 会话后显示文件管理"));
-    m_filePlaceholder->setObjectName(QStringLiteral("fileWorkspacePlaceholder"));
-    auto *placeholderLabel = qobject_cast<QLabel *>(m_filePlaceholder);
-    placeholderLabel->setAlignment(Qt::AlignCenter);
-    m_fileWorkspaceStack->addWidget(m_filePlaceholder);
-    layout->addWidget(m_fileWorkspaceStack);
     return widget;
 }
 
@@ -789,17 +857,9 @@ void MainWindow::selectServer(const ServerProfile &profile)
     m_serverMeta->setText(profile.host);
     if (profile.connectionMode == ConnectionMode::Rdp) {
         m_session = nullptr;
-        m_filePanel = nullptr;
         resetMetrics(QStringLiteral("Windows 远程桌面由系统客户端运行"));
-        if (auto *placeholder = qobject_cast<QLabel *>(m_filePlaceholder)) {
-            placeholder->setText(QStringLiteral("Windows 远程桌面在系统客户端中打开"));
-        }
-        if (m_fileWorkspaceStack && m_filePlaceholder) m_fileWorkspaceStack->setCurrentWidget(m_filePlaceholder);
         setConnectionBadge(QStringLiteral("RDP 远程桌面"), QStringLiteral("#6F42C1"), QStringLiteral("#F1EAFE"));
         return;
-    }
-    if (auto *placeholder = qobject_cast<QLabel *>(m_filePlaceholder)) {
-        placeholder->setText(QStringLiteral("选择 SSH 会话后显示文件管理"));
     }
     const bool connectedNow = m_terminalWorkspace && m_terminalWorkspace->hasConnectedSession(profile.id);
     if (connectedNow) {
@@ -815,16 +875,45 @@ void MainWindow::selectServer(const ServerProfile &profile)
     }
 }
 
-void MainWindow::activateTerminalSession(const ServerProfile &profile, SshSession *session)
+void MainWindow::cacheMonitorState()
 {
-    if (profile.id.isEmpty() || !session) return;
+    if(m_monitorPage && m_hasMetricSample && m_systemDetailPanel)
+        m_monitorStates[m_monitorPage]={monitorEndpoint(m_currentServer),m_systemDetailPanel->viewState()};
+}
+
+void MainWindow::activateMonitorSession(QWidget *tabPage, const ServerProfile &profile, SshSession *session)
+{
+    if (profile.id.isEmpty() || !session || !tabPage) return;
+    if(m_monitorPage==tabPage && m_session==session){
+        m_currentServer=profile;
+        m_serverMeta->setText(profile.host);
+        updateConnectionPresentation(profile.id,session->isConnected(),session->isConnecting()?QStringLiteral("正在连接"):QString{});
+        return;
+    }
+    cacheMonitorState();
+    if(!m_monitorCleanupConnections.contains(tabPage)){
+        m_monitorCleanupConnections.insert(tabPage,connect(tabPage,&QObject::destroyed,this,[this,tabPage]{
+            m_monitorStates.remove(tabPage);m_monitorCacheOrder.removeAll(tabPage);
+            m_monitorCleanupConnections.remove(tabPage);
+        }));
+    }
+    m_monitorCacheOrder.removeAll(tabPage);m_monitorCacheOrder.append(tabPage);
+    while(m_monitorCacheOrder.size()>32)m_monitorStates.remove(m_monitorCacheOrder.takeFirst());
+    m_monitorPage=tabPage;
     if (m_sidebar) m_sidebar->selectServerById(profile.id);
     selectServer(profile);
     bindSession(session);
     m_session = session;
-    showFilePanel(profile, session);
+    m_serverMeta->setToolTip(QStringLiteral("当前顶部标签的固定监控目标：%1@%2:%3\n切换内部 Shell / Agent 或分屏不会清空图表。").arg(profile.user,profile.host).arg(profile.port));
+    updateConnectionPresentation(profile.id, session->isConnected(), session->isConnecting() ? QStringLiteral("正在连接") : QString{});
+    const auto state=m_monitorStates.value(tabPage);
+    const bool sameEndpoint=state.endpoint==monitorEndpoint(profile);
+    if(sameEndpoint && state.view.sample.capturedAt.isValid()){
+        m_systemDetailPanel->restoreViewState(state.view);
+        displayMetrics(state.view.sample);
+    }
     if (session->isConnected()) {
-        if (const auto cached = session->lastMetricSample()) displayMetrics(*cached);
+        if (!m_hasMetricSample)if(const auto cached=session->lastMetricSample())displayMetrics(*cached);
         requestMetrics();
     }
 }
@@ -864,32 +953,9 @@ void MainWindow::releaseSession(SshSession *session)
     if (!session) return;
     m_boundSessions.remove(session);
     disconnect(session, nullptr, this, nullptr);
-    if (auto *panel = m_filePanels.take(session)) {
-        if (m_fileWorkspaceStack) m_fileWorkspaceStack->removeWidget(panel);
-        panel->deleteLater();
-    }
     if (m_session == session) {
         m_session = nullptr;
-        m_filePanel = nullptr;
-        if (m_fileWorkspaceStack && m_filePlaceholder) m_fileWorkspaceStack->setCurrentWidget(m_filePlaceholder);
     }
-}
-
-void MainWindow::showFilePanel(const ServerProfile &profile, SshSession *session)
-{
-    if (!m_fileWorkspaceStack || !session) return;
-    auto *panel = m_filePanels.value(session);
-    if (!panel) {
-        panel = new FilePanel(session);
-        panel->setMinimumHeight(220);
-        panel->setServer(profile);
-        m_filePanels.insert(session, panel);
-        m_fileWorkspaceStack->addWidget(panel);
-    } else {
-        panel->updateServer(profile);
-    }
-    m_filePanel = panel;
-    m_fileWorkspaceStack->setCurrentWidget(panel);
 }
 
 void MainWindow::connectToServer(const ServerProfile &profile)
@@ -897,8 +963,9 @@ void MainWindow::connectToServer(const ServerProfile &profile)
     if (profile.id.isEmpty() || m_readingRdpCredentials) return;
     m_rdpCredentialButton->hide();
     m_pendingCredentialProfile = {};
-    selectServer(profile);
     if (profile.connectionMode == ConnectionMode::Rdp) {
+        cacheMonitorState();m_monitorPage.clear();
+        selectServer(profile);
         auto launchProfile = profile;
         if (launchProfile.password.isEmpty() && !profile.credentialRef.isEmpty()) {
             m_readingRdpCredentials = true;
@@ -1150,8 +1217,6 @@ void MainWindow::deleteServer(const ServerProfile &removedProfile)
             QStringLiteral("#738297"), QStringLiteral("#EEF2F6"));
         resetMetrics(QStringLiteral("等待选择主机"));
         m_session = nullptr;
-        m_filePanel = nullptr;
-        if (m_fileWorkspaceStack && m_filePlaceholder) m_fileWorkspaceStack->setCurrentWidget(m_filePlaceholder);
     }
     m_serverDeletionInFlight = false;
 }
@@ -1176,7 +1241,7 @@ void MainWindow::setConnectionBadge(const QString &text, const QString &foregrou
             themedBackground = QStringLiteral("#252F3A");
         }
     }
-    m_onlineBadge->setStyleSheet(QStringLiteral("color:%1;background:%2;border-radius:3px;padding:2px 8px;")
+    m_onlineBadge->setStyleSheet(QStringLiteral("color:%1;background:%2;border-radius:3px;padding:2px 4px;")
             .arg(themedForeground, themedBackground));
 }
 
@@ -1186,23 +1251,19 @@ void MainWindow::updateConnectionPresentation(const QString &serverId, bool conn
     const bool terminalConnected = m_terminalWorkspace && m_terminalWorkspace->hasConnectedSession(serverId);
     const bool anyConnected = connected || terminalConnected;
 
-    if (anyConnected) {
-        m_sidebar->setServerState(serverId, ServerState::Online);
-        if (m_currentServer.id == serverId) {
-            m_currentServer.state = ServerState::Online;
-            setConnectionBadge(QStringLiteral("● 在线"), QStringLiteral("#008858"), QStringLiteral("#E8F8F2"));
-        }
-        return;
-    }
-    if (isConnectingMessage(message)) {
-        if (m_currentServer.id == serverId) {
-            setConnectionBadge(QStringLiteral("◌ 连接中"), QStringLiteral("#006EFF"), QStringLiteral("#E8F3FF"));
-        }
-        return;
-    }
-
-    m_sidebar->setServerState(serverId, ServerState::Offline);
-    if (m_currentServer.id == serverId) {
+    m_sidebar->setServerState(serverId, anyConnected ? ServerState::Online : ServerState::Offline);
+    if (m_currentServer.id != serverId) return;
+    // The list aggregates all panes. The monitor is pinned to its top-level
+    // tab's source channel, not to whichever pane currently has keyboard focus.
+    const bool focused = m_session && m_session->profile().id == serverId;
+    const bool currentConnected = focused ? m_session->isConnected() : anyConnected;
+    const bool currentConnecting = focused ? m_session->isConnecting() : isConnectingMessage(message);
+    if (currentConnected) {
+        m_currentServer.state = ServerState::Online;
+        setConnectionBadge(QStringLiteral("● 在线"), QStringLiteral("#008858"), QStringLiteral("#E8F8F2"));
+    } else if (currentConnecting) {
+        setConnectionBadge(QStringLiteral("◌ 连接中"), QStringLiteral("#006EFF"), QStringLiteral("#E8F3FF"));
+    } else {
         m_currentServer.state = ServerState::Offline;
         setConnectionBadge(QStringLiteral("○ 离线"), QStringLiteral("#738297"), QStringLiteral("#EEF2F6"));
     }
@@ -1215,17 +1276,19 @@ void MainWindow::closeEvent(QCloseEvent *event)
         return;
     }
     event->ignore();
+    const auto behavior = AppSettings::value("general/closeBehavior").toString();
+    if (behavior == "quit") { QMetaObject::invokeMethod(qApp, &QCoreApplication::quit, Qt::QueuedConnection); return; }
 #ifdef Q_OS_MACOS
     m_hiddenByClose = true;
     hide(); // Dock activation restores this same window and its live sessions.
 #else
-    // Platforms without a Dock retain a normal, confirmed application exit.
-    QMetaObject::invokeMethod(qApp, &QCoreApplication::quit, Qt::QueuedConnection);
+    showMinimized();
 #endif
 }
 
 bool MainWindow::confirmApplicationQuit()
 {
+    if (!AppSettings::value("general/confirmClose").toBool()) return true;
     QMessageBox dialog(QMessageBox::Question, QStringLiteral("确认退出玄壳"),
         QStringLiteral("退出将断开所有 SSH 会话，并停止进行中的传输。\n确认退出程序？"),
         QMessageBox::Yes | QMessageBox::Cancel, this);
@@ -1239,6 +1302,7 @@ bool MainWindow::confirmApplicationQuit()
 
 void MainWindow::requestMetrics()
 {
+    if (!AppSettings::value("general/serverStatus").toBool()) return;
     // Keep background/minimized windows inexpensive without disconnecting SSH.
     const int interval = !isVisible() || isMinimized() || !isActiveWindow() || !m_monitorRail->isVisible() ? 5000 : 1000;
     if (m_metricTimer->interval() != interval) m_metricTimer->setInterval(interval);

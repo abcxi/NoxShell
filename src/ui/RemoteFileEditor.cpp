@@ -1,4 +1,5 @@
 #include "RemoteFileEditor.h"
+#include "../core/AppSettings.h"
 
 #include "../core/SshSession.h"
 #include "AppTheme.h"
@@ -17,6 +18,7 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QScrollBar>
 #include <QScopedValueRollback>
 #include <QShortcut>
@@ -258,8 +260,9 @@ public:
         QPainter painter(m_lineNumberArea);
         painter.setFont(font());
         const bool dark = isApplicationDarkTheme();
-        painter.fillRect(event->rect(), QColor(dark ? QStringLiteral("#151E29") : QStringLiteral("#F6F8FB")));
-        painter.setPen(QColor(dark ? QStringLiteral("#293748") : QStringLiteral("#E5EBF2")));
+        const auto theme = workspaceColors(dark);
+        painter.fillRect(event->rect(), theme.canvas);
+        painter.setPen(theme.line);
         painter.drawLine(m_lineNumberArea->width() - 1, event->rect().top(),
             m_lineNumberArea->width() - 1, event->rect().bottom());
 
@@ -472,6 +475,7 @@ struct RemoteFileEditor::Document {
     QLabel *position{};
     quint64 readRequestId{};
     quint64 writeRequestId{};
+    QTimer *autoSave{};
     bool loaded{false};
     bool dirty{false};
     bool busy{false};
@@ -480,17 +484,15 @@ struct RemoteFileEditor::Document {
 };
 
 RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QString remotePath, QWidget *parent)
-    : QDialog(parent)
+    : QWidget(parent)
     , m_session(session)
     , m_serverName(std::move(serverName))
 {
     setObjectName(QStringLiteral("remoteFileEditor"));
     setAttribute(Qt::WA_DeleteOnClose);
-    setWindowFlag(Qt::Window, true);
-    setWindowModality(Qt::NonModal);
     setWindowTitle(QStringLiteral("%1 · 远端文件编辑").arg(m_serverName));
     resize(1000, 720);
-    setMinimumSize(600, 380);
+    setMinimumSize(300, 150);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -531,6 +533,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     m_undoButton->setFixedWidth(28);
     m_redoButton->setFixedWidth(28);
     auto *findButton = tool(QStringLiteral("remoteFileEditorFind"), QStringLiteral("查找"), QStringLiteral("查找 / 替换（Cmd/Ctrl+F）"));
+    m_findButton = findButton;
     findButton->setIcon(QIcon(QStringLiteral(":/assets/editor-find.svg")));
     findButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     m_wrapButton = tool(QStringLiteral("remoteFileEditorWrap"), QStringLiteral("自动换行"), QStringLiteral("自动换行（仅改变显示，不修改文件）"));
@@ -541,6 +544,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
     m_saveButton->setAutoDefault(false);
     m_saveButton->setDefault(false);
     m_saveButton->setFixedHeight(28);
+    m_saveButton->setFixedWidth(70);
     toolbarLayout->addWidget(m_pathDisplay, 1);
     toolbarLayout->addWidget(m_documentState);
     toolbarLayout->addSpacing(4);
@@ -737,6 +741,7 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
 
     auto *closeShortcut = new QShortcut(QKeySequence::Close, this);
     closeShortcut->setObjectName(QStringLiteral("remoteFileEditorCloseShortcut"));
+    closeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(closeShortcut, &QShortcut::activated, this, [this] {
         const int index = m_tabs->currentIndex();
         if (index >= 0) requestCloseDocument(index);
@@ -744,15 +749,19 @@ RemoteFileEditor::RemoteFileEditor(SshSession *session, QString serverName, QStr
 
     auto *findShortcut = new QShortcut(QKeySequence::Find, this);
     findShortcut->setObjectName(QStringLiteral("remoteFileEditorFindShortcut"));
+    findShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(findShortcut, &QShortcut::activated, this, [this] { showFindPanel(false); });
     auto *replaceShortcut = new QShortcut(QKeySequence(Qt::META | Qt::ALT | Qt::Key_F), this);
     replaceShortcut->setObjectName(QStringLiteral("remoteFileEditorReplaceShortcut"));
+    replaceShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(replaceShortcut, &QShortcut::activated, this, [this] { showFindPanel(true); });
     auto *replaceControlShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_H), this);
     replaceControlShortcut->setObjectName(QStringLiteral("remoteFileEditorReplaceControlShortcut"));
+    replaceControlShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(replaceControlShortcut, &QShortcut::activated, this, [this] { showFindPanel(true); });
     m_hideFindShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), this);
     m_hideFindShortcut->setObjectName(QStringLiteral("remoteFileEditorHideFindShortcut"));
+    m_hideFindShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     m_hideFindShortcut->setEnabled(false);
     connect(m_hideFindShortcut, &QShortcut::activated, this, &RemoteFileEditor::hideFindPanel);
 
@@ -772,8 +781,7 @@ void RemoteFileEditor::openFile(const QString &remotePath)
         if (m_documents.at(index)->path != remotePath) continue;
         m_tabs->setCurrentIndex(index);
         show();
-        raise();
-        activateWindow();
+        m_documents.at(index)->editor->setFocus();
         return;
     }
 
@@ -813,11 +821,19 @@ void RemoteFileEditor::openFile(const QString &remotePath)
     m_tabs->setCurrentIndex(index);
     updateChrome();
 
+    document->autoSave = new QTimer(document->page);
+    document->autoSave->setSingleShot(true);
+    document->autoSave->setInterval(3000);
+    connect(document->autoSave,&QTimer::timeout,document->page,[this,document]{
+        if(AppSettings::value("files/autoSave").toBool() && document->loaded && document->dirty
+            && !document->busy && m_session->isConnected())saveDocument(document);
+    });
     connect(document->editor->document(), &QTextDocument::contentsChange, document->page,
         [this, document](int, int removed, int added) {
         // Syntax/theme-only format changes must not mark a remote file dirty.
         if ((!removed && !added) || !document->loaded || document->busy) return;
         setDirty(document, true);
+        if(AppSettings::value("files/autoSave").toBool())document->autoSave->start();
         document->status->setText(QStringLiteral("有未保存的修改 · Cmd/Ctrl+S 保存"));
     });
     connect(document->editor, &QPlainTextEdit::textChanged, document->page, [this, document] {
@@ -1071,7 +1087,7 @@ bool RemoteFileEditor::eventFilter(QObject *watched, QEvent *event)
             return true;
         }
     }
-    return QDialog::eventFilter(watched, event);
+    return QWidget::eventFilter(watched, event);
 }
 
 void RemoteFileEditor::beginLoad(Document *document)
@@ -1143,11 +1159,24 @@ void RemoteFileEditor::updateChrome()
 
 void RemoteFileEditor::changeEvent(QEvent *event)
 {
-    QDialog::changeEvent(event);
+    QWidget::changeEvent(event);
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
         if (m_findPanel && m_findPanel->isVisible()) updateFindStatus();
         updateChrome();
     }
+}
+
+void RemoteFileEditor::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    if (!m_findButton || !m_saveButton) return;
+    const bool compact = width() < 600;
+    m_pathDisplay->setVisible(!compact);
+    m_documentState->setVisible(!compact);
+    m_findButton->setToolButtonStyle(compact ? Qt::ToolButtonIconOnly : Qt::ToolButtonTextBesideIcon);
+    m_findButton->setFixedWidth(compact ? 28 : 76);
+    m_wrapButton->setText(compact ? QStringLiteral("换行") : QStringLiteral("自动换行"));
+    m_wrapButton->setFixedWidth(compact ? 44 : 84);
 }
 
 void RemoteFileEditor::updateTab(Document *document)
@@ -1243,7 +1272,7 @@ void RemoteFileEditor::maybeFinishWindowClose()
     });
     if (pending) return;
     m_closeAfterAllSaved = false;
-    QTimer::singleShot(0, this, &QDialog::close);
+    QTimer::singleShot(0, this, &QWidget::close);
 }
 
 void RemoteFileEditor::closeEvent(QCloseEvent *event)

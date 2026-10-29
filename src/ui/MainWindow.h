@@ -3,11 +3,14 @@
 #include "../core/LinuxMetrics.h"
 #include "../core/ServerProfile.h"
 #include "AppTheme.h"
+#include "SystemDetailPanel.h"
 
 #include <QMainWindow>
 #include <QHash>
 #include <QSet>
 #include <QList>
+#include <QPointer>
+#include <QStringList>
 
 class QLabel;
 class QTimer;
@@ -26,7 +29,6 @@ class CredentialStore;
 
 namespace noxshell::ui {
 
-class FilePanel;
 class HostSidebar;
 class MetricCard;
 class SystemDetailPanel;
@@ -37,6 +39,7 @@ class MainWindow final : public QMainWindow {
 
 public:
     explicit MainWindow(QString databasePath = {}, QWidget *parent = nullptr, CredentialStore *credentialStore = nullptr);
+    ~MainWindow() override;
     bool confirmApplicationQuit();
     void setQuitInProgress(bool quitting) { m_quitInProgress = quitting; }
 
@@ -51,21 +54,20 @@ private:
     QWidget *createMetricStrip();
     QWidget *createTerminalWorkspace();
     QWidget *createMonitorWorkspace();
-    QWidget *createFileWorkspace();
     QWidget *createStatusBar();
     void setMonitorVisible(bool visible);
-    void setFileWorkspaceVisible(bool visible);
-    void updateFileWorkspaceVisibility();
     void showTerminalSettings();
+    void showCredentialManager();
+    void showServerManager();
     void setThemeMode(ThemeMode mode, bool persist = true);
     void updateThemePresentation();
     void updateConnectionPresentation(const QString &serverId, bool connected, const QString &message);
     void setConnectionBadge(const QString &text, const QString &foreground, const QString &background);
     void selectServer(const ServerProfile &profile);
-    void activateTerminalSession(const ServerProfile &profile, SshSession *session);
+    void activateMonitorSession(QWidget *tabPage, const ServerProfile &profile, SshSession *session);
+    void cacheMonitorState();
     void bindSession(SshSession *session);
     void releaseSession(SshSession *session);
-    void showFilePanel(const ServerProfile &profile, SshSession *session);
     void connectToServer(const ServerProfile &profile);
     void selectAndEditServer(const ServerProfile &profile);
     void selectAndDeleteServer(const ServerProfile &profile);
@@ -83,12 +85,15 @@ private:
 
     HostSidebar *m_sidebar{};
     QLabel *m_serverMeta{};
+    QLabel *m_serverLatency{};
     QLabel *m_onlineBadge{};
     QLabel *m_sampleStatus{};
     QPushButton *m_rdpCredentialButton{};
     ServerProfile m_pendingCredentialProfile;
     bool m_readingRdpCredentials{false};
     QToolButton *m_monitorToggleButton{};
+    QToolButton *m_newConnectionButton{};
+    QWidget *m_titlebarTabsHost{};
     QToolButton *m_settingsButton{};
     QToolButton *m_themeModeButton{};
     QAction *m_systemThemeAction{};
@@ -102,14 +107,15 @@ private:
     QLabel *m_uptimeValue{};
     SystemDetailPanel *m_systemDetailPanel{};
     TerminalWorkspace *m_terminalWorkspace{};
-    QSplitter *m_terminalFileSplitter{};
-    QList<int> m_terminalFileSplitSizes;
-    FilePanel *m_filePanel{};
-    QStackedWidget *m_fileWorkspaceStack{};
-    QWidget *m_filePlaceholder{};
-    QWidget *m_fileWorkspacePane{};
-    SshSession *m_session{};
-    QHash<SshSession *, FilePanel *> m_filePanels;
+    QPointer<SshSession> m_session;
+    struct MonitorState {
+        QStringList endpoint;
+        SystemDetailPanel::ViewState view;
+    };
+    QPointer<QWidget> m_monitorPage;
+    QHash<QWidget *,MonitorState> m_monitorStates;
+    QHash<QWidget *,QMetaObject::Connection> m_monitorCleanupConnections;
+    QList<QWidget *> m_monitorCacheOrder;
     QSet<SshSession *> m_boundSessions;
     QTimer *m_metricTimer{};
     ServerProfile m_currentServer;
@@ -118,7 +124,6 @@ private:
     bool m_hasMetricSample{false};
     bool m_serverDeletionInFlight{false};
     bool m_nativeTitleBarControls{false};
-    bool m_fileWorkspaceVisible{true};
     bool m_hiddenByClose{false};
     bool m_quitInProgress{false};
     ThemeMode m_themeMode{ThemeMode::System};
